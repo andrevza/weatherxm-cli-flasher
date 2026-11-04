@@ -1,0 +1,7 @@
+# Upstream code and dependencies
+
+`src/upstream/flasher/` contains WG1200 logic adapted from [WeatherXM/web-flasher](https://github.com/WeatherXM/web-flasher), reviewed at commit `35b2ecc4ccb31799ecd720609786362a99b3e33a` (2026-10-22). The files are covered by the upstream Apache-2.0 [LICENSE](LICENSE). Each file identifies the source commit; adapted files point here for downstream change details. `constants.ts`, `hashing.ts`, `identity.ts`, and `manifest.ts` are unchanged copies. The other files were adapted for the CLI, including its Node serial transport, read-only operations, OTA presentation, and read-response validation.
+
+The serial protocol implementation and ESP32-S3 loader workarounds are adapted from upstream `transport.ts`; `NodeSerialPort` adapts node-serialport to the Web Serial stream interface expected by esptool-js. For local review, keep the official checkout as a separate sibling directory (`../web-flasher`); it is not a build dependency or Git submodule.
+
+Other runtime dependencies are pinned by `package-lock.json`: esptool-js 0.7.0 (MIT), SerialPort 13.x and its native bindings (MIT), and spark-md5 3.0.2 (MIT). Their package license files are distributed with npm packages. Official WeatherXM firmware images are downloaded from their release repositories at runtime and are not included here; their redistribution terms are separate from the Apache-2.0 CLI/source license.

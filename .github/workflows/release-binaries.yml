@@ -1,0 +1,112 @@
+name: Standalone release binaries
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            target: linux-arm64
+            file: weatherxm-flash-linux-arm64
+            node_version: 26.8.2
+          - runner: ubuntu-22.04
+            target: linux-x64
+            file: weatherxm-flash-linux-x64
+            node_version: 26.13.0
+          - runner: macos-14
+            target: darwin-arm64
+            file: weatherxm-flash-macos-arm64
+            node_version: 26.13.0
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Linux ARM64 stays on the last release before the SEA page-alignment
+          # regression. Other targets use the current patched release.
+          node-version: ${{ matrix.node_version }}
+      - run: npm ci
+      - name: Capture pristine Node ELF layout
+        if: matrix.target == 'linux-arm64'
+        run: |
+          node --version
+          readelf -lW "$(command -v node)"
+          readelf -dW "$(command -v node)"
+      - run: npm run build:standalone
+      - name: Validate Linux ARM64 executable and native addon ELF layout
+        if: matrix.target == 'linux-arm64'
+        run: |
+          node scripts/validate-linux-elf.mjs \
+            ./dist/${{ matrix.file }} \
+            ./node_modules/@serialport/bindings-cpp/prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.glibc.node \
+            "$(command -v node)"
+          readelf -lW ./dist/${{ matrix.file }}
+          readelf -dW ./dist/${{ matrix.file }}
+          readelf -dW ./node_modules/@serialport/bindings-cpp/prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.glibc.node
+          ldd ./dist/${{ matrix.file }}
+          ldd ./node_modules/@serialport/bindings-cpp/prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.glibc.node
+          if ldd ./dist/${{ matrix.file }} ./node_modules/@serialport/bindings-cpp/prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.glibc.node | grep -q 'not found'; then
+            echo 'Unresolved dynamic dependency in Linux ARM64 standalone package' >&2
+            exit 1
+          fi
+      - name: Smoke test standalone executable
+        run: |
+          ./dist/${{ matrix.file }} --version
+          ./dist/${{ matrix.file }} --version --verbose --json
+          ./dist/${{ matrix.file }} --help
+          ./dist/${{ matrix.file }} firmware list --json
+      - name: Test embedded native binding from an isolated directory
+        env:
+          WG1200_STANDALONE_BINARY: ${{ github.workspace }}/dist/${{ matrix.file }}
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.file }}
+          path: dist/${{ matrix.file }}
+          if-no-files-found: error
+          retention-days: 14
+
+  read-only-hardware-gate:
+    needs: build
+    # Configure a self-hosted Linux ARM64 runner with a WG1200 attached and
+    # WG1200_PORT set in the runner environment (for example /dev/ttyUSB0).
+    runs-on: [self-hosted, linux, ARM64, wg1200]
+    env:
+      WG1200_PORT: ${{ vars.WG1200_PORT }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: weatherxm-flash-linux-arm64
+          path: dist
+      - name: Verify attached WG1200 without writing firmware
+        env:
+          WG1200_BINARY: ./dist/weatherxm-flash-linux-arm64
+        run: |
+          chmod +x "$WG1200_BINARY"
+          sh ./scripts/read-only-hardware-check.sh
+
+  publish:
+    needs: [build, read-only-hardware-gate]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: release
+        run: sha256sum weatherxm-flash-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/weatherxm-flash-*
+            release/SHA256SUMS
