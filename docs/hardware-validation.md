@@ -1,5 +1,37 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Latest build validation
+
+The maintainer supplied the following results for the Linux ARM64 standalone
+executable built from commit
+`b3328336f494558fbc37a8c5537646441c1e20ab` on 4 November 2026. Codex did not
+generate these results in its own hardware environment.
+
+| Item | Result |
+| --- | --- |
+| Host | Raspberry Pi 5, AArch64 |
+| OS/kernel | Debian ARM64; 16 KB kernel page size |
+| CLI | `weatherxm-flash-linux-arm64`, package version `0.1.0` |
+| Build | Node.js `v26.8.2`; timestamp `2026-11-04T22:05:59.740Z`; source SHA-256 `c2796f8c67887fcdc711280357af9cfd4c215caec0cab05210f4d95324dd4d29`; clean tree |
+| Device | WeatherXM WG1200 using `/dev/ttyUSB0` |
+| Chip/flash | ESP32-S3; 16 MiB flash detected |
+| Operations | One `verify`, one `status`, and one `info --json`; all succeeded |
+
+The maintainer reports successful ESP32-S3 ROM connection, Secure Boot V2 stub
+workaround, RAM stub upload and execution, partition-table read, secure
+certificate and OTA metadata inspection, and reads of both application
+descriptors. Device identity and the exact WG1200 partition layout validated;
+`verify` returned `VERIFIED`; OTA state remained `VALID`, active slot `ota_1`
+at sequence 4, inactive slot `ota_0`, and next proposed sequence 5. The report
+states that MAC addresses, device identifiers, and certificate identity fields
+were redacted and that JSON output remained valid and correctly structured.
+No firmware writes or erases occurred.
+
+This was one successful run of each of the three commands against the build
+from `b3328336…`. It is distinct from the previous nine-operation validation
+below, which used commit `233fe617f57f3c75e0a2d31214ff731a62b509ca`. The newer
+commit did not undergo nine repeated rounds.
+
 ## Validation record
 
 The project maintainer reported this validation on 4 November 2026 using the Linux ARM64 standalone executable built from source commit `233fe617f57f3c75e0a2d31214ff731a62b509ca`.
