@@ -1,16 +1,17 @@
 const sensitiveKey = /^(?:mac(?:address)?|device(?:name|id|identifier)?|gateway(?:id|identifier)?|serial(?:number|no)?|commonname|fingerprint|certificatefingerprint|publickeyhash|publickey|certificate|identity)$/i;
 
 function redactJsonValue(value: unknown, key?: string): unknown {
-  if (key && sensitiveKey.test(key) && key.toLowerCase() === 'identity' && value && typeof value === 'object' && !Array.isArray(value)) {
+  const normalizedKey = key?.replace(/[_ -]/g, '').toLowerCase();
+  if (normalizedKey && sensitiveKey.test(normalizedKey) && normalizedKey === 'identity' && value && typeof value === 'object' && !Array.isArray(value)) {
     return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, redactJsonValue(child, childKey)]));
   }
-  if (key && sensitiveKey.test(key)) {
-    if (key.toLowerCase().includes('mac')) return value === null ? null : '[REDACTED MAC]';
-    if (key.toLowerCase().includes('fingerprint')) return value === null ? null : '[REDACTED CERTIFICATE FINGERPRINT]';
-    if (key.toLowerCase().includes('commonname')) return value === null ? null : '[REDACTED COMMON NAME]';
-    if (key.toLowerCase().includes('serial')) return value === null ? null : '[REDACTED SERIAL NUMBER]';
-    if (key.toLowerCase().includes('publickey')) return value === null ? null : '[REDACTED PUBLIC KEY]';
-    if (key.toLowerCase().includes('certificate')) return value === null ? null : '[REDACTED CERTIFICATE]';
+  if (normalizedKey && sensitiveKey.test(normalizedKey)) {
+    if (normalizedKey.includes('mac')) return value === null ? null : '[REDACTED MAC]';
+    if (normalizedKey.includes('fingerprint')) return value === null ? null : '[REDACTED CERTIFICATE FINGERPRINT]';
+    if (normalizedKey.includes('commonname')) return value === null ? null : '[REDACTED COMMON NAME]';
+    if (normalizedKey.includes('serial')) return value === null ? null : '[REDACTED SERIAL NUMBER]';
+    if (normalizedKey.includes('publickey')) return value === null ? null : '[REDACTED PUBLIC KEY]';
+    if (normalizedKey.includes('certificate')) return value === null ? null : '[REDACTED CERTIFICATE]';
     return value === null ? null : '[REDACTED DEVICE ID]';
   }
   if (Array.isArray(value)) return value.map((item) => redactJsonValue(item));
