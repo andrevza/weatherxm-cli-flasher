@@ -44,6 +44,7 @@ describe('standalone executable packaging', () => {
     expect(help).not.toMatch(/\u001b\[/);
     const commandHelp = execFileSync(executable, ['check', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(commandHelp).toContain('Never writes flash');
+    expect(commandHelp).toContain('[--redact]');
     const monitorHelp = execFileSync(executable, ['monitor', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(monitorHelp).toContain('receive-only');
     const badInput = spawnSync(executable, ['check', 'weatherxm', '--json'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
