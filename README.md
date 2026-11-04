@@ -1,12 +1,16 @@
 # WeatherXM WG1200 CLI
 
-Standalone command-line utility for inspecting a WeatherXM WG1200 gateway and installing official firmware without a browser.
+Independent command-line utility for inspecting, verifying and installing compatible firmware on WeatherXM WG1200 gateways without a browser. It is not an official WeatherXM utility.
 
 ## Status
 
 Commands include `info`, `verify`, `status`, `firmware list`, and `flash`. Device inspection enters the ESP32-S3 ROM loader and resets the device to run a RAM stub. `flash` writes only the inactive OTA app slot and OTA selection metadata, after exact layout validation, firmware integrity checks, and explicit confirmation.
 
 The official reference repository and exact behavior reviewed are documented in [docs/official-flasher-analysis.md](docs/official-flasher-analysis.md). The staged implementation plan is in [docs/implementation-plan.md](docs/implementation-plan.md). Safety rules are in [SAFETY.md](SAFETY.md).
+
+## Hardware validation
+
+The Linux ARM64 standalone built from commit `233fe617` completed three rounds each of `info`, `verify`, and `status` on a Raspberry Pi 5 with a WG1200. All nine read-only runs passed; each took about 4–5 seconds. This validates inspection and verification on that hardware, not firmware installation, erase, or recovery. See the [hardware validation record](docs/hardware-validation.md) for the build identity and limits.
 
 Contributor workflow and safety requirements are in [AGENTS.md](AGENTS.md). Command examples and sample dual-slot output are in [EXAMPLE.md](EXAMPLE.md).
 
@@ -18,11 +22,11 @@ The release workflow builds a self-contained executable with the Node.js runtime
 
 | Release artifact | OS and architecture | Minimum validated OS baseline | Status in this project |
 | --- | --- | --- | --- |
-| `weatherxm-flash-macos-arm64` | macOS ARM64 (Apple Silicon) | macOS 14 build runner | Built and read-only hardware validated on macOS ARM64 in this environment. |
-| `weatherxm-flash-linux-arm64` | Linux ARM64 | Ubuntu 22.04 build runner | Release pipeline target; physical-device validation is performed only by the configured Linux ARM64 release gate. |
-| `weatherxm-flash-linux-x64` | Linux x64 | Ubuntu 22.04 build runner | Release pipeline target and executable smoke-tested in the release workflow; no physical-device validation is recorded here. |
+| `weatherxm-flash-macos-arm64` | macOS ARM64 (Apple Silicon) | macOS 14 build runner | Build target; physical hardware validation is not claimed in this validation record. |
+| `weatherxm-flash-linux-arm64` | Linux ARM64 | Ubuntu 22.04 build runner | Read-only physical validation reported on Raspberry Pi 5; see [hardware validation](docs/hardware-validation.md). |
+| `weatherxm-flash-linux-x64` | Linux x64 | Ubuntu 22.04 build runner | Build and release-workflow smoke-test target; no physical-device validation is recorded here. |
 
-Treat these as the minimum validated OS baselines for this distribution: macOS 14 and Ubuntu 22.04. Older OS releases have not been established as compatible; newer releases still need the required runtime libraries. All three artifacts are supported by the release build/test matrix. This environment has physically validated read-only WG1200 commands on macOS ARM64. The release workflow's Linux ARM64 hardware gate runs only when its self-hosted device runner is configured; Linux x64 has no physical-device validation in that workflow.
+Build runner baselines are macOS 14 and Ubuntu 22.04. Older OS releases have not been established as compatible; newer releases still need the required runtime libraries. Linux ARM64 has completed repeated read-only hardware tests on a Raspberry Pi 5. Other platform targets are not claimed as physically validated.
 
 Linux executables need a compatible system C/C++ runtime and `libatomic.so.1` (usually provided by the `libatomic1` package on Debian/Ubuntu). Linux users need permission to open the serial device, often through the `dialout` group; log out and back in after changing group membership. Containers must expose the serial device, commonly `/dev/ttyUSB0` or `/dev/serial/by-id/...`.
 
@@ -140,6 +144,10 @@ wg1200 flash meshtastic --port /dev/ttyUSB0
 # Complete inspection and then keep listening to the booted device
 wg1200 info --port /dev/ttyUSB0 --monitor
 
+# Share identifying output more safely (review before posting)
+wg1200 info --port /dev/ttyUSB0 --json --redact
+wg1200 status --port /dev/ttyUSB0 --redact
+
 # Capture post-flash boot logs for 30 seconds, or disable the finite capture
 wg1200 flash weatherxm --port /dev/ttyUSB0 --boot-log-seconds 30
 wg1200 flash weatherxm --port /dev/ttyUSB0 --boot-log-seconds 0
@@ -175,6 +183,8 @@ Baud defaults to 115200, matching the WG1200 web flasher. Firmware writes report
 `check <firmware>` downloads and validates the actual firmware image, inspects the gateway, then applies the same descriptor comparison policy as flash preflight. Completed checks always exit `0`, including up-to-date, update available, downgrade blocked, approval required, and incompatible firmware results. Invalid input, unavailable manifests, image-integrity failures, and device-validation errors exit nonzero. A firmware-type change is reported as incompatible/approval-required and is never described as a normal version upgrade.
 
 `monitor` opens a receive-only serial session without creating an esptool loader, sending serial bytes, or changing DTR/RTS. It supports `--timestamp`, `--level error|warn|info|debug|verbose`, `--output <file>`, `--raw`, and `--no-color`. The monitor sanitizes certificate/key blocks and long hex values even in raw mode. `--monitor` on a device operation starts this same passive reader after the operation closes and releases its own serial connection; duplicate owners are never kept open together. Because the monitor must reopen after the inspection/reset handoff, some early boot messages can occur before it begins listening.
+
+`--redact` masks MAC addresses, gateway/device identifiers and names, certificate common names, fingerprints and PEM blocks, public keys/hashes, serial-number fields, and common USB serial paths in human-readable and JSON output, including application diagnostics and monitor output files. It does not alter values used internally for device identity, validation, or cryptographic checks. It preserves operational details such as chip model, firmware version, flash size, and partition layout. Redaction uses field names and recognizable text patterns; it cannot identify every possible secret, so review logs before sharing them.
 
 Post-flash boot capture defaults to 15 seconds. Set `--boot-log-seconds 0` to skip it or a positive value up to 3600 to change the duration. `--monitor` overrides finite capture and continues until Ctrl+C. Flash, OTA metadata, and protected-partition verification are reported separately from boot evidence. Missing boot logs report `NOT OBSERVED`; `applicationHealthy` remains `not-checked` because no reliable application health probe is currently defined.
 
@@ -226,10 +236,10 @@ Tests use fixtures and mocks. They do not connect to a gateway or perform firmwa
 
 ## Release process
 
-Create and push a `v*` tag to start `.github/workflows/release-binaries.yml`. It builds each target on a matching native GitHub runner, smoke-tests startup, catalog retrieval, and Linux native serial binding loading, then waits for a self-hosted Linux ARM64 runner labeled `wg1200` with a gateway connected. Configure `WG1200_PORT` in that runner environment. Its gate runs `verify --json` only; this enters the ROM loader and resets the device, but does not write flash. The release is published only after that hardware check passes. SHA-256 checksums are generated beside the artifacts.
+The release workflow builds each target on a matching native runner, smoke-tests startup and the serial binding, then waits for the configured self-hosted Linux ARM64 read-only device gate. It generates SHA-256 checksums and creates a **draft prerelease** that is not public until manually published. Its notes distinguish physically tested read-only operations from automated-only write paths. Do not publish it as production-ready until firmware installation and OTA activation have been separately validated on hardware. No release has been created by this task.
 
 The hardware gate is intentional: no release is published until an actual WG1200 serial session confirms read-only identity, flash layout, credentials, and OTA metadata checks. Automated firmware-write testing remains fixture/mock-only. Never use the release gate to run `flash`.
 
 ## License
 
-This CLI/source is distributed under Apache-2.0. Reused WeatherXM implementation code is attributed to [WeatherXM/web-flasher](https://github.com/WeatherXM/web-flasher) at commit `35b2ecc4ccb31799ecd720609786362a99b3e33a`; see [UPSTREAM_NOTICES.md](UPSTREAM_NOTICES.md) and [LICENSE](LICENSE). Firmware images are fetched from upstream release locations and are not included in this repository.
+This CLI/source is distributed under Apache-2.0. Reused WeatherXM implementation code is attributed to [WeatherXM/web-flasher](https://github.com/WeatherXM/web-flasher) at commit `35b2ecc4ccb31799ecd720609786362a99b3e33a`; see [UPSTREAM_NOTICES.md](UPSTREAM_NOTICES.md) and [LICENSE](LICENSE). Firmware manifests and images are fetched from WeatherXM's hosted catalog and official [WG1200 firmware source](https://github.com/WeatherXM/wg1200-firmware); the official [WeatherXM Web Flasher](https://flash.weatherxm.com/) and its [source repository](https://github.com/WeatherXM/web-flasher) are useful references. This independent project does not include or redistribute official firmware binaries.

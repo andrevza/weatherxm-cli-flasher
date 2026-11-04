@@ -20,7 +20,7 @@ Each target executes `--serial-binding-smoke`, which checks the addon exports it
 
 The optional `scripts/install-wg1200.sh` requires an explicitly configured GitHub owner/repository and release tag because the source checkout has no canonical release URL configured. It downloads only over HTTPS, verifies the requested artifact against `SHA256SUMS`, and uses a no-clobber hard-link operation to create the installed command atomically. Manual installation remains supported.
 
-The release workflow then requires a self-hosted 16 KB Linux ARM64 runner with a WG1200 attached (configure a Raspberry Pi 5 runner with `WG1200_PORT`). It runs version/help/catalog commands, then `info --json` and `verify --json`. Device inspection enters the ROM loader and resets the gateway, but these commands do not write flash. No release is published until this hardware check passes. Firmware-write tests remain mock/fixture-only.
+The release workflow then requires a self-hosted 16 KB Linux ARM64 runner with a WG1200 attached (configure a Raspberry Pi 5 runner with `WG1200_PORT`). The read-only script runs three rounds of `info`, `verify`, and `status`, with `--redact` on diagnostic output, and briefly exercises passive monitor mode. Device inspection enters the ROM loader and resets the gateway, but these commands do not write flash. A successful workflow creates a draft prerelease; its release notes distinguish read-only physical validation from automated-only write paths. Firmware-write tests remain mock/fixture-only.
 
 ## Why not Bun compile
 

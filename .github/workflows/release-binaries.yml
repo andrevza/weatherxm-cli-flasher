@@ -107,6 +107,16 @@ jobs:
         run: sha256sum weatherxm-flash-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          prerelease: true
+          body: |
+            This draft is a prerelease candidate, not a production-ready firmware installer.
+
+            **Physical hardware validated:** Linux ARM64 standalone read-only `info`, `verify`, and `status` on Raspberry Pi 5 / WG1200 (three rounds each, recorded in `docs/hardware-validation.md`).
+
+            **Automated only:** firmware image validation, comparison, write transaction guards, and presentation paths use fixtures and mocks.
+
+            **Not physically validated:** firmware installation, OTA activation, and recovery. The CLI exposes no erase command. Do not publish this release as production-ready until the write path has separate controlled hardware validation.
           files: |
             release/weatherxm-flash-*
             release/SHA256SUMS

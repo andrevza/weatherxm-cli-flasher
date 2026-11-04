@@ -84,6 +84,22 @@ describe('standalone executable packaging', () => {
     expect(matchingDryRun).toContain('Selected firmware matches the build descriptor stored in the inactive OTA slot.');
   });
 
+  it.skipIf(!builtExecutable)('redacts synthetic nested JSON and diagnostics in the actual executable', () => {
+    const executable = resolve(builtExecutable!);
+    const env = { PATH: '', TMPDIR: tmpdir(), TMP: tmpdir(), TEMP: tmpdir(), NO_COLOR: '1' };
+    const raw = execFileSync(executable, ['--redaction-smoke'], { encoding: 'utf8', env, timeout: 15_000 });
+    expect(raw).toContain('AA:BB:CC:DD:EE:FF');
+    const safe = execFileSync(executable, ['--redact', '--redaction-smoke'], { encoding: 'utf8', env, timeout: 15_000 });
+    expect(safe).toContain('[REDACTED MAC]');
+    expect(safe).toContain('[REDACTED COMMON NAME]');
+    expect(safe).toContain('[REDACTED CERTIFICATE FINGERPRINT]');
+    expect(safe).toContain('"chip": "ESP32-S3"');
+    expect(safe).not.toContain('AA:BB:CC:DD:EE:FF');
+    expect(safe).not.toContain('gateway-secret.example');
+    expect(safe).not.toContain('1234');
+    expect(safe).not.toContain('AB12CD34EF56');
+  });
+
   it.skipIf(!builtExecutable)('reports embedded source and build metadata', () => {
     const executable = resolve(builtExecutable!);
     const metadata = JSON.parse(execFileSync(executable, ['--build-info'], { encoding: 'utf8', timeout: 15_000 }));

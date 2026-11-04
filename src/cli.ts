@@ -9,10 +9,11 @@ import { finished } from 'node:stream/promises';
 import { analyzeBootLogs } from './upstream/flasher/serialLog.js';
 import { monitorSerial, type MonitorLevel } from './monitor.js';
 import { formatCheckOutput, formatDryRunOutput, formatStatusOutput, standalonePresentationFixture } from './presentation.js';
+import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -45,7 +46,7 @@ function operatingSystemLabel(platform: string): string {
 
 function renderVersion(args: string[]): boolean {
   if (!args.includes('--version') && !args.includes('-v')) return false;
-  const unsupported = args.filter((arg) => !['--version', '-v', '--verbose', '--json'].includes(arg));
+  const unsupported = args.filter((arg) => !['--version', '-v', '--verbose', '--json', '--redact'].includes(arg));
   if (unsupported.length) throw new Error(`Version options cannot be combined with commands or other options: ${unsupported.join(' ')}`);
   const verbose = args.includes('--verbose');
   const info = versionInfo(verbose);
@@ -63,13 +64,14 @@ function parseArgs(argv: string[]): Args {
   let helpRequested = false;
   let manifestProvided = false;
   let bootLogProvided = false;
-  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, yes: false, recover: false, force: false, dryRun: false, traceSerial: false, monitor: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
+  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, traceSerial: false, monitor: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--port' || arg === '-p') out.port = argv[++i];
     else if (arg === '--baud') out.baud = Number(argv[++i]);
     else if (arg === '--manifest') { out.manifest = argv[++i]; manifestProvided = true; }
     else if (arg === '--json') out.json = true;
+    else if (arg === '--redact') out.redact = true;
     else if (arg === '--yes') out.yes = true;
     else if (arg === '--recover') out.recover = true;
     else if (arg === '--force') out.force = true;
@@ -141,6 +143,7 @@ function help(command?: string, plain = false) {
   output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
   output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Writes are restricted to the validated inactive OTA slot.\n  Identical firmware is skipped unless --force is explicit.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
   output = output.replace('  -h, --help          Show help', '  -v, --version       Show application version; add --verbose for build details\n  -h, --help          Show help');
+  output = output.replace('  --manifest <url>', '  --redact            Mask device and certificate identifiers in output\n  --manifest <url>');
   process.stdout.write(output);
 }
 
@@ -156,7 +159,8 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
       output: (value) => {
         const rendered = `${value}${value.endsWith('\n') ? '' : '\n'}`;
         target.write(rendered);
-        file?.write(`${rendered.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')}`);
+        const plain = rendered.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+        file?.write(args.redact ? redactOutput(plain) : plain);
       },
     });
     target.write('Serial port released.\n');
@@ -173,6 +177,10 @@ async function main() {
   if (renderVersion(process.argv.slice(2))) return;
   if (process.argv[2] === '--build-info') {
     process.stdout.write(`${JSON.stringify(typeof __BUILD_METADATA__ === 'undefined' ? { packageVersion: packageMetadata.version, builtAt: null, sourceSha256: null, gitCommit: null, gitTag: null, gitDirty: null } : __BUILD_METADATA__, null, 2)}\n`);
+    return;
+  }
+  if (process.argv.includes('--redaction-smoke')) {
+    for (const fixtureChunk of standaloneRedactionFixture()) process.stdout.write(fixtureChunk);
     return;
   }
   if (process.argv[2] === '--presentation-smoke') {
@@ -222,7 +230,8 @@ async function main() {
       if (!stdin.isTTY || !stdout.isTTY) throw new Error('No interactive terminal. Review the displayed write and pass --yes to confirm explicitly.');
       const rl = createInterface({ input: stdin, output: stdout });
       try {
-        const phrase = `FLASH ${summary.deviceName} ${summary.firmwareKey}${summary.recovery ? ' RECOVERY' : ''}`;
+        const reviewedDevice = args.redact ? '[REDACTED DEVICE ID]' : summary.deviceName;
+        const phrase = `FLASH ${reviewedDevice} ${summary.firmwareKey}${summary.recovery ? ' RECOVERY' : ''}`;
         const answer = await rl.question(`Type ${phrase} to continue: `);
         return answer === phrase;
       } finally { rl.close(); }
@@ -283,6 +292,14 @@ async function main() {
     process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
   }
   if (args.monitor) await runMonitor(args);
+}
+
+if (process.argv.includes('--redact')) {
+  for (const stream of [process.stdout, process.stderr]) {
+    const originalWrite = stream.write.bind(stream);
+    (stream as unknown as { write: (...args: any[]) => boolean }).write = (chunk: string | Uint8Array, ...args: any[]) =>
+      originalWrite(redactOutput(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')), ...args);
+  }
 }
 
 main().catch((err: unknown) => {

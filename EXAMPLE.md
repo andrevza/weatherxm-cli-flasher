@@ -49,6 +49,7 @@ The standalone builder uses Node's SEA builder. Bun may run the source app, but 
 
 ```sh
 wg1200 status --port /dev/cu.usbserial-13210
+wg1200 info --port /dev/cu.usbserial-13210 --json --redact
 ```
 
 Example output:
@@ -80,6 +81,8 @@ NEXT INSTALLATION
 ```
 
 Active/inactive labels come from OTA metadata. The next target is the slot selected by the current OTA state; it is not activated by `status`.
+
+Add `--redact` to mask device and certificate identifiers when saving or sharing output. Review every log before publishing because pattern-based redaction cannot guarantee that all identifying values have been removed.
 
 ## Compare an available release
 

@@ -23,16 +23,16 @@ fi
 round=1
 while [ "$round" -le 3 ]; do
   echo "Read-only WG1200 hardware pass $round/3"
-  "$binary" info --port "$WG1200_PORT" --json
-  "$binary" verify --port "$WG1200_PORT" --json
-  "$binary" status --port "$WG1200_PORT" --json
+  "$binary" info --port "$WG1200_PORT" --json --redact
+  "$binary" verify --port "$WG1200_PORT" --json --redact
+  "$binary" status --port "$WG1200_PORT" --json --redact
   round=$((round + 1))
 done
 
 # The monitor is passive and runs until interrupted. Give it a short bounded
 # read window so the hardware gate exercises the command without hanging.
 set +e
-timeout --signal=INT --kill-after=2s 5s "$binary" monitor --port "$WG1200_PORT"
+timeout --signal=INT --kill-after=2s 5s "$binary" monitor --port "$WG1200_PORT" --redact
 monitor_status=$?
 set -e
 if [ "$monitor_status" -ne 124 ] && [ "$monitor_status" -ne 130 ]; then

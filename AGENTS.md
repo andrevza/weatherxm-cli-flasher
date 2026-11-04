@@ -19,6 +19,7 @@ This repository contains the WeatherXM WG1200 CLI and its standalone serial flas
 - Keep inspection and dry-run read-only with respect to flash. Inspection may enter the ESP32 ROM loader, read metadata, and reset the gateway; state this accurately in user-facing docs.
 - Never run firmware writes or erases as a test. Physical-device checks must be read-only (`info`, `verify`, `status`, `check`, or `flash --dry-run`) and should only be done when explicitly requested.
 - JSON mode must emit valid JSON on stdout. Send diagnostics to stderr and use `null` for unavailable fields rather than guessed values.
+- `--redact` must be applied at the output boundary for stdout and stderr, including JSON, diagnostics, monitor display, and monitor output files. Keep original identity values for validation and cryptographic operations. Extend `tests/redaction.test.ts` and the standalone executable redaction fixture for any new sensitive output fields.
 
 ## Development and verification
 
@@ -47,6 +48,8 @@ WG1200_STANDALONE_BINARY="$PWD/dist/weatherxm-flash-macos-arm64" npm test
 ```
 
 `tests/standaloneExecutable.test.ts` runs the real binary's embedded presentation fixtures and checks that both OTA slots, versions/builds, target details, comparisons, and the inactive-match message are present. It also verifies `--version`, `-v`, verbose and JSON output, and the package version in normal help. Keep that regression coverage in sync with formatter changes. The binary's verbose version output identifies package version, build timestamp, source SHA-256, Git commit/tag, and whether the build tree was dirty; `--version --json` is available for automation. Tagged GitHub release builds must use a clean checkout. `--build-info` remains an internal build-validation command.
+
+The optional `--redact` output mode masks MAC addresses, gateway/device IDs and names, certificate common names/fingerprints/PEM blocks, public keys/hashes, serial-number fields, and common USB serial paths. It keeps chip, firmware, flash, and partition details useful for diagnosis. It cannot guarantee detection of every sensitive value; docs must tell users to review logs before sharing.
 
 Do not treat a help output smoke test as verification that firmware presentation code is current.
 

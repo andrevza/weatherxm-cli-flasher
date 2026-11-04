@@ -8,6 +8,13 @@
 
 `flash` downloads and validates the selected image, inspects the device, presents identity/hash/inactive-slot/address for explicit confirmation, and re-inspects immediately before the first write. It uses the upstream bounded OTA write and activation functions. No hardware write tests are run.
 
+## Command effects
+
+- Read-only inspection: `info`, `verify`, `status`, `check`, and `firmware list` do not write or erase flash. Device inspection enters ROM loader mode and resets the gateway; `check` also downloads the selected image.
+- Installation: `flash <firmware>` can write the validated inactive OTA application slot and one OTA-selection sector after image checks, device checks, reinspection, and explicit confirmation. This modifies device firmware and may leave the gateway unusable if power or transport is interrupted.
+- Recovery: `flash <firmware> --recover` opts into the narrowly bounded recovery flow for ambiguous OTA metadata. It still writes and is not a read-only diagnostic operation.
+- Erase: the CLI exposes no standalone erase command and must never issue a full-chip erase. Flash writes are bounded to the inactive OTA app and the selected OTA metadata sector.
+
 The comparison uses application type, version, and the descriptor's embedded app ELF SHA-256 build identifier. An exact match is skipped unless `--force` is supplied. `--force` changes only that duplicate skip; it cannot bypass identity/layout/MD5/image-integrity/OTA/write-boundary/protected-region checks or explicit confirmation. Downgrades remain blocked with or without `--force`. Ambiguous version ordering and firmware-type changes need separate interactive approval and cannot be approved by `--yes` or `--force`.
 
 When OTA metadata is ambiguous, flashing fails by default. `--recover` explicitly opts into the upstream targeted recovery behavior, which writes the determined OTA target while preserving factory firmware and the other OTA metadata sector; the normal confirmation is still required.
@@ -34,3 +41,5 @@ Partition addresses come from WeatherXM WG1200 source, reviewed at commit `35b2e
 ## Firmware trust
 
 Upstream checks the manifest SHA-256 and Secure Boot V2 signature-block marker (`0xE7` at the final 4096-byte block). These establish integrity against the fetched manifest and expected packaging marker; they are not an independent cryptographic verification of the Secure Boot signature. The CLI will not claim that marker alone verifies signer authenticity.
+
+The manifest requires `secure_boot_v2: true`; the device itself remains responsible for secure-boot enforcement. Do not disable Secure Boot or bypass signature verification. Firmware images are obtained from WeatherXM's official sources; this repository does not include those binaries.
