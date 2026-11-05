@@ -116,6 +116,19 @@ export function assertAllowedApplicationWrite(
   return result.partitionName;
 }
 
+/** Returns the sector-rounded erase interval for esptool-js's four-byte padded app write. */
+export function getApplicationEraseRange(address: number, length: number): { slot: 'ota_0' | 'ota_1'; start: number; end: number } {
+  const slot = assertAllowedApplicationWrite(address, length);
+  const partition = slot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  const paddedLength = Math.ceil(length / 4) * 4;
+  const writeEnd = address + paddedLength;
+  const eraseEnd = Math.ceil(writeEnd / 0x1000) * 0x1000;
+  if (address !== partition.offset || !Number.isSafeInteger(eraseEnd) || eraseEnd > partition.offset + partition.size) {
+    throw new Error(`Rounded application erase range exceeds the ${slot} partition`);
+  }
+  return { slot, start: address, end: eraseEnd };
+}
+
 /**
  * Strictly verifies that an otadata update targets exactly one 4 KB sector:
  * - Sector 0: 0x13000 (length 4096)

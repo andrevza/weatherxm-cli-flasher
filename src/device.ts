@@ -1,4 +1,4 @@
-import type { Wg1200Inspection, Wg1200Transport } from './upstream/flasher/transport.js';
+import { assertCompleteProtectedRegionSnapshots, type Wg1200Inspection, type Wg1200Transport } from './upstream/flasher/transport.js';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { EXPECTED_WG1200_PARTITIONS, parsePartitionTableWithMetadata } from './upstream/flasher/partitions.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
@@ -9,6 +9,7 @@ import { fetchCatalog } from './catalog.js';
 import { analyzeBootLogs, captureBootLogs } from './upstream/flasher/serialLog.js';
 import { parseAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { isValidAppDescriptor } from './upstream/flasher/appDescriptor.js';
+import { assertAllowedApplicationWrite } from './upstream/flasher/writeGuard.js';
 import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from './upstream/flasher/firmwareComparison.js';
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
 import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
@@ -172,20 +173,37 @@ export function summarizeBootLog(lines: string[]) {
   };
 }
 export interface OtaWriteOperations {
+  readOtadataSnapshot(): Promise<Uint8Array>;
   installApplication(offset: number, bytes: Uint8Array, onProgress?: (percent: number) => void): Promise<void>;
   verifyApplicationFlash(offset: number, expectedMd5: string, length: number): Promise<boolean>;
   writeOtaSelectSector(address: number, bytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void>;
-  verifyProtectedRegions(snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>): Promise<{ valid: boolean; mismatches: string[] }>;
+  verifyProtectedRegions(snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>, preservedOtaSlot: 'ota_0' | 'ota_1'): Promise<{ valid: boolean; mismatches: string[] }>;
   hardReset(): Promise<void | boolean>;
 }
 
 export async function runOtaWriteTransaction(transport: OtaWriteOperations, input: {
   targetOffset: number; firmwareBytes: Uint8Array; nextSeq: number; targetSector: 0 | 1;
+  preservedOtaSlot: 'ota_0' | 'ota_1'; recovery?: boolean;
   snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>;
   otadataBefore: Uint8Array;
 }, onProgress?: (percent: number) => void): Promise<{ flashVerified: true; otaMetadataVerified: true; protectedPartitionsVerified: true; deviceReleased: boolean }> {
   if (!Number.isSafeInteger(input.nextSeq) || input.nextSeq <= 0 || input.nextSeq >= 0xffffffff) {
     throw new Error('OTA sequence is outside the safely supported range; OTA activation was not attempted');
+  }
+  assertCompleteProtectedRegionSnapshots(input.snapshots, input.preservedOtaSlot);
+  assertAllowedApplicationWrite(input.targetOffset, input.firmwareBytes.byteLength);
+  if (input.otadataBefore.byteLength !== WG1200_CONSTANTS.OTADATA.size) throw new Error('OTA metadata snapshot has an invalid length; application write was not attempted');
+  const parsedBefore = determineActiveBootSlot(input.otadataBefore);
+  if (parsedBefore.isAmbiguous && !input.recovery) throw new Error('OTA metadata is ambiguous; application write was not attempted');
+  const expectedTarget = input.preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_1 : WG1200_CONSTANTS.APP_OTA_0;
+  if (input.targetOffset !== expectedTarget.offset || parsedBefore.targetOffset !== input.targetOffset ||
+      parsedBefore.targetSector !== input.targetSector || parsedBefore.nextSeq !== input.nextSeq) {
+    throw new Error('OTA target no longer matches the validated inactive slot; application write was not attempted');
+  }
+  const currentOtadata = await transport.readOtadataSnapshot();
+  if (currentOtadata.byteLength !== WG1200_CONSTANTS.OTADATA.size || currentOtadata.byteLength !== input.otadataBefore.byteLength ||
+      !Buffer.from(currentOtadata).equals(Buffer.from(input.otadataBefore))) {
+    throw new Error('OTA metadata changed before application write; application write was not attempted');
   }
   await transport.installApplication(input.targetOffset, input.firmwareBytes, onProgress);
   const expectedMd5 = md5Hex(input.firmwareBytes);
@@ -193,7 +211,7 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
     throw new Error('On-chip flash MD5 mismatch; OTA activation was not attempted');
   }
   // Do not make the new slot bootable until all protected-region checks pass.
-  const protectedResult = await transport.verifyProtectedRegions(input.snapshots);
+  const protectedResult = await transport.verifyProtectedRegions(input.snapshots, input.preservedOtaSlot);
   if (!protectedResult.valid) throw new Error(`Protected flash data changed: ${protectedResult.mismatches.join('; ')}; OTA activation was not attempted`);
   const { targetAddress, sectorData } = buildTransactionalOtadataSector(input.nextSeq, input.targetSector);
   await transport.writeOtaSelectSector(targetAddress, sectorData, input.nextSeq, input.otadataBefore);
@@ -370,7 +388,6 @@ export async function flashDevice(options: DeviceOptions & {
       throw new Error('Device identity or OTA target changed after confirmation; refusing to write');
     }
 
-    const snapshots = await transport.snapshotProtectedRegions();
     const otadataBefore = await transport.readOtadataSnapshot();
     const preCommitOta = determineActiveBootSlot(otadataBefore);
     if (preCommitOta.activeSlot !== fresh.otadata.activeSlot || preCommitOta.activeSeq !== fresh.otadata.activeSeq ||
@@ -379,10 +396,13 @@ export async function flashDevice(options: DeviceOptions & {
         preCommitOta.isAmbiguous !== fresh.otadata.isAmbiguous) {
       throw new Error('OTA metadata changed after confirmation; refusing application write');
     }
+    const preservedOtaSlot = fresh.otadata.targetSlot === 'ota_0' ? 'ota_1' : 'ota_0';
+    const snapshots = await transport.snapshotProtectedRegions(preservedOtaSlot);
     let lastProgress = -5;
     const transactionResult = await runOtaWriteTransaction(transport, {
       targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data,
       nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots, otadataBefore,
+      preservedOtaSlot, recovery: options.recovery,
     }, (percent) => {
       if (percent === 100 || percent >= lastProgress + 5) {
         lastProgress = percent;

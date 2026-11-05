@@ -9,10 +9,10 @@ import { formatWg1200DeviceName, verifySecureCertIdentity, type SecureCertVerifi
 import { buildOtadataSector, determineActiveBootSlot, parseOtadataSector, type OtadataStatus } from './otadata';
 import { parsePartitionTableWithMetadata, verifyWg1200PartitionTable, type PartitionRecord } from './partitions';
 import {
-  assertAllowedApplicationWrite,
   assertAllowedFactoryRollbackWrite,
   assertAllowedFullBackupRestore,
   assertAllowedOtaSelectWrite,
+  getApplicationEraseRange,
 } from './writeGuard';
 
 let isTransportPatched = false;
@@ -808,8 +808,10 @@ export class Wg1200Transport {
   /**
    * Snapshots SHA-256 hashes of all protected regions before flashing.
    */
-  public async snapshotProtectedRegions(): Promise<ProtectedRegionSnapshot[]> {
-    const targets = PROTECTED_REGIONS.filter((region) => region.name !== 'otadata');
+  public async snapshotProtectedRegions(preservedOtaSlot: 'ota_0' | 'ota_1'): Promise<ProtectedRegionSnapshot[]> {
+    const otaRegion = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+    const targets = [...PROTECTED_REGIONS.filter((region) => region.name !== 'otadata'),
+      { name: 'preserved_ota', offset: otaRegion.offset, size: otaRegion.size }];
 
     const snapshots: ProtectedRegionSnapshot[] = [];
     for (const target of targets) {
@@ -829,17 +831,15 @@ export class Wg1200Transport {
    * Re-reads protected regions and verifies hashes match the pre-flash snapshot.
    */
   public async verifyProtectedRegions(
-    beforeSnapshots: ProtectedRegionSnapshot[]
+    beforeSnapshots: ProtectedRegionSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1'
   ): Promise<{ valid: boolean; mismatches: string[] }> {
-    assertCompleteProtectedRegionSnapshots(beforeSnapshots);
+    assertCompleteProtectedRegionSnapshots(beforeSnapshots, preservedOtaSlot);
     const mismatches: string[] = [];
 
     for (const snap of beforeSnapshots) {
       const currentHash = await this.hashRegionSha256(snap.offset, snap.size);
       if (!compareHexHashes(snap.sha256, currentHash)) {
-        mismatches.push(
-          `Protected partition '${snap.name}' was modified! Expected SHA ${snap.sha256}, got ${currentHash}`
-        );
+        mismatches.push(`Protected partition '${snap.name}' was modified`);
       }
     }
 
@@ -861,7 +861,7 @@ export class Wg1200Transport {
     if (!this.loader) throw new Error('Not connected');
 
     // 1. Guard check: strictly allow only ota_0 or ota_1 (never factory)
-    assertAllowedApplicationWrite(slotOffset, firmwareBytes.byteLength);
+    getApplicationEraseRange(slotOffset, firmwareBytes.byteLength);
 
     // 2. Perform guarded flash write
     this.logger.log(
@@ -1241,9 +1241,11 @@ export class Wg1200Transport {
   }
 }
 
-export function assertCompleteProtectedRegionSnapshots(snapshots: ProtectedRegionSnapshot[]): void {
-  const required = PROTECTED_REGIONS.filter((region) => region.name !== 'otadata')
-    .map(({ name, offset, size }) => ({ name, offset, size }))
+export function assertCompleteProtectedRegionSnapshots(snapshots: ProtectedRegionSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1'): void {
+  const otaRegion = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  const required = [...PROTECTED_REGIONS.filter((region) => region.name !== 'otadata')
+    .map(({ name, offset, size }) => ({ name, offset, size })),
+  { name: 'preserved_ota', offset: otaRegion.offset, size: otaRegion.size }]
     .sort((a, b) => a.name.localeCompare(b.name));
   const provided = snapshots.map(({ name, offset, size, sha256 }) => {
     if (!/^[a-f0-9]{64}$/i.test(sha256)) throw new Error(`Protected region '${name}' has an invalid SHA-256 snapshot`);
