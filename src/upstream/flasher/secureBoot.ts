@@ -21,6 +21,19 @@ export interface SecureBootKeyBlock {
   readProtected: boolean | null;
   publicKeyHash: string | null;
   digestStatus: EvidenceStatus;
+  readDiagnostic: KeyDigestReadDiagnostic | null;
+}
+
+export interface KeyDigestReadDiagnostic {
+  operation: 'READ_REG';
+  logicalSlot: number;
+  physicalBlock: number;
+  registerBaseOffset: string;
+  expectedWords: 8;
+  wordsRead: number;
+  errorCategory: 'read-protected' | 'protection-state-unavailable' | 'serial-read-failed' | 'rom-command-unavailable' | 'register-read-failed' | 'invalid-register-value' | 'empty-readable-block' | null;
+  failedWordIndex: number | null;
+  failedRegisterOffset: string | null;
 }
 
 export interface SecureBootDeviceState {
@@ -56,6 +69,19 @@ function wordBytes(value: number): Uint8Array {
   return bytes;
 }
 
+/** esptool-js 0.7.0 assembles READ_REG values with JS bitwise operators and can return a signed int32. */
+function unsignedRegisterWord(value: number): number | null {
+  if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) return null;
+  return value >>> 0;
+}
+
+function registerErrorCategory(error: unknown): KeyDigestReadDiagnostic['errorCategory'] {
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (/timeout|serial|port closed|stream stopped|no data/.test(message)) return 'serial-read-failed';
+  if (/unsupported|not supported|invalid command/.test(message)) return 'rom-command-unavailable';
+  return 'register-read-failed';
+}
+
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -81,9 +107,9 @@ export async function readEsp32S3SecureBootState(
   let block0Status: EvidenceStatus = 'verified';
   for (let i = 0; i < 6; i++) {
     try {
-      const word = await readReg(ESP32S3_EFUSE.block0 + i * 4);
-      if (!Number.isInteger(word) || word < 0 || word > 0xffffffff) throw new Error('invalid register value');
-      words.push(word >>> 0);
+      const word = unsignedRegisterWord(await readReg(ESP32S3_EFUSE.block0 + i * 4));
+      if (word === null) throw new Error('invalid register value');
+      words.push(word);
     } catch {
       words.push(0);
       block0Status = 'unavailable';
@@ -107,33 +133,58 @@ export async function readEsp32S3SecureBootState(
     const digestPurpose = purposeCode !== null && purposeCode >= 9 && purposeCode <= 11;
     let publicKeyHash: string | null = null;
     let digestStatus: EvidenceStatus = block0Status === 'verified' ? 'verified' : 'unavailable';
+    let readDiagnostic: KeyDigestReadDiagnostic | null = digestPurpose ? {
+      operation: 'READ_REG', logicalSlot: purposeCode! - 9, physicalBlock: block + 4,
+      registerBaseOffset: `0x${(ESP32S3_EFUSE.keyBlocks[block] - ESP32S3_EFUSE.base).toString(16).padStart(3, '0')}`,
+      expectedWords: 8, wordsRead: 0, errorCategory: null, failedWordIndex: null, failedRegisterOffset: null,
+    } : null;
 
     if (digestPurpose) {
       if (readProtected === true) {
         digestStatus = 'unavailable';
+        readDiagnostic!.errorCategory = 'read-protected';
       } else if (readProtected === null) {
         digestStatus = 'unavailable';
+        readDiagnostic!.errorCategory = 'protection-state-unavailable';
       } else {
-        try {
-          const start = ESP32S3_EFUSE.keyBlocks[block];
-          const bytes = new Uint8Array(32);
-          for (let word = 0; word < 8; word++) {
-            const value = await readReg(start + word * 4);
-            if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new Error('invalid register value');
-            bytes.set(wordBytes(value), word * 4);
+        const start = ESP32S3_EFUSE.keyBlocks[block];
+        const bytes = new Uint8Array(32);
+        let readFailed = false;
+        for (let word = 0; word < 8; word++) {
+          const address = start + word * 4;
+          let rawValue: number;
+          try {
+            rawValue = await readReg(address);
+          } catch (error) {
+            readDiagnostic!.errorCategory = registerErrorCategory(error);
+            readDiagnostic!.failedWordIndex = word;
+            readDiagnostic!.failedRegisterOffset = `0x${(address - ESP32S3_EFUSE.base).toString(16).padStart(3, '0')}`;
+            readFailed = true;
+            break;
           }
-          if (bytes.every((byte) => byte === 0) || bytes.every((byte) => byte === 0xff)) {
-            digestStatus = 'ambiguous';
-          } else {
-            publicKeyHash = hex(bytes);
+          const value = unsignedRegisterWord(rawValue);
+          if (value === null) {
+            readDiagnostic!.errorCategory = 'invalid-register-value';
+            readDiagnostic!.failedWordIndex = word;
+            readDiagnostic!.failedRegisterOffset = `0x${(address - ESP32S3_EFUSE.base).toString(16).padStart(3, '0')}`;
+            readFailed = true;
+            break;
           }
-        } catch {
+          readDiagnostic!.wordsRead++;
+          bytes.set(wordBytes(value), word * 4);
+        }
+        if (readFailed) {
           digestStatus = 'unavailable';
+        } else if (bytes.every((byte) => byte === 0) || bytes.every((byte) => byte === 0xff)) {
+          digestStatus = 'ambiguous';
+          readDiagnostic!.errorCategory = 'empty-readable-block';
+        } else {
+          publicKeyHash = hex(bytes);
         }
       }
     }
 
-    keyBlocks.push({ block, purposeCode, purpose, readProtected, publicKeyHash, digestStatus });
+    keyBlocks.push({ block, purposeCode, purpose, readProtected, publicKeyHash, digestStatus, readDiagnostic });
   }
 
   // Duplicate digest purposes make the silicon's active key-block selection ambiguous.

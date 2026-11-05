@@ -169,6 +169,10 @@ function formatSecurityResult(device: import('./upstream/flasher/secureBoot.js')
   ];
   for (const block of device.keyBlocks) {
     lines.push(`  BLOCK_KEY${block.block} purpose=${block.purpose} readProtection=${block.readProtected === null ? 'UNKNOWN' : block.readProtected ? 'enabled' : 'disabled'} Public key hash=${block.publicKeyHash ? block.publicKeyHash : block.digestStatus.toUpperCase()}`);
+    const diagnostic = block.readDiagnostic;
+    if (diagnostic?.errorCategory) {
+      lines.push(`    Read diagnostic  ${diagnostic.operation} logicalSlot=${diagnostic.logicalSlot} physicalBlock=${diagnostic.physicalBlock} baseOffset=${diagnostic.registerBaseOffset} wordsRead=${diagnostic.wordsRead}/${diagnostic.expectedWords} error=${diagnostic.errorCategory}${diagnostic.failedWordIndex === null ? '' : ` wordIndex=${diagnostic.failedWordIndex} registerOffset=${diagnostic.failedRegisterOffset}`}`);
+    }
   }
   lines.push('', 'KEY REVOCATION');
   for (const item of device.revocation) lines.push(`  digest${item.digestSlot}=${item.revoked === null ? 'UNKNOWN' : item.revoked ? 'REVOKED' : 'active'} (${item.status})`);
