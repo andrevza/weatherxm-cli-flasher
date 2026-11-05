@@ -62,7 +62,8 @@ function deviceRegisters(options: { secureBoot?: boolean; purpose?: number; revo
     if (address >= ESP32S3_EFUSE.block0 && address < ESP32S3_EFUSE.block0 + 24) return words[(address - ESP32S3_EFUSE.block0) / 4] >>> 0;
     if (address >= ESP32S3_EFUSE.keyBlocks[0] && address < ESP32S3_EFUSE.keyBlocks[0] + 32) {
       const word = (address - ESP32S3_EFUSE.keyBlocks[0]) / 4;
-      return new DataView(digest.buffer, digest.byteOffset, digest.byteLength).getUint32(word * 4, true);
+      // Match esptool-js's READ_REG bitwise int32 return value, including negatives.
+      return new DataView(digest.buffer, digest.byteOffset, digest.byteLength).getUint32(word * 4, true) | 0;
     }
     throw new Error('unexpected register');
   };
@@ -87,16 +88,43 @@ describe('ESP32-S3 Secure Boot V2 read-only evidence', () => {
 
   it('reads only eFuse read registers and marks protected or failed evidence unavailable', async () => {
     const reads: number[] = [];
-    const read = deviceRegisters({ digest: '22'.repeat(32) });
+    const expectedDigest = '8123456789abcdef'.repeat(4);
+    const read = deviceRegisters({ digest: expectedDigest });
     const state = await readEsp32S3SecureBootState(async (address) => { reads.push(address); return read(address); }, { model: 'ESP32-S3', revision: 'v0.2' });
     expect(state.secureBootV2.state).toBe('enabled');
-    expect(state.keyBlocks[0].publicKeyHash).toBe('22'.repeat(32));
+    expect(state.keyBlocks[0].publicKeyHash).toBe(expectedDigest);
+    expect(state.keyBlocks[0].readDiagnostic).toMatchObject({ logicalSlot: 0, physicalBlock: 4, registerBaseOffset: '0x09c', expectedWords: 8, wordsRead: 8, errorCategory: null });
+    expect(reads.filter((address) => address >= ESP32S3_EFUSE.keyBlocks[0] && address < ESP32S3_EFUSE.keyBlocks[0] + 32))
+      .toEqual(Array.from({ length: 8 }, (_, word) => ESP32S3_EFUSE.keyBlocks[0] + word * 4));
     expect(reads.every((address) => address >= ESP32S3_EFUSE.block0 && address < 0x60007200)).toBe(true);
     const protectedState = await readEsp32S3SecureBootState(async (address) => deviceRegisters({ readProtect: true })(address), { model: 'ESP32-S3', revision: null });
     expect(protectedState.keyBlocks[0].digestStatus).toBe('unavailable');
+    expect(protectedState.keyBlocks[0].readDiagnostic?.errorCategory).toBe('read-protected');
     const failed = await readEsp32S3SecureBootState(async () => { throw new Error('serial failure'); }, { model: 'ESP32-S3', revision: null });
     expect(failed.secureBootV2.state).toBe('unknown');
     expect(failed.secureVersion.value).toBeNull();
+
+    const truncated = await readEsp32S3SecureBootState(async (address) => {
+      if (address === ESP32S3_EFUSE.keyBlocks[0] + 16) throw new Error('Serial timeout');
+      return deviceRegisters({ digest: expectedDigest })(address);
+    }, { model: 'ESP32-S3', revision: null });
+    expect(truncated.keyBlocks[0].publicKeyHash).toBeNull();
+    expect(truncated.keyBlocks[0].digestStatus).toBe('unavailable');
+    expect(truncated.keyBlocks[0].readDiagnostic).toMatchObject({ wordsRead: 4, failedWordIndex: 4, failedRegisterOffset: '0x0ac', errorCategory: 'serial-read-failed' });
+
+    const restricted = await readEsp32S3SecureBootState(async (address) => {
+      if (address === ESP32S3_EFUSE.keyBlocks[0]) throw new Error('Command not supported in secure download mode');
+      return deviceRegisters({ digest: expectedDigest })(address);
+    }, { model: 'ESP32-S3', revision: null });
+    expect(restricted.keyBlocks[0].readDiagnostic?.errorCategory).toBe('rom-command-unavailable');
+
+    const zeroBlock = await readEsp32S3SecureBootState(async (address) => {
+      if (address >= ESP32S3_EFUSE.keyBlocks[0] && address < ESP32S3_EFUSE.keyBlocks[0] + 32) return 0;
+      return deviceRegisters({ digest: expectedDigest })(address);
+    }, { model: 'ESP32-S3', revision: null });
+    expect(zeroBlock.keyBlocks[0].publicKeyHash).toBeNull();
+    expect(zeroBlock.keyBlocks[0].digestStatus).toBe('ambiguous');
+    expect(zeroBlock.keyBlocks[0].readDiagnostic?.errorCategory).toBe('empty-readable-block');
   });
 
   it('compares trusted, revoked, and incorrectly purposed keys without guessing rollback enforcement', () => {
