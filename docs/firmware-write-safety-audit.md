@@ -276,6 +276,10 @@ the installed bootloader. The reviewed release profile sets
 read-protected. Missing, inconsistent, or protected values are inconclusive.
 No eFuse operation was issued.
 
+Espressif documents the ESP32-S3 digest/key-purpose/revocation model and the
+`CONFIG_SECURE_BOOT_V2_ALLOW_EFUSE_RD_DIS` option in its [Secure Boot V2
+guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/security/secure-boot-v2.html).
+
 The public `sdkconfig.wg1200_release` enables Secure Boot V2 and signed
 applications, but its configured production key file is absent from the public
 checkout. Its anti-rollback configuration is not enabled, and
@@ -285,6 +289,9 @@ secure-version eFuse state. Secure Boot and anti-rollback are independent; the
 source profile does not prove anti-rollback is active or establish the
 installed gateway's eFuse value. There is no trustworthy candidate preflight.
 **Blocker unresolved.**
+
+The independent option semantics are described in Espressif's [ESP32-S3 OTA
+guide](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/system/ota.html): app rollback uses `NEW`/`PENDING_VERIFY` only when enabled, and anti-rollback separately compares image security version with the eFuse floor. The WeatherXM source inspected was pinned at [`a30374b045c138dac3f6dd4267ef8eb7390a7670`](https://github.com/WeatherXM/wg1200-firmware/tree/a30374b045c138dac3f6dd4267ef8eb7390a7670); its `sdkconfig.wg1200_release` and [`main/boot_guard.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/boot_guard.cpp) are source evidence only, not proof of the gateway's installed build.
 
 The safe resolution is to retain the hard write block in `securityPolicy.ts`.
 Non-identical firmware checks report `security-blocked` with
@@ -354,8 +361,39 @@ Regression coverage checks exact snapshot membership, partial-read failure,
 OTA metadata precommit/readback, abort before activation on protected-check
 failure, the hard security gate, and OTA erased-sequence rejection. `factory`
 is newly included in protected hashes. Source tests and standalone validation
-results for this follow-up are recorded with its final build metadata below
-after completion.
+results for this follow-up:
+
+- `npm run typecheck`, `npm test`, and `npm run build` passed in the Node 22
+  source container. The source suite passed 70 tests; the standalone suite was
+  skipped at that stage because no binary variable was configured.
+- The committed source was built for native Linux ARM64 in a Node.js 26.8.2
+  ARM64 container after installing `libatomic1`. The builder's normal Git probe
+  could not read mounted `.git` metadata, so a second build used its explicit
+  `WG1200_GIT_COMMIT` / `WG1200_GIT_DIRTY` overrides after confirming clean
+  commit `6c35e65b2d748320d68b3f11277fcddc034b1a55`.
+- Final artifact: `dist/weatherxm-flash-linux-arm64`, SHA-256
+  `1329813656666376ef450f41b090e488cdda596f35a86ff5635b13909c6630b8`, size
+  143 MiB. Embedded metadata reports package `0.1.0`, Node `v26.8.2`, source
+  SHA-256 `8e57578c017c85f534e66a01dd5e6dc35ab3c2cfbc17fe02f8bff89fc8c00e3e`,
+  commit `6c35e65b2d748320d68b3f11277fcddc034b1a55`, and `gitDirty: false`.
+- `--version --verbose --json`, `--help`, and `firmware list` passed. ELF
+  validation passed: executable 5 PT_LOAD segments and embedded SerialPort
+  addon 2 PT_LOAD segments, all compatible with 16 KiB pages. `ldd` checks ran
+  in the builder and found the expected runtime dependency set.
+- Full ARM64 standalone suite passed: 9 files, 77 tests, zero skipped. This
+  verifies the executable and addon in the container, not on a Raspberry Pi or
+  gateway.
+- Previous artifact preserved at
+  `/private/tmp/weatherxm-flash-linux-arm64-pre-audit-a1e53b9`, SHA-256
+  `8ba42e765a9de90e4edb20977664b7109ee3328f45079e3cf17aedab654dc2ed`.
+
+The requested cryptographic cases (trusted/untrusted RSA signatures, revoked
+key slots, and device-specific secure-version incompatibility) cannot be
+meaningfully represented as successful mock checks because those validators
+and a validated eFuse decoder are not implemented. Instead, the deterministic
+security-gate regression asserts no write permission is granted while
+evidence is unavailable. Existing simulated tests cover metadata CRC/readback
+and activation ordering. No test performs physical writes.
 
 **NOT READY FOR PHYSICAL FLASH TEST.** Remaining blockers are per-device Secure
 Boot key trust and anti-rollback evidence, unconfirmed exact gateway
