@@ -55,6 +55,56 @@ signature against the device's enrolled key digests, nor compares image
 security-version fields with eFuse anti-rollback state. The bootloader may
 reject an image that passes the host-side checks.
 
+### Added: read-only Secure Boot V2 evidence and candidate checks
+
+The CLI now provides `security --port <path>` and
+`security check <weatherxm|meshtastic> --port <path>`. Both connect through
+`ESPLoader.detectChip()` and stay in the ROM loader: this path skips
+`runStub()`, flash-ID probing, flash reads/writes/erases, and all eFuse write
+commands. The ROM-loader reset/entry behavior can restart the gateway. The
+security command reads only ESP32-S3 eFuse read-register addresses validated
+against Espressif's [ESP32-S3 eFuse memory definition](https://github.com/espressif/esptool/blob/master/espefuse/efuse/esp32s3/mem_definition.py).
+Secure Download Mode and other ROM restrictions can make register evidence
+unavailable; failures remain `UNKNOWN`/`unavailable` rather than being treated
+as zero.
+
+Reported fields include Secure Boot V2 enablement, key purposes, key-block read
+protection, key digests, digest-slot revocation, the security-version floor,
+and download-mode restrictions. Only blocks assigned a Secure Boot digest
+purpose are read as key digests. Duplicate purposes, protected blocks, failed
+reads, or unexplained chip identity are surfaced as ambiguous or unavailable.
+The key digest is SHA-256 over the Secure Boot V2 public-key data (modulus,
+exponent, and Montgomery constants).
+
+Candidate checks first use the existing HTTPS catalog and manifest SHA-256
+validator. They then validate the ESP image header/segments, ESP32-S3 chip ID,
+segment XOR checksum, appended image SHA-256, 64 KiB WG1200 page boundary,
+signature-sector structure/CRC/reserved bytes, RSA-3072 encoding and
+Montgomery constants, signed-image digest, and RSA-PSS/SHA-256 signature with
+32-byte salt. RSA signature verification uses Node's OpenSSL-backed
+cryptographic implementation. These layout and cryptographic parameters follow
+Espressif's [Secure Boot V2 guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/security/secure-boot-v2.html),
+[firmware image format](https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/firmware-image-format.html),
+and [esptool image implementation](https://github.com/espressif/esptool/blob/master/esptool/bin_image.py).
+Candidate signatures are then matched to readable, correctly purposed,
+non-revoked device digest slots. Image signature validity and device trust are
+reported independently.
+
+The descriptor's `secure_version` is compared with the device eFuse floor.
+However, the eFuse does not establish whether the installed bootloader was
+built with `CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK`; the public WG1200 firmware
+configuration is not proof of the connected gateway's installed bootloader.
+Therefore enforcement is explicitly `unknown`, and a key match alone cannot
+produce `TRUSTED`. Application boot acceptance, OTA rollback configuration,
+and application health are not established. This feature does not alter the
+existing `security-blocked` firmware-writing policy.
+
+No physical gateway was measured as part of this implementation. Hardware
+validation requires capturing unredacted/local and redacted output from the
+commands in the final report, recording chip revision and read availability,
+and independently matching the key digest to a trusted firmware signing-key
+record. Do not treat synthetic unit fixtures as gateway evidence.
+
 ## C. Findings
 
 ### Fixed: protected-region failure happened after OTA selection
@@ -71,17 +121,15 @@ deterministic mock regression asserts the sequence and proves metadata write and
 reset are absent on mismatch. This fix is in the audit changes after baseline;
 the separately committed hardware validation executable did not contain it.
 
-### Blocking: no host-side cryptographic Secure Boot verification
+### Addressed for read-only checks; install gate retained: Secure Boot trust
 
-**Severity: Critical / blocks physical flashing.** Image validation establishes
-declared byte count, a 4 MiB ceiling, the `0xE7` signature-block marker at the
-expected location, and SHA-256 equality with the manifest. It does not parse and
-verify the Secure Boot V2 RSA-PSS signature, establish that its key digest is
-trusted by this gateway, or check the device eFuse security version. A valid
-format and checksum do not establish bootability or device trust. Resolve this
-before any write by establishing an authoritative firmware signing-key/trust
-source and implementing or independently validating signature and anti-rollback
-compatibility checks.
+**Severity: Critical / still blocks physical flashing.** The original audit
+found only marker and manifest-hash checks. The read-only `security check`
+command now verifies the signed image and compares its key digest with readable
+device eFuse digests. It also reports the descriptor security version against
+the eFuse floor. The installed bootloader's anti-rollback configuration and
+OTA rollback behavior remain unknown, so this is not sufficient to permit
+writes and the fail-closed `securityPolicy.ts` remains unchanged.
 
 ### Blocking: protection snapshots omit writable-but-protected regions
 
@@ -283,12 +331,11 @@ guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/security/se
 The public `sdkconfig.wg1200_release` enables Secure Boot V2 and signed
 applications, but its configured production key file is absent from the public
 checkout. Its anti-rollback configuration is not enabled, and
-`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is not set. The app descriptor contains
-`secure_version`, but this CLI does not compare it with the device's
-secure-version eFuse state. Secure Boot and anti-rollback are independent; the
-source profile does not prove anti-rollback is active or establish the
-installed gateway's eFuse value. There is no trustworthy candidate preflight.
-**Blocker unresolved.**
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is not set. The new command compares
+the app descriptor's `secure_version` with the device eFuse floor; it cannot
+establish whether the connected gateway's installed bootloader enforces that
+floor. Secure Boot and anti-rollback are independent. **Install blocker
+unresolved.**
 
 The independent option semantics are described in Espressif's [ESP32-S3 OTA
 guide](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/system/ota.html): app rollback uses `NEW`/`PENDING_VERIFY` only when enabled, and anti-rollback separately compares image security version with the eFuse floor. The WeatherXM source inspected was pinned at [`a30374b045c138dac3f6dd4267ef8eb7390a7670`](https://github.com/WeatherXM/wg1200-firmware/tree/a30374b045c138dac3f6dd4267ef8eb7390a7670); its `sdkconfig.wg1200_release` and [`main/boot_guard.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/boot_guard.cpp) are source evidence only, not proof of the gateway's installed build.

@@ -4,7 +4,7 @@ Independent command-line utility for inspecting, verifying and installing compat
 
 ## Status
 
-Commands include `info`, `verify`, `status`, `firmware list`, and `flash`. Device inspection enters the ESP32-S3 ROM loader and resets the device to run a RAM stub. Firmware writing is currently fail-closed: the CLI does not permit installation until Secure Boot signing-key trust and gateway anti-rollback compatibility can be verified. `flash --dry-run` remains read-only.
+Commands include `info`, `verify`, `status`, `firmware list`, `security`, and `flash`. Standard device inspection enters the ESP32-S3 ROM loader and runs a RAM stub; `security` stays in the ROM loader and reads eFuse registers without uploading a stub or accessing flash. Firmware writing remains fail-closed while installed-bootloader anti-rollback behavior and OTA rollback compatibility are unknown. `flash --dry-run` remains read-only.
 
 The official reference repository and exact behavior reviewed are documented in [docs/official-flasher-analysis.md](docs/official-flasher-analysis.md). The staged implementation plan is in [docs/implementation-plan.md](docs/implementation-plan.md). Safety rules are in [SAFETY.md](SAFETY.md).
 
@@ -206,11 +206,11 @@ The `check --json` response is a JSON object with these stable fields:
 }
 ```
 
-`comparison` values are `identical`, `newer`, `older`, `same-version-different-build`, `different-type`, and `ambiguous`. `status` values are `up-to-date`, `update-available`, `downgrade-blocked`, `approval-required`, `incompatible-firmware`, and `security-blocked`. `securityEvidence` is currently `unverified`; `flashingPermitted` is always false until device trust and anti-rollback checks are implemented. A type change is not treated as an update.
+`comparison` values are `identical`, `newer`, `older`, `same-version-different-build`, `different-type`, and `ambiguous`. `status` values are `up-to-date`, `update-available`, `downgrade-blocked`, `approval-required`, `incompatible-firmware`, and `security-blocked`. Existing check output's `securityEvidence` remains `unverified`; `flashingPermitted` is always false. A type change is not treated as an update.
 
 Device inspection JSON (`info`, `status`, `verify`) and firmware check/dry-run JSON include additive `ota` and `firmwareSlots` fields. `ota.activeSlot` and `ota.inactiveSlot` are null when validated OTA metadata cannot identify an OTA slot; `nextTargetSlot` and `nextTargetOffset` are null for ambiguous metadata. `firmwareSlots.ota_0` and `.ota_1` contain `active`, `version`, `firmwareType`, `build`, and `descriptorStatus` (`valid`, `invalid`, or `unknown`). Unavailable descriptor values are JSON `null`. Check/dry-run also report `inactiveMatch` when the selected application descriptor matches the readable inactive slot descriptor; this is informational and does not change installation policy.
 
-The CLI checks the manifest length and SHA-256, descriptor fields, and signature-block marker, but does not validate the RSA-PSS signature or establish that its key is trusted by the connected gateway. It also cannot currently compare image security version with that gateway's eFuse anti-rollback state. Therefore every non-identical candidate is reported as `security-blocked`, and confirmed install attempts are rejected before any flash operation regardless of `--yes`, `--force`, or `--recover`. `--dry-run` performs read-only catalog/image validation and device inspection, and reports the proposed target plus the write-block reason. See [the safety audit](docs/firmware-write-safety-audit.md).
+`security --port <path>` reports read-only Secure Boot V2 eFuse evidence. `security check weatherxm --port <path>` (or `meshtastic`) verifies a catalog candidate's ESP32-S3 image, digest, RSA-PSS signature, signing-key digest, and available device trust slots. It returns `UNKNOWN` when installed-bootloader anti-rollback enforcement is not established; signature trust does not establish boot or rollback behavior. Firmware install attempts remain rejected before any flash operation regardless of `--yes`, `--force`, or `--recover`. `--dry-run` remains read-only and reports the proposed target plus the write-block reason. See [the safety audit](docs/firmware-write-safety-audit.md).
 
 ## Docker
 
