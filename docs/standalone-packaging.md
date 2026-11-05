@@ -10,6 +10,8 @@ The SEA bootstrap reads its embedded addon with `node:sea`, writes it to a priva
 
 Each output is built on its native target runner: Ubuntu ARM64, Ubuntu x64, or macOS ARM64. This ensures the correct native addon and Node binary are paired. The macOS binary is ad-hoc signed after SEA generation.
 
+The Linux ARM64 release runner installs the `libatomic1` runtime package before running standalone tests. Debian-family users running that artifact may also need the system `libatomic1` package; it is a host runtime dependency and is not embedded in the SEA.
+
 Linux ARM64 SEA generation is pinned to Node 26.8.2. Node 26.9 through 26.13 added 4 KB-aligned load segments on official Linux ARM64 SEA outputs; those binaries fail to load on 16 KB and 64 KB page kernels even though the base Node executable runs. The release build validates every executable and SerialPort addon `PT_LOAD` for 16 KB file-offset/address congruence, checks the executable interpreter/dynamic segment, and inspects dynamic dependencies. Update this pin only after the generated SEA passes the same validation and an actual 16 KB Linux runtime test. The other target platforms continue using the same Node release pin for reproducible builds.
 
 Release filenames identify their platform; after installation, all three are exposed under the command name `wg1200`. The executable embeds package version, build timestamp, source SHA-256, Git commit/tag, and dirty-tree status. Tagged release builds are rejected unless the checkout is clean. `wg1200 --version --verbose` reports these values alongside runtime platform and Node version.

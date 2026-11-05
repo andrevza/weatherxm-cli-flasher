@@ -29,6 +29,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux ARM64 runtime dependency for standalone tests
+        if: matrix.target == 'linux-arm64'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libatomic1
       - uses: actions/setup-node@v4
         with:
           # Linux ARM64 stays on the last release before the SEA page-alignment
@@ -112,11 +115,11 @@ jobs:
           body: |
             This draft is a prerelease candidate, not a production-ready firmware installer.
 
-            **Physical hardware validated:** Linux ARM64 standalone read-only `info`, `verify`, and `status` on Raspberry Pi 5 / WG1200 (three rounds each, recorded in `docs/hardware-validation.md`).
+            **Maintainer-reported physical validation:** Linux ARM64 read-only `info`, `verify`, and `status` on Raspberry Pi 5 / WG1200 using an earlier build (see `docs/hardware-validation.md`). Current source changes have not been physically exercised.
 
-            **Automated only:** firmware image validation, comparison, write transaction guards, and presentation paths use fixtures and mocks.
+            **Write safety status:** installation is blocked because Secure Boot key trust and device anti-rollback compatibility cannot be established. OTA rollback behavior is not confirmed for the deployed gateway.
 
-            **Not physically validated:** firmware installation, OTA activation, and recovery. The CLI exposes no erase command. Do not publish this release as production-ready until the write path has separate controlled hardware validation.
+            **Not physically validated:** firmware installation, OTA activation, and recovery. Automated write-path tests use fixtures and mocks. The CLI exposes no erase command. Do not publish this release as production-ready.
           files: |
             release/weatherxm-flash-*
             release/SHA256SUMS
