@@ -218,9 +218,12 @@ existing Linux ARM64 binary failed because the container lacked
 `libatomic.so.1`; those failures do not establish a binary defect. The existing
 macOS ARM64 executable runs on the host and reports Node.js v26.3.0, but it
 predates the audit fix and is not evidence for modified-source standalone
-packaging. Linux ARM64 ELF alignment and release workflow checks remain
-unrun. No physical tests were run. This audit's modified source must not be
-represented by the prior read-only hardware validation record.
+packaging. The Linux ARM64 ELF validator passed for the existing executable and
+SerialPort addon (5 and 2 PT_LOAD segments, respectively), using Bun to run the
+pure-JavaScript validator; these artifacts predate the source fix. Full release
+workflow checks remain unrun. No physical tests were run. This audit's modified
+source must not be represented by the prior read-only hardware validation
+record.
 
 ## H. Physical test readiness
 
