@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { checkExitCode, checkFirmware, flashDevice, inspectDevice, serializeFirmwareCheckResult, summarizeInspection } from './device.js';
+import { checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, summarizeInspection } from './device.js';
 import { catalogRows, DEFAULT_MANIFEST_URL, fetchCatalog } from './catalog.js';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -13,7 +13,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -91,13 +91,14 @@ function parseArgs(argv: string[]): Args {
   out.command = helpRequested ? 'help' : positional[0] || 'help';
   if (helpRequested) out.helpTarget = positional[0];
   out.subcommand = positional[1];
+  out.target = positional[2];
   if (!Number.isInteger(out.baud) || out.baud < 1200 || out.baud > 2000000) throw new Error('Baud rate must be an integer from 1200 to 2000000');
   if (!helpRequested) {
     if (out.force && out.command !== 'flash') throw new Error('--force is supported only by flash');
     if (out.dryRun && out.command !== 'flash') throw new Error('--dry-run is supported only by flash');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
-    if (manifestProvided && !['firmware', 'check', 'flash'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, and flash');
-    if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--trace-serial requires a device command');
+    if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
+    if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
     if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
@@ -124,6 +125,7 @@ function help(command?: string, plain = false) {
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nPassively receives serial output in receive-only mode. Does not send bytes, toggle DTR/RTS, enter ROM loader, or reset the gateway. Ctrl+C closes the serial port.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n\nLists validated firmware releases from the official HTTPS manifest.`,
+      security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
       flash: `USAGE\n  ${name} flash <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--dry-run] [--force] [--recover] [--yes] [--monitor] [--boot-log-seconds <0..3600>] [--json] [--redact] [--trace-serial]\n\nWrites only the validated inactive OTA slot and selected OTA metadata sector after validation and confirmation. --dry-run is read-only. --force permits only an identical-build reinstall; it does not bypass identity, layout, integrity, OTA, boundary or confirmation checks. Downgrades remain blocked. Boot capture defaults to 15 seconds; zero disables it; --monitor captures continuously after release.`,
     };
     const detail = details[command];
@@ -137,14 +139,53 @@ function help(command?: string, plain = false) {
   output += commandRow('status', 'Show firmware and OTA boot state');
   output += commandRow('check <firmware>', 'Check available firmware; read-only');
   output += commandRow('monitor', 'Passively stream serial console output');
+  output += commandRow('security', 'Read Secure Boot V2 and firmware trust evidence');
   output += `\n${heading('FIRMWARE COMMANDS')}\n`;
   output += commandRow('firmware list', 'List available firmware releases');
   output += commandRow('flash <firmware>', 'Install to the inactive OTA slot');
   output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
-  output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Writes are restricted to the validated inactive OTA slot.\n  Identical firmware is skipped unless --force is explicit.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
+  output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Firmware writing is blocked pending device trust and rollback evidence.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
   output = output.replace('  -h, --help          Show help', '  -v, --version       Show application version; add --verbose for build details\n  -h, --help          Show help');
   output = output.replace('  --manifest <url>', '  --redact            Mask device and certificate identifiers in output\n  --manifest <url>');
   process.stdout.write(output);
+}
+
+function formatSecurityResult(device: import('./upstream/flasher/secureBoot.js').SecureBootDeviceState,
+  candidate?: import('./device.js').FirmwareSecurityCheckResult): string {
+  const lines = [
+    'WG1200 Secure Boot V2 Security',
+    '────────────────────────────────',
+    `Chip model      ${device.chip.model}`,
+    `Chip revision   ${device.chip.revision ?? 'UNKNOWN'}`,
+    `Secure Boot V2  ${device.secureBootV2.state.toUpperCase()} (${device.secureBootV2.status})`,
+    `Secure version  ${device.secureVersion.value ?? 'UNKNOWN'} (${device.secureVersion.status})`,
+    `Anti-rollback   ${device.antiRollbackEnforcement.state.toUpperCase()} — ${device.antiRollbackEnforcement.explanation}`,
+    `Download mode   ${device.downloadMode.status === 'verified'
+      ? `disableAll=${device.downloadMode.disableAllDownload}, disableUsbSerialJtag=${device.downloadMode.disableUsbSerialJtagDownload}, secureDownload=${device.downloadMode.securityDownloadEnabled}`
+      : 'UNKNOWN'}`,
+    `Evidence        ${device.evidence.toUpperCase()}`,
+    '',
+    'KEY BLOCKS',
+  ];
+  for (const block of device.keyBlocks) {
+    lines.push(`  BLOCK_KEY${block.block} purpose=${block.purpose} readProtection=${block.readProtected === null ? 'UNKNOWN' : block.readProtected ? 'enabled' : 'disabled'} Public key hash=${block.publicKeyHash ? block.publicKeyHash : block.digestStatus.toUpperCase()}`);
+  }
+  lines.push('', 'KEY REVOCATION');
+  for (const item of device.revocation) lines.push(`  digest${item.digestSlot}=${item.revoked === null ? 'UNKNOWN' : item.revoked ? 'REVOKED' : 'active'} (${item.status})`);
+  if (candidate) {
+    lines.push('', 'CANDIDATE FIRMWARE',
+      `  Result          ${candidate.result}`,
+      `  Firmware        ${candidate.firmware.key} ${candidate.firmware.version}`,
+      `  Manifest SHA256 ${candidate.firmware.manifestSha256}`,
+      `  Image structure ${candidate.image.imageFormatValid ? 'VALID' : 'INVALID'}`,
+      `  Image digest    ${candidate.image.imageDigestValid ? 'VALID' : 'INVALID'}`,
+      `  RSA-PSS         ${candidate.image.signatureValid ? 'VALID' : 'INVALID'}`,
+      `  Secure version  ${candidate.firmware.descriptorSecureVersion} (${candidate.trust.securityVersionStatus})`,
+      `  Device key      ${candidate.trust.trustedKeyMatch === null ? 'UNKNOWN' : candidate.trust.trustedKeyMatch ? 'MATCH' : 'NO MATCH'}`,
+      `  Boot/rollback   NOT ESTABLISHED`,
+      `  Assessment      ${candidate.explanation}`);
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 async function runMonitor(args: Args, header?: string): Promise<string[]> {
@@ -207,6 +248,23 @@ async function main() {
     const rows = catalogRows(manifest);
     if (args.json) process.stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
     else for (const fw of rows) process.stdout.write(`${fw.key.padEnd(20)} ${fw.label}  ${fw.bytes} bytes  sha256:${fw.sha256}\n`);
+    return;
+  }
+  if (args.command === 'security') {
+    if (!args.port) throw new Error('security requires --port, for example --port /dev/ttyUSB0');
+    if (args.subcommand !== undefined && args.subcommand !== 'check') throw new Error('security supports only the optional `check <firmware>` subcommand');
+    if (args.subcommand === 'check' && !args.target) throw new Error('security check requires a firmware key: weatherxm or meshtastic');
+    if (args.subcommand !== 'check' && args.target) throw new Error('Unexpected extra argument after security command');
+    if (args.subcommand === 'check') {
+      const result = await checkFirmwareSecurity({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
+        firmwareKey: args.target!, manifestUrl: args.manifest });
+      if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      else process.stdout.write(formatSecurityResult(result.device, result));
+    } else {
+      const result = await readDeviceSecurity({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial });
+      if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      else process.stdout.write(formatSecurityResult(result));
+    }
     return;
   }
   if (args.command === 'check') {

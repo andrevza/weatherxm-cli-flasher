@@ -12,6 +12,7 @@ import { isValidAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from './upstream/flasher/firmwareComparison.js';
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
 import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
+import { compareSecureBootTrust, verifySecureBootV2Image, type SecureBootDeviceState, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
 
 export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; }
 export interface FlashConfirmation {
@@ -20,6 +21,49 @@ export interface FlashConfirmation {
   comparison: FirmwareComparison;
 }
 export interface SelectedFirmware { entry: FirmwareEntry; verified: VerifiedFirmware; descriptor: NonNullable<ReturnType<typeof parseAppDescriptor>>; }
+export interface FirmwareSecurityCheckResult {
+  result: 'TRUSTED' | 'UNTRUSTED' | 'REVOKED' | 'INCOMPATIBLE' | 'UNKNOWN';
+  firmware: { key: string; version: string; manifestSha256: string; descriptorSecureVersion: number };
+  image: SecureBootImageEvidence;
+  device: SecureBootDeviceState;
+  trust: ReturnType<typeof compareSecureBootTrust>;
+  applicationBootAndRollbackEstablished: false;
+  explanation: string;
+}
+
+/** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
+export async function readDeviceSecurity(options: DeviceOptions): Promise<SecureBootDeviceState> {
+  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const port = new NodeSerialPort(options.portPath, trace);
+  const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
+  const transport = new Wg1200Transport({
+    log: (message) => process.stderr.write(`[wg1200] ${message}\n`),
+    error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`),
+    debug: (message) => process.stderr.write(`${message}\n`),
+  }, options.traceSerial);
+  try {
+    await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_ROM, 'rom-read-only');
+    return await transport.readSecureBootConfiguration();
+  } finally {
+    await transport.disconnect();
+  }
+}
+
+/** Verifies catalog/image authenticity and compares it with actual read-only device evidence. */
+export async function checkFirmwareSecurity(options: DeviceOptions & { firmwareKey: string; manifestUrl: string }): Promise<FirmwareSecurityCheckResult> {
+  const selected = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl);
+  const image = verifySecureBootV2Image(selected.verified.data);
+  image.secureVersion = selected.descriptor.secureVersion;
+  const device = await readDeviceSecurity(options);
+  const trust = compareSecureBootTrust(image, device);
+  return {
+    result: trust.result,
+    firmware: { key: options.firmwareKey, version: selected.descriptor.version,
+      manifestSha256: selected.verified.sha256, descriptorSecureVersion: selected.descriptor.secureVersion },
+    image, device, trust, applicationBootAndRollbackEstablished: false,
+    explanation: `${trust.explanation} This command does not establish application boot health or rollback behavior; firmware writing remains blocked.`,
+  };
+}
 export interface FirmwareCheckResult {
   device: { model: 'WG1200'; identity: string | null; identityValid: boolean; chip: string; flashBytes: number };
   otaState: { ambiguous: boolean; explanation: string };

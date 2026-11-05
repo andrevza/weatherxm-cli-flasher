@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { ESPLoader, Transport, ESPError, getStubJsonByChipName } from 'esptool-js';
 import { parseAppDescriptor, type AppDescriptor } from './appDescriptor';
 import { PROTECTED_REGIONS, WG1200_CONSTANTS } from './constants';
+import { readEsp32S3SecureBootState, type SecureBootDeviceState } from './secureBoot';
 import { compareHexHashes, sha256Hex } from './hashing';
 import { formatWg1200DeviceName, verifySecureCertIdentity, type SecureCertVerificationResult } from './identity';
 import { buildOtadataSector, determineActiveBootSlot, parseOtadataSector, type OtadataStatus } from './otadata';
@@ -403,10 +404,14 @@ export class Wg1200Transport {
   /**
    * Connects to the device over Web Serial and boots the ESP stub.
    */
+  public async connect(serialPort: any, baudrate?: number): Promise<Wg1200Inspection>;
+  public async connect(serialPort: any, baudrate: number | undefined, inspectHardware: false): Promise<void>;
+  public async connect(serialPort: any, baudrate: number | undefined, inspectHardware: 'rom-read-only'): Promise<void>;
   public async connect(
     serialPort: any,
-    baudrate: number = WG1200_CONSTANTS.BAUDRATE_FLASH
-  ): Promise<Wg1200Inspection> {
+    baudrate: number = WG1200_CONSTANTS.BAUDRATE_FLASH,
+    inspectHardware: boolean | 'rom-read-only' = true,
+  ): Promise<Wg1200Inspection | void> {
     this.port = serialPort;
     this.transport = new Transport(serialPort);
     configureEsptoolTrace(this.transport, this.logger, this.diagnostics);
@@ -430,14 +435,47 @@ export class Wg1200Transport {
 
     try {
       this.logger.log('Connecting to ESP32 ROM bootloader…');
-      await this.loader.main();
+      if (inspectHardware === 'rom-read-only') {
+        // detectChip enters the ROM loader but deliberately skips runStub(), flash probing,
+        // and the additional register reads in main(). No RAM upload or flash operation.
+        await this.loader.detectChip();
+      } else {
+        await this.loader.main();
+      }
       if (this.diagnostics) this.logger.debug?.(`[serial] loader ready baud=${(this.loader as any).baudrate} stub=${(this.loader as any).IS_STUB}`);
-      this.logger.log('Stub running. Inspecting hardware…');
-      return await this.inspect();
+      this.logger.log(inspectHardware === 'rom-read-only' ? 'ROM loader ready for security register reads.' : inspectHardware ? 'Stub running. Inspecting hardware…' : 'ROM loader ready for security register reads.');
+      if (inspectHardware === true) return await this.inspect();
     } catch (err: any) {
       await this.disconnect(false);
       throw new Error(`Failed to initialize WG1200 serial connection: ${err.message ?? err}`);
     }
+  }
+
+  /** Read-only Secure Boot V2/eFuse inspection; this method has no eFuse write operations. */
+  public async readSecureBootConfiguration(): Promise<SecureBootDeviceState> {
+    if (!this.loader) throw new Error('Not connected to device');
+    const chip = (this.loader as any).chip;
+    const model = String(chip?.CHIP_NAME ?? 'Unknown');
+    if (!model.toLowerCase().includes('esp32-s3')) {
+      return readEsp32S3SecureBootState(async () => { throw new Error('not ESP32-S3'); }, { model, revision: null, status: 'ambiguous' });
+    }
+    let revision: string | null = null;
+    let chipStatus: 'verified' | 'unavailable' = 'verified';
+    if ((this.loader as any).secureDownloadMode) {
+      chipStatus = 'unavailable';
+    } else {
+      try {
+        const description = await chip.getChipDescription(this.loader);
+        const match = description.match(/revision v?([0-9]+\.[0-9]+)/i);
+        revision = match?.[1] ?? null;
+      } catch {
+        chipStatus = 'unavailable';
+      }
+    }
+    return readEsp32S3SecureBootState(
+      async (address) => await this.loader!.readReg(address),
+      { model, revision, status: chipStatus },
+    );
   }
 
   /**
