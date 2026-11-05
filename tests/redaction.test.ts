@@ -35,4 +35,11 @@ describe('output redaction', () => {
     expect(redactOutput('Device validation failed: partition table mismatch')).toContain('Device validation failed: partition table mismatch');
     expect(redactOutput('-----BEGIN CERTIFICATE-----\nsynthetic-certificate-bytes\n-----END CERTIFICATE-----')).toBe('[REDACTED CERTIFICATE]');
   });
+
+  it('redacts Secure Boot public-key digests in text and JSON', () => {
+    const digest = 'a'.repeat(64);
+    const json = JSON.parse(redactOutput(JSON.stringify({ keyBlocks: [{ publicKeyHash: digest }] })));
+    expect(json.keyBlocks[0].publicKeyHash).toBe('[REDACTED PUBLIC KEY]');
+    expect(redactOutput(`Public key hash: ${digest}`)).toBe('Public key hash: [REDACTED PUBLIC KEY]');
+  });
 });

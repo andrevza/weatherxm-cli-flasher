@@ -47,6 +47,8 @@ describe('standalone executable packaging', () => {
     expect(commandHelp).toContain('[--redact]');
     const monitorHelp = execFileSync(executable, ['monitor', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(monitorHelp).toContain('receive-only');
+    const securityHelp = execFileSync(executable, ['security', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
+    expect(securityHelp).toContain('security check <firmware>');
     const badInput = spawnSync(executable, ['check', 'weatherxm', '--json'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(badInput.status).toBe(1);
     expect(badInput.stdout).toBe('');
@@ -94,11 +96,14 @@ describe('standalone executable packaging', () => {
     expect(safe).toContain('[REDACTED MAC]');
     expect(safe).toContain('[REDACTED COMMON NAME]');
     expect(safe).toContain('[REDACTED CERTIFICATE FINGERPRINT]');
+    expect(safe).toContain('[REDACTED PUBLIC KEY]');
     expect(safe).toContain('"chip": "ESP32-S3"');
     expect(safe).not.toContain('AA:BB:CC:DD:EE:FF');
     expect(safe).not.toContain('gateway-secret.example');
     expect(safe).not.toContain('1234');
     expect(safe).not.toContain('AB12CD34EF56');
+    expect(safe).not.toContain('a'.repeat(64));
+    expect(safe).not.toContain('b'.repeat(64));
   });
 
   it.skipIf(!builtExecutable)('reports embedded source and build metadata', () => {

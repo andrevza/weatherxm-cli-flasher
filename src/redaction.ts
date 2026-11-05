@@ -43,7 +43,7 @@ export function redactOutput(input: string): string {
 /** Synthetic fixture for checking that the executable's output boundary applies redaction. */
 export function standaloneRedactionFixture(): string[] {
   return [
-    `${JSON.stringify({ macAddress: 'AA:BB:CC:DD:EE:FF', deviceName: 'WeatherXM WG1200 1234', identity: { valid: true, commonName: 'gateway-secret.example', fingerprint: 'AB12CD34EF56', publicKeyHash: 'a'.repeat(64) }, chip: 'ESP32-S3' }, null, 2)}\n`,
-    'ERROR: MAC address: AA:BB:CC:DD:EE:FF; certificate fingerprint: AB12CD34EF56\n',
+    `${JSON.stringify({ macAddress: 'AA:BB:CC:DD:EE:FF', deviceName: 'WeatherXM WG1200 1234', identity: { valid: true, commonName: 'gateway-secret.example', fingerprint: 'AB12CD34EF56' }, keyBlocks: [{ publicKeyHash: 'a'.repeat(64) }], chip: 'ESP32-S3' }, null, 2)}\n`,
+    `ERROR: MAC address: AA:BB:CC:DD:EE:FF; certificate fingerprint: AB12CD34EF56; Public key hash: ${'b'.repeat(64)}\n`,
   ];
 }
