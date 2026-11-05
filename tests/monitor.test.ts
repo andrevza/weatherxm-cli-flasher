@@ -71,6 +71,7 @@ describe('passive serial monitor', () => {
     const errored = new FakeMonitorPort();
     const serialError = monitorSerial({ portPath: '/dev/fake', signalSource: signals, portFactory: () => errored });
     errored.openNow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     errored.emit('error', new Error('adapter failure'));
     await expect(serialError).rejects.toThrow(/Serial monitor disconnected: adapter failure/);
   });
