@@ -15,7 +15,7 @@ describe('output redaction', () => {
     }));
     const parsed = JSON.parse(output);
     expect(parsed.macAddress).toBe('[REDACTED MAC]');
-    expect(parsed.deviceName).toBe('[REDACTED DEVICE ID]');
+    expect(parsed.deviceName).toBe('[REDACTED DEVICE NAME]');
     expect(parsed.gatewayId).toBe('[REDACTED DEVICE ID]');
     expect(parsed.device_id).toBe('[REDACTED DEVICE ID]');
     expect(parsed.serialNumber).toBe('[REDACTED SERIAL NUMBER]');
@@ -83,5 +83,70 @@ describe('output redaction', () => {
     for (const secret of ['15428', '0x00001234', 'ABCD123456', 'wxm-gw-a1b2c3.local', '11:22:33:44', 'Example City, ZZ']) expect(text).not.toContain(secret);
     expect(text).toContain('reset=1');
     expect(text).toContain('boot=8');
+  });
+
+  it('is idempotent and never redacts its own placeholders twice', () => {
+    const input = '> WXM WG1200 RELEASE BUILD\n> S/N: SERIAL-SYNTH-42\nI MdnsDiscovery: mDNS announced: wxm-gw-synthetic.local, service: _weatherxm._tcp (id: 0x00A1B2C3)\n';
+    const once = redactOutput(input);
+    expect(once).toContain('S/N: [REDACTED SERIAL NUMBER]');
+    expect(once).toContain('mDNS announced: [REDACTED DEVICE NAME]');
+    expect(once).not.toContain('SERIAL-SYNTH-42');
+    expect(once).not.toContain('DEVICE NAME] DEVICE NAME]');
+    expect(redactOutput(once)).toBe(once);
+  });
+
+  it('redacts embedded settings and telemetry JSON without damaging JSON syntax', () => {
+    const samples = [
+      'I (123) Submit: Remote Settings JSON {"client":{"ws_fo_id":"0x0000A1B2"},"shared":{"rm_run_ts":123,"name":"Synthetic Gateway"},"sensor":{"name":"Temperature"},"mdnsName":"wxm-gw-synthetic.local"}',
+      'I (124) TBJson: {"gw_tick_ms":"1234","ws_fo_id":"0x0000B2C3","ws_reception":"100","reset":1}',
+    ];
+    for (const sample of samples) {
+      const sanitized = redactOutput(sample);
+      expect(redactOutput(sanitized)).toBe(sanitized);
+      const firstBrace = sanitized.indexOf('{');
+      const lastBrace = sanitized.lastIndexOf('}');
+      const parsed = JSON.parse(sanitized.slice(firstBrace, lastBrace + 1));
+      const client = parsed.client ?? parsed;
+      expect(client.ws_fo_id).toBe('[REDACTED STATION ID]');
+      expect(JSON.stringify(parsed)).not.toContain('Synthetic Gateway');
+      expect(JSON.stringify(parsed)).not.toContain('0x0000');
+      expect(JSON.stringify(parsed)).not.toContain('wxm-gw-synthetic.local');
+      if (sample.includes('sensor')) expect(JSON.stringify(parsed)).toContain('"name":"Temperature"');
+    }
+  });
+
+  it('redacts station IDs by context but retains unrelated addresses, reset values, heap telemetry and public firmware hashes', () => {
+    const firmwareHash = 'cf'.repeat(32);
+    const input = [
+      'W (23303) WsHandler: Station ownership challenge sent to 0x00A1B2C3',
+      'W (23304) WsHandler: Station ownership confirmed by GPS response for 0x00A1B2C3 after 1 packet(s)',
+      'Station ID, Val: 123456',
+      'load:0x403c9700 reset=1 boot=8',
+      'ESP-ROM:esp32s3-20210327 secure boot verification succeeded',
+      'I secure_boot_v2: Signature verified successfully!',
+      'I boot: Loaded app from partition at offset 0x820000',
+      'I (2262) nvs: nvs_get swd_flag 1',
+      'IP Address=192.0.2.123',
+      'I (1523) heap_init: Initializing. RAM available for dynamic allocation: 123456 bytes',
+      `I Submit: Public firmware SHA-256: ${firmwareHash}`,
+    ].join('\n');
+    const output = redactOutput(input);
+    expect(output.match(/\[REDACTED STATION ID\]/g)).toHaveLength(3);
+    expect(output).toContain('load:0x403c9700 reset=1 boot=8');
+    expect(output).toContain('ESP-ROM:esp32s3-20210327 secure boot verification succeeded');
+    expect(output).toContain('Signature verified successfully!');
+    expect(output).toContain('Loaded app from partition at offset 0x820000');
+    expect(output).toContain('nvs_get swd_flag 1');
+    expect(output).toContain('IP Address=[REDACTED IP ADDRESS]');
+    expect(output).toContain('RAM available for dynamic allocation: 123456 bytes');
+    expect(output).toContain(firmwareHash);
+  });
+
+  it('uses a safe fallback for malformed JSON-like fields without inserting unmatched brackets', () => {
+    const malformed = 'I Submit: {"client":{"ws_fo_id":0x00A1B2C3';
+    const output = redactOutput(malformed);
+    expect(output).toContain('"ws_fo_id":null');
+    expect(output).not.toContain('0x00A1B2C3');
+    expect(output).not.toContain('[REDACTED STATION ID] STATION ID]');
   });
 });

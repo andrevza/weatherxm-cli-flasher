@@ -1,6 +1,7 @@
 import { SerialPort } from 'serialport';
 import { StringDecoder } from 'node:string_decoder';
 import { LogSanitizer } from './upstream/flasher/serialLog.js';
+import { redactOutput } from './redaction.js';
 
 export type MonitorLevel = 'error' | 'warn' | 'info' | 'debug' | 'verbose';
 export interface MonitorOptions {
@@ -48,6 +49,19 @@ export async function resetForNormalBoot(port: MonitorPort, delay: (ms: number) 
 
 const rank: Record<MonitorLevel, number> = { error: 0, warn: 1, info: 2, debug: 3, verbose: 4 };
 const ansi = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+/** Sends one already-rendered monitor chunk through the same redaction boundary for console and file sinks. */
+export function writeMonitorOutput(
+  rendered: string,
+  redact: boolean,
+  consoleWrite: (text: string) => void,
+  fileWrite?: (text: string) => void,
+): string {
+  const safe = redact ? redactOutput(rendered) : rendered;
+  consoleWrite(safe);
+  fileWrite?.(safe.replace(ansi, ''));
+  return safe;
+}
 
 export function parseSerialLevel(line: string): MonitorLevel | undefined {
   const clean = line.replace(ansi, '');

@@ -7,7 +7,7 @@ import packageMetadata from '../package.json';
 import { createWriteStream } from 'node:fs';
 import { finished } from 'node:stream/promises';
 import { analyzeBootLogs } from './upstream/flasher/serialLog.js';
-import { monitorSerial, type MonitorLevel } from './monitor.js';
+import { monitorSerial, type MonitorLevel, writeMonitorOutput } from './monitor.js';
 import { formatCheckOutput, formatDryRunOutput, formatStatusOutput, standalonePresentationFixture } from './presentation.js';
 import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
@@ -205,10 +205,7 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
       raw: args.raw, noColor: args.noColor, color, header,
       output: (value) => {
         const rendered = `${value}${value.endsWith('\n') ? '' : '\n'}`;
-        const safeRendered = args.redact ? redactOutput(rendered) : rendered;
-        target.write(safeRendered);
-        const plain = safeRendered.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
-        file?.write(plain);
+        writeMonitorOutput(rendered, args.redact, (text) => target.write(text), file ? (text) => file.write(text) : undefined);
       },
     });
     target.write('Serial port released.\n');

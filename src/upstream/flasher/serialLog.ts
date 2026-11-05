@@ -76,6 +76,10 @@ export class LogSanitizer {
 
   private inRadioPayload = false;
 
+  private pendingIdentityBlock?: 'PUBLIC KEY' | 'SERIAL NUMBER';
+
+  private identityHexBlock?: 'PUBLIC KEY' | 'SERIAL NUMBER';
+
   public constructor(private readonly options: { suppressRadioPayloads?: boolean } = {}) {}
 
   public sanitizeLine(line: string): string | null {
@@ -96,6 +100,31 @@ export class LogSanitizer {
     }
 
     if (this.options.suppressRadioPayloads) {
+      const identityLabel = trimmed.match(/\b(?:local\s+|cloud\s+)?WS\s+(PubKey|SN)\s*:/i)?.[1]?.toLowerCase();
+      if (identityLabel) {
+        this.pendingIdentityBlock = identityLabel === 'pubkey' ? 'PUBLIC KEY' : 'SERIAL NUMBER';
+        this.identityHexBlock = undefined;
+        return line;
+      }
+      if (this.identityHexBlock && /^={3,}\s*$/.test(trimmed)) {
+        this.identityHexBlock = undefined;
+        return line;
+      }
+      if (this.pendingIdentityBlock && /^={3,}\s*$/.test(trimmed)) {
+        this.identityHexBlock = this.pendingIdentityBlock;
+        this.pendingIdentityBlock = undefined;
+        return line;
+      }
+      if (this.identityHexBlock && /^(?:[0-9a-f]{2}(?:\s+|$)){2,}$/i.test(trimmed)) {
+        const bytes = trimmed.split(/\s+/).filter(Boolean).length;
+        return `[REDACTED ${this.identityHexBlock}; ${bytes} bytes]`;
+      }
+      if (this.pendingIdentityBlock && /^(?:[0-9a-f]{2}(?:\s+|$)){2,}$/i.test(trimmed)) {
+        const bytes = trimmed.split(/\s+/).filter(Boolean).length;
+        return `[REDACTED ${this.pendingIdentityBlock}; ${bytes} bytes]`;
+      }
+      if (this.pendingIdentityBlock) this.pendingIdentityBlock = undefined;
+
       if (/---.*\bPacket\s+(?:Received|Response)\b.*---/i.test(trimmed)) {
         this.inRadioPacket = true;
         this.inRadioPayload = false;

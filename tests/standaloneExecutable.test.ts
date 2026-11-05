@@ -108,7 +108,7 @@ describe('standalone executable packaging', () => {
     expect(safe).toContain('"chip": "ESP32-S3"');
     expect(safe).not.toContain('AA:BB:CC:DD:EE:FF');
     expect(safe).not.toContain('gateway-secret.example');
-    expect(safe).not.toContain('1234');
+    expect(safe).not.toContain('WeatherXM WG1200 1234');
     expect(safe).not.toContain('AB12CD34EF56');
     expect(safe).not.toContain('station-123');
     expect(safe).not.toContain('serial-123');
@@ -122,8 +122,17 @@ describe('standalone executable packaging', () => {
     expect(safe).not.toContain('0x00001234');
     expect(safe).not.toContain('Synthetic City');
     expect(safe).not.toContain('wxm-gw-a1b2c3.local');
+    expect(safe).not.toContain('wxm-gw-aabbcc.local');
     expect(safe).not.toContain('11:22:33:44');
     expect(safe).toContain('reset=');
+    expect(safe).toContain('"ws_fo_id": "[REDACTED STATION ID]"');
+    expect(safe).toContain('"name":"[REDACTED DEVICE NAME]"');
+    expect(safe).toContain('RAM available for dynamic allocation: 123456 bytes');
+    expect(safe).toContain('Public firmware SHA-256: cf99cf99');
+    expect(safe).not.toContain('0x00A1B2C3');
+    expect(safe).not.toContain('0x00B2C3D4');
+    expect(safe).not.toContain('Synthetic Gateway');
+    expect(safe).not.toContain('192.0.2.42');
   });
 
   it.skipIf(!builtExecutable)('reports embedded source and build metadata', () => {

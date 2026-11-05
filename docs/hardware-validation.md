@@ -68,6 +68,29 @@ follow-up address those known forms and suppress packet byte rows in redacted
 monitor mode; the updated implementation still needs its automated validation
 below and has not been physically retested. This is best-effort filtering.
 
+### Follow-up capture showing overlapping-redaction defects (5 November 2026)
+
+The maintainer later supplied a second real capture on Raspberry Pi 5 `bugs`
+using the same previously hardware-tested executable (SHA-256
+`1615d6d37e3a49bb0d4be252256865cedb0dfc4ccf2e9db6835f37e13b04e72c`, source
+commit `3ba995d844bd82d9fc8901838adc248c5eb0c2d1`). It again showed ROM startup,
+successful Secure Boot V2 verification, selection of `ota_1`, Wi-Fi/MQTT
+startup, and WS1001 packet processing. This is physical validation of that
+binary only; the corrections in the current working tree are not physically
+validated. The terminal transcript is not reproduced here because it includes
+network identity and device-specific station data.
+
+The capture showed that the previous overlapping replacements corrupted
+serial and mDNS placeholders; prefixed settings/telemetry JSON became invalid;
+station IDs remained visible in ownership messages; and routine heap text was
+over-redacted. The old binary also labeled an IP address as a location. The
+updated source uses protected placeholders, structured embedded-JSON parsing,
+contextual station-ID labels, a distinct IP-address placeholder, and tests for
+preserving heap values and public firmware SHA-256 strings. Redacted monitor mode
+also replaces delimited `WS PubKey` and `WS SN` byte rows with byte counts.
+Redaction remains best-effort and cannot guarantee safety for unknown log
+formats.
+
 ## Continuous startup capture follow-up
 
 Source now provides `monitor --boot`: the receive listener is attached before
