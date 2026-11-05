@@ -47,6 +47,7 @@ describe('standalone executable packaging', () => {
     expect(commandHelp).toContain('[--redact]');
     const monitorHelp = execFileSync(executable, ['monitor', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(monitorHelp).toContain('receive-only');
+    expect(monitorHelp).toContain('--boot');
     const securityHelp = execFileSync(executable, ['security', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(securityHelp).toContain('security check <firmware>');
     const badInput = spawnSync(executable, ['check', 'weatherxm', '--json'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
