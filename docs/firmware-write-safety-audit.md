@@ -244,3 +244,125 @@ Blocking issues:
    matrix remains incomplete.
 
 No physical write procedure is provided because the readiness gate is not met.
+
+## I. Follow-up investigation and current status (2026-11-05)
+
+This follow-up starts at clean commit `a1e53b9e62c39beb25cba7efee77d3fcf5d83c69`.
+The independently pinned web-flasher checkout remains at
+`35b2ecc4ccb31799ecd720609786362a99b3e33a`. The reviewed public WeatherXM
+firmware source checkout was `a30374b045c138dac3f6dd4267ef8eb7390a7670`
+(`wg1200-firmware`, 2026-10-26); it is a source reference and is not proven to
+be the exact firmware/bootloader installed on the previously observed gateway.
+The lockfile resolves `esptool-js` 0.7.0 and SerialPort 13.0.0. No physical
+device was connected or modified during this follow-up.
+
+### Secure Boot V2 and anti-rollback assessment
+
+The three checks are distinct:
+
+| Property | What this CLI establishes | Assessment |
+|---|---|---|
+| A. Image structure | Manifest length and SHA-256, app descriptor, expected Secure Boot V2 signature-block marker `0xE7` | Format/manifest integrity only; the marker does not establish a valid signature. |
+| B. Cryptographic signature | No RSA-PSS verification of the image signature against its embedded public key | Unverified. The public firmware repository does not contain its configured production private key. |
+| C. Device trust | No comparison between the candidate key digest and active, unrevoked ESP32-S3 eFuse key digests | Unverified for the individual gateway. |
+
+Espressif Secure Boot V2 stores SHA-256 key digests in eFuse key-purpose
+blocks. Secure-boot enablement, key-purpose values, per-key revocation, and
+read-protection state all matter. ROM-loader register reads could in principle
+expose read-only eFuse state, and esptool-js provides low-level register reads,
+but this project has no validated ESP32-S3 field decoder or cross-check against
+the installed bootloader. The reviewed release profile sets
+`CONFIG_SECURE_BOOT_V2_ALLOW_EFUSE_RD_DIS=y`, so relevant fields can be
+read-protected. Missing, inconsistent, or protected values are inconclusive.
+No eFuse operation was issued.
+
+The public `sdkconfig.wg1200_release` enables Secure Boot V2 and signed
+applications, but its configured production key file is absent from the public
+checkout. Its anti-rollback configuration is not enabled, and
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is not set. The app descriptor contains
+`secure_version`, but this CLI does not compare it with the device's
+secure-version eFuse state. Secure Boot and anti-rollback are independent; the
+source profile does not prove anti-rollback is active or establish the
+installed gateway's eFuse value. There is no trustworthy candidate preflight.
+**Blocker unresolved.**
+
+The safe resolution is to retain the hard write block in `securityPolicy.ts`.
+Non-identical firmware checks report `security-blocked` with
+`securityEvidence: "unverified"`; write attempts are rejected before any flash
+operation and cannot be overridden by confirmation, `--yes`, `--force`, or
+recovery flags. This is conservative, not proof that a candidate would fail.
+
+### Protected-region coverage after hardening
+
+Exact expected extents are validated against the partition table before the
+transaction. Every non-OTA protected range below is read completely before the
+app write and SHA-256 hashed incrementally; the same range is reread and
+compared after app MD5 verification and before OTA activation. Reads use 4096
+byte chunks, retaining one chunk at a time. Partial reads, timeouts,
+disconnects, malformed/incomplete snapshot sets, or hash mismatches fail
+closed. ROM-loader reads do not intentionally mutate flash.
+
+| Region | Start | End (exclusive) | Size | Before / after | Integrity handling |
+|---|---:|---:|---:|---|---|
+| Partition table | `0x0C000` | `0x0D000` | `0x1000` | Full / full | SHA-256 equality; abort before activation |
+| `esp_secure_cert` | `0x0D000` | `0x0F000` | `0x2000` | Full / full | SHA-256 equality; abort |
+| `nvs` | `0x0F000` | `0x13000` | `0x4000` | Full / full | SHA-256 equality; abort |
+| `otadata` | `0x13000` | `0x15000` | `0x2000` | Full snapshot / full precommit reread and postcommit read | Intentional target-sector mutation; validate state, sequence, CRC, target bytes and unchanged peer sector |
+| `phy_init` | `0x15000` | `0x16000` | `0x1000` | Full / full | SHA-256 equality; abort |
+| `factory` | `0x020000` | `0x420000` | `0x400000` | Full / full | SHA-256 equality; abort |
+| `ota_0` | `0x420000` | `0x820000` | `0x400000` | Not hashed as protected | OTA target exception; metadata-selected active slot is not targeted; app gets on-chip MD5 verification |
+| `ota_1` | `0x820000` | `0xC20000` | `0x400000` | Not hashed as protected | Same OTA-slot exception |
+| `nvs_key` | `0xC20000` | `0xC21000` | `0x1000` | Full / full | SHA-256 equality; abort |
+| `spiffs` | `0xC21000` | `0xF21000` | `0x300000` | Full / full | SHA-256 equality; abort |
+
+Each non-OTA protected pass reads 7,372,800 bytes; both passes total
+14,745,600 bytes. At 115200 baud and 10 serial bits per byte, payload alone
+requires about 21.4 minutes. The 25 ms inter-chunk pacing adds about 90 seconds
+across both passes, before ROM protocol and response overhead. Memory remains
+bounded to a 4 KiB chunk plus hash state. Large ranges are not sampled and raw
+data or hashes are not printed. The active OTA slot is protected by the
+metadata-derived write guard rather than an additional full-slot digest.
+
+The transaction reads both full OTA metadata sectors after confirmation and
+compares their derived active/target state with the initial inspection. Before
+commit it compares the complete 8192-byte snapshot, refuses to overwrite the
+active sector, validates intended sequence and CRC, then reads the full
+partition back and checks the target record and byte-identical peer sector.
+Sequence `0xFFFFFFFF` is rejected before app write because ESP OTA treats that
+value as erased. A future activation still carries rollback risk: the CLI
+directly writes `VALID`, not the normal `NEW`/`PENDING_VERIFY` flow.
+
+### OTA rollback and failure recovery matrix
+
+| Scenario | Evidence and likely behavior | Recovery conclusion |
+|---|---|---|
+| Malformed image | Host checks structure, manifest digest and descriptor; the Secure Boot bootloader should reject an invalid image, but the installed bootloader is not matched | Boot rejection/fallback is unverified; ROM recovery may be required |
+| Validly formatted, untrusted signature | Public WeatherXM source says production bootloader accepts production-key applications; production key and installed bootloader are unavailable | Rejection expected from source, fallback unverified; ROM recovery may be required |
+| Candidate security version below device eFuse floor | Current public profile has anti-rollback disabled; actual device eFuse/profile unknown | CLI cannot preflight; if enforced, rejection/fallback behavior is unknown |
+| Valid signed image crashes immediately | Public `boot_guard.cpp` counts panic/watchdog resets and selects previous OTA slot at a threshold; power-on resets the count | App-level and source-only, not bootloader rollback; deployed build and behavior unverified |
+| App starts but initialization fails | Source guard relies on panic/watchdog reset reasons; no generic early-init confirmation established | Unknown; ROM-loader recovery may be needed |
+| Power loss during metadata commit | CLI alternates metadata sectors, preserves/checks peer and checks readback; ESP-IDF documents two-sector selection | Generic power-loss tolerance is not validated with this bootloader and direct `VALID` record |
+| New image boots but never confirms health | Public profile does not enable ESP-IDF app rollback; app guard clears its counter after 600 seconds or ThingsBoard connection | No generic rollback guarantee; serial observation is informational and health remains `not-checked` |
+| No app-level rollback / rejected new app | CLI commits `VALID`; the old sector remains but shipped bootloader policy is unmatched | Do not assume automatic return to prior app; ROM-loader recovery may be needed |
+
+These statements describe the public source snapshot, not proven gateway
+behavior. The physical-write and health-gate blocker remains unresolved.
+
+### Current disposition
+
+Regression coverage checks exact snapshot membership, partial-read failure,
+OTA metadata precommit/readback, abort before activation on protected-check
+failure, the hard security gate, and OTA erased-sequence rejection. `factory`
+is newly included in protected hashes. Source tests and standalone validation
+results for this follow-up are recorded with its final build metadata below
+after completion.
+
+**NOT READY FOR PHYSICAL FLASH TEST.** Remaining blockers are per-device Secure
+Boot key trust and anti-rollback evidence, unconfirmed exact gateway
+rollback/bootloader semantics, and absence of physical write/health-gate
+validation. Resolution requires authoritative production public-key digests, a
+validated read-only eFuse decoder and device-specific readable configuration
+and security-version evidence (or authoritative attestation), the exact
+deployed bootloader/configuration and rollback behavior, and a separately
+approved staged hardware plan with recovery prerequisites. No physical writes
+should be attempted before then.

@@ -4,13 +4,13 @@ Independent command-line utility for inspecting, verifying and installing compat
 
 ## Status
 
-Commands include `info`, `verify`, `status`, `firmware list`, and `flash`. Device inspection enters the ESP32-S3 ROM loader and resets the device to run a RAM stub. `flash` writes only the inactive OTA app slot and OTA selection metadata, after exact layout validation, firmware integrity checks, and explicit confirmation.
+Commands include `info`, `verify`, `status`, `firmware list`, and `flash`. Device inspection enters the ESP32-S3 ROM loader and resets the device to run a RAM stub. Firmware writing is currently fail-closed: the CLI does not permit installation until Secure Boot signing-key trust and gateway anti-rollback compatibility can be verified. `flash --dry-run` remains read-only.
 
 The official reference repository and exact behavior reviewed are documented in [docs/official-flasher-analysis.md](docs/official-flasher-analysis.md). The staged implementation plan is in [docs/implementation-plan.md](docs/implementation-plan.md). Safety rules are in [SAFETY.md](SAFETY.md).
 
 ## Hardware validation
 
-The Linux ARM64 standalone built from commit `233fe617` completed three rounds each of `info`, `verify`, and `status` on a Raspberry Pi 5 with a WG1200. All nine read-only runs passed; each took about 4–5 seconds. This validates inspection and verification on that hardware, not firmware installation, erase, or recovery. See the [hardware validation record](docs/hardware-validation.md) for the build identity and limits.
+The maintainer-reported Linux ARM64 standalone built from commit `b332833` completed one each of `info`, `verify`, and `status` on a Raspberry Pi 5 with a WG1200. This validates those read-only operations on that hardware, not firmware installation, erase, or recovery. The current audited source is newer and has not been physically exercised. See the [hardware validation record](docs/hardware-validation.md) for build identity and limits.
 
 Contributor workflow and safety requirements are in [AGENTS.md](AGENTS.md). Command examples and sample dual-slot output are in [EXAMPLE.md](EXAMPLE.md).
 
@@ -26,7 +26,7 @@ The release workflow builds a self-contained executable with the Node.js runtime
 | `weatherxm-flash-linux-arm64` | Linux ARM64 | Ubuntu 22.04 build runner | Read-only physical validation reported on Raspberry Pi 5; see [hardware validation](docs/hardware-validation.md). |
 | `weatherxm-flash-linux-x64` | Linux x64 | Ubuntu 22.04 build runner | Build and release-workflow smoke-test target; no physical-device validation is recorded here. |
 
-Build runner baselines are macOS 14 and Ubuntu 22.04. Older OS releases have not been established as compatible; newer releases still need the required runtime libraries. Linux ARM64 has completed repeated read-only hardware tests on a Raspberry Pi 5. Other platform targets are not claimed as physically validated.
+Build runner baselines are macOS 14 and Ubuntu 22.04. Linux ARM64 runtime environments need `libatomic1`. Older OS releases have not been established as compatible. The maintainer-reported Linux ARM64 build has completed read-only tests on a Raspberry Pi 5; the current audited source has not. Other platform targets are not claimed as physically validated.
 
 Linux executables need a compatible system C/C++ runtime and `libatomic.so.1` (usually provided by the `libatomic1` package on Debian/Ubuntu). Linux users need permission to open the serial device, often through the `dialout` group; log out and back in after changing group membership. Containers must expose the serial device, commonly `/dev/ttyUSB0` or `/dev/serial/by-id/...`.
 
@@ -206,11 +206,11 @@ The `check --json` response is a JSON object with these stable fields:
 }
 ```
 
-`comparison` values are `identical`, `newer`, `older`, `same-version-different-build`, `different-type`, and `ambiguous`. `status` values are `up-to-date`, `update-available`, `downgrade-blocked`, `approval-required`, and `incompatible-firmware`. A type change is not treated as an update. `flashingPermitted` describes the policy before ordinary write confirmation; it is false where special approval is required or the OTA state is ambiguous.
+`comparison` values are `identical`, `newer`, `older`, `same-version-different-build`, `different-type`, and `ambiguous`. `status` values are `up-to-date`, `update-available`, `downgrade-blocked`, `approval-required`, `incompatible-firmware`, and `security-blocked`. `securityEvidence` is currently `unverified`; `flashingPermitted` is always false until device trust and anti-rollback checks are implemented. A type change is not treated as an update.
 
 Device inspection JSON (`info`, `status`, `verify`) and firmware check/dry-run JSON include additive `ota` and `firmwareSlots` fields. `ota.activeSlot` and `ota.inactiveSlot` are null when validated OTA metadata cannot identify an OTA slot; `nextTargetSlot` and `nextTargetOffset` are null for ambiguous metadata. `firmwareSlots.ota_0` and `.ota_1` contain `active`, `version`, `firmwareType`, `build`, and `descriptorStatus` (`valid`, `invalid`, or `unknown`). Unavailable descriptor values are JSON `null`. Check/dry-run also report `inactiveMatch` when the selected application descriptor matches the readable inactive slot descriptor; this is informational and does not change installation policy.
 
-Before any write, `flash` parses the active and selected images' ESP-IDF application descriptors. It compares firmware type, version, and the embedded application ELF SHA-256 build identifier; the selected firmware's descriptor comes from the downloaded, signature-block and SHA-256-validated image. Exact matches exit successfully without writing. `--force` permits intentional reinstall of an exact match but still requires the existing install confirmation. Downgrades are blocked. Unrecognized or ambiguously ordered version strings require a separate interactive approval phrase; `--yes` cannot approve ambiguity. `--dry-run` performs catalog/image validation and read-only device inspection, then prints both descriptors, comparison result, image hash, and proposed OTA target without modifying flash. If required descriptor metadata is missing or malformed, flashing fails closed.
+The CLI checks the manifest length and SHA-256, descriptor fields, and signature-block marker, but does not validate the RSA-PSS signature or establish that its key is trusted by the connected gateway. It also cannot currently compare image security version with that gateway's eFuse anti-rollback state. Therefore every non-identical candidate is reported as `security-blocked`, and confirmed install attempts are rejected before any flash operation regardless of `--yes`, `--force`, or `--recover`. `--dry-run` performs read-only catalog/image validation and device inspection, and reports the proposed target plus the write-block reason. See [the safety audit](docs/firmware-write-safety-audit.md).
 
 ## Docker
 
@@ -238,7 +238,7 @@ Tests use fixtures and mocks. They do not connect to a gateway or perform firmwa
 
 The release workflow builds each target on a matching native runner, smoke-tests startup and the serial binding, then waits for the configured self-hosted Linux ARM64 read-only device gate. It generates SHA-256 checksums and creates a **draft prerelease** that is not public until manually published. Its notes distinguish physically tested read-only operations from automated-only write paths. Do not publish it as production-ready until firmware installation and OTA activation have been separately validated on hardware. No release has been created by this task.
 
-The hardware gate is intentional: no release is published until an actual WG1200 serial session confirms read-only identity, flash layout, credentials, and OTA metadata checks. Automated firmware-write testing remains fixture/mock-only. Never use the release gate to run `flash`.
+The hardware gate is read-only and does not enable firmware writes. The CLI currently blocks all installation attempts because Secure Boot trust and device anti-rollback evidence are unavailable. Automated firmware-write testing remains fixture/mock-only. Never use the release gate to run `flash`.
 
 ## License
 
