@@ -7,6 +7,7 @@ This repository contains the WeatherXM WG1200 CLI and its standalone serial flas
 - `src/cli.ts` defines command parsing and dispatch.
 - `src/device.ts` handles read-only inspection, firmware comparison, and the guarded OTA installation transaction.
 - `src/presentation.ts` formats human-readable status, check, and dry-run output. Keep user-visible slot formatting here so it can be exercised by standalone tests.
+- `src/upstream/flasher/secureBoot.ts` decodes read-only ESP32-S3 Secure Boot V2 eFuse evidence and verifies candidate RSA-PSS images; `security` command dispatch lives in `src/cli.ts`.
 - `src/upstream/flasher/` contains the adapted ESP32/WG1200 transport, partition, descriptor, and OTA logic.
 - `tests/` contains unit, safety, and standalone executable regression tests.
 - `scripts/build-standalone.mjs` builds platform-native Node single executable applications.
@@ -17,6 +18,11 @@ This repository contains the WeatherXM WG1200 CLI and its standalone serial flas
 - Never change firmware upgrade/downgrade comparison policy, duplicate detection, `--force` restrictions, identity checks, image validation, partition validation, protected-region handling, OTA selection, transactional metadata updates, write boundaries, or post-flash monitoring without an explicit task requiring that change.
 - The active firmware descriptor is the reference for upgrade and downgrade decisions. The inactive slot is informational only; a matching descriptor does not prove image integrity, authorize activation, bypass downgrade rules, or justify skipping installation.
 - Keep inspection and dry-run read-only with respect to flash. Inspection may enter the ESP32 ROM loader, read metadata, and reset the gateway; state this accurately in user-facing docs.
+- `security` uses the ROM loader without uploading a RAM stub or accessing flash. It reads only eFuse read registers and may reset the gateway while entering ROM mode. It must never invoke eFuse programming, flash write, flash erase, or OTA metadata operations.
+- ESP32-S3 `KEY_PURPOSE_0` is logical Secure Boot digest slot 0, stored in `BLOCK_KEY0`, physical eFuse block 4, whose read registers start at `0x6000709c` (eight 32-bit words). `RD_DIS` bit 0 applies to this physical block. Keep logical slot, named block, physical block index, and register offset explicit in code and tests.
+- `esptool-js` `readReg()` may return a signed JavaScript int32 for register words with bit 31 set. Normalize valid signed words with `>>> 0` before interpreting bytes; do not classify negative int32 values as read failures. Keep eFuse word order and byte order consistent with Espressif `espefuse summary`.
+- On failed key-digest reads, expose only a bounded diagnostic category, logical/physical block mapping, register offset, and word index. Never include raw key-block words or the thrown error's unrestricted message. Keep `--redact` at the output boundary.
+- Unreadable, all-zero, or ambiguous key data must not become a trusted digest. Image signature validity is distinct from device key trust. Keep anti-rollback enforcement `unknown` unless the connected bootloader configuration is independently established; firmware writing remains hard-blocked.
 - Never run firmware writes or erases as a test. Physical-device checks must be read-only (`info`, `verify`, `status`, `check`, or `flash --dry-run`) and should only be done when explicitly requested.
 - JSON mode must emit valid JSON on stdout. Send diagnostics to stderr and use `null` for unavailable fields rather than guessed values.
 - `--redact` must be applied at the output boundary for stdout and stderr, including JSON, diagnostics, monitor display, and monitor output files. Keep original identity values for validation and cryptographic operations. Extend `tests/redaction.test.ts` and the standalone executable redaction fixture for any new sensitive output fields.
@@ -41,13 +47,15 @@ wg1200 --version --verbose
 
 Build on the target OS and architecture because the executable embeds the native `serialport` binding. The build script stages the binary, verifies embedded source/build metadata and the slot formatter, then replaces the artifact in `dist/`. It intentionally rejects Bun to prevent a false-success build.
 
-When changing human-readable status, check, or dry-run output, test the executable itself, not only the source renderer or `--help`:
+When changing human-readable status, check, dry-run, or security output, test the executable itself, not only the source renderer or `--help`:
 
 ```sh
 WG1200_STANDALONE_BINARY="$PWD/dist/weatherxm-flash-macos-arm64" npm test
 ```
 
 `tests/standaloneExecutable.test.ts` runs the real binary's embedded presentation fixtures and checks that both OTA slots, versions/builds, target details, comparisons, and the inactive-match message are present. It also verifies `--version`, `-v`, verbose and JSON output, and the package version in normal help. Keep that regression coverage in sync with formatter changes. The binary's verbose version output identifies package version, build timestamp, source SHA-256, Git commit/tag, and whether the build tree was dirty; `--version --json` is available for automation. Tagged GitHub release builds must use a clean checkout. `--build-info` remains an internal build-validation command.
+
+For Secure Boot digest decoder changes, add synthetic tests for the exact ESP32-S3 `BLOCK_KEY<n>` register addresses, eight-word read length, unsigned normalization, esptool-compatible byte order, truncated reads, protection restrictions, and redacted diagnostics. Do not access physical hardware unless the user explicitly requests it; provide read-only command examples when they need to validate on a gateway.
 
 The optional `--redact` output mode masks MAC addresses, gateway/device IDs and names, certificate common names/fingerprints/PEM blocks, public keys/hashes, serial-number fields, and common USB serial paths. It keeps chip, firmware, flash, and partition details useful for diagnosis. It cannot guarantee detection of every sensitive value; docs must tell users to review logs before sharing.
 

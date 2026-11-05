@@ -212,6 +212,8 @@ Device inspection JSON (`info`, `status`, `verify`) and firmware check/dry-run J
 
 `security --port <path>` reports read-only Secure Boot V2 eFuse evidence. `security check weatherxm --port <path>` (or `meshtastic`) verifies a catalog candidate's ESP32-S3 image, digest, RSA-PSS signature, signing-key digest, and available device trust slots. It returns `UNKNOWN` when installed-bootloader anti-rollback enforcement is not established; signature trust does not establish boot or rollback behavior. Firmware install attempts remain rejected before any flash operation regardless of `--yes`, `--force`, or `--recover`. `--dry-run` remains read-only and reports the proposed target plus the write-block reason. See [the safety audit](docs/firmware-write-safety-audit.md).
 
+Security JSON `keyBlocks[]` includes `readDiagnostic` for digest-purpose blocks. It reports the logical slot, physical eFuse block, register base offset, eight-word read count, and a fixed failure category/word offset when relevant. It never includes raw eFuse words. A successful signature check is separate from device key trust, and the digest remains unavailable until read-only hardware revalidation succeeds.
+
 ## Docker
 
 The image supports the host architecture, including Linux ARM64 systems such as Raspberry Pi. Pass the serial device through explicitly:

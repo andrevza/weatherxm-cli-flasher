@@ -76,6 +76,37 @@ reads, or unexplained chip identity are surfaced as ambiguous or unavailable.
 The key digest is SHA-256 over the Secure Boot V2 public-key data (modulus,
 exponent, and Montgomery constants).
 
+### Key-digest read diagnosis
+
+Espressif's ESP32-S3 eFuse definition maps `BLOCK_KEY0` to physical block 4,
+read-register base `EFUSE_BASE + 0x09C`, and eight 32-bit words. Its read-disable
+bit is `RD_DIS[0]`; `KEY_PURPOSE_0 = SECURE_BOOT_DIGEST0` selects this block as
+logical Secure Boot digest slot 0. The register map and block/alias mapping are
+confirmed by Espressif's [official definition](https://github.com/espressif/esptool/blob/master/espefuse/efuse/esp32s3/mem_definition.py).
+
+The unavailable digest report was caused by signed conversion, not an
+incorrect block address or word count. In the installed `esptool-js` version,
+`readReg()` returns the `READ_REG` response assembled with JavaScript bitwise
+operators; the top bit therefore makes a valid 32-bit register word a negative
+JavaScript number. The decoder rejected negative values before byte decoding.
+Eight digest words are independently random-looking, so this affected most
+real digests. The correction accepts the signed-int32 representation and
+normalizes it with `>>> 0`. Byte ordering matches Espressif `espefuse`: its
+implementation reads eight ascending registers, reverses the word list to
+construct its bit array, then reverses those bytes for display. The CLI writes
+each word's bytes little-endian in ascending address order, yielding the same
+display/digest bytes.
+
+Each digest slot now includes a bounded `readDiagnostic`: logical slot,
+physical block, register base offset, expected/read word counts, failed word and
+offset when present, and a fixed error category. It never includes raw register
+values or unrestricted exception text. A complete all-zero or all-one block
+remains ambiguous and cannot be accepted as a trusted digest. Secure Download
+Mode may separately restrict register operations; a failed read reports its
+category and remains unavailable. The supplied Raspberry Pi result predates
+this correction, so the new digest decoder still requires read-only physical
+revalidation before device trust can be claimed.
+
 Candidate checks first use the existing HTTPS catalog and manifest SHA-256
 validator. They then validate the ESP image header/segments, ESP32-S3 chip ID,
 segment XOR checksum, appended image SHA-256, 64 KiB WG1200 page boundary,
