@@ -1,5 +1,34 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Maintainer-reported Secure Boot validation (4 November 2026)
+
+The maintainer reports that Linux ARM64 executable version `0.1.0`, built
+with Node.js `v26.8.2` from commit
+`1881be937c94be9f48e566a1fc6d37ff9dc73776`, had SHA-256
+`a57682e15418389c02f7e9ff509a9311035af903796c8269e44272361c6a9310` and
+successfully ran both read-only commands below on a Raspberry Pi 5 / WG1200:
+
+```sh
+./weatherxm-flash-linux-arm64 security --port /dev/ttyUSB0 --json --redact
+./weatherxm-flash-linux-arm64 security check weatherxm --port /dev/ttyUSB0 --json --redact
+```
+
+The reported ESP32-S3 v0.2 evidence was Secure Boot V2 enabled and verified;
+logical digest slot 0 mapped to physical block 4 and was readable, active,
+correctly purposed and matched the candidate signer; slots 1 and 2 were
+revoked; security-version floor and candidate version were both 0. Candidate
+manifest/image digest, ESP image structure, RSA-3072/PSS-SHA256 signature and
+signature-block checks passed. The reported comparison was `meets-floor`.
+Anti-rollback enforcement and installed-bootloader behavior remain unknown.
+No raw identifiers, digests or certificates are recorded here. This is
+maintainer-supplied evidence; Codex did not independently access the gateway.
+
+This executable predates the trust-classification change in the current
+checkout. Its output was `UNKNOWN` because anti-rollback configuration was
+unknown. The updated classifier should report image/device trust as `TRUSTED`
+while keeping installation readiness blocked; this updated source has not yet
+been physically validated.
+
 ## Latest build validation
 
 The maintainer supplied the following results for the Linux ARM64 standalone

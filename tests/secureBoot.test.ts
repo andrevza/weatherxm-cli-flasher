@@ -127,14 +127,25 @@ describe('ESP32-S3 Secure Boot V2 read-only evidence', () => {
     expect(zeroBlock.keyBlocks[0].readDiagnostic?.errorCategory).toBe('empty-readable-block');
   });
 
-  it('compares trusted, revoked, and incorrectly purposed keys without guessing rollback enforcement', () => {
+  it('keeps device trust separate from unknown bootloader rollback and rejects revoked or mismatched keys', () => {
     const { data, digest } = fixture();
     const image = verifySecureBootV2Image(data); image.secureVersion = 2;
     const makeState = (options: Parameters<typeof deviceRegisters>[0]) => readEsp32S3SecureBootState(async (address) => deviceRegisters({ ...options, digest })(address), { model: 'ESP32-S3', revision: null });
     return makeState({}).then((trusted) => {
-      expect(compareSecureBootTrust(image, trusted).result).toBe('UNKNOWN');
+      expect(compareSecureBootTrust(image, trusted).result).toBe('TRUSTED');
       expect(compareSecureBootTrust(image, trusted).trustedKeyMatch).toBe(true);
+      expect(compareSecureBootTrust(image, trusted).securityVersionStatus).toBe('meets-floor');
       return makeState({ revoke: true }).then((revoked) => expect(compareSecureBootTrust(image, revoked).result).toBe('REVOKED'));
     }).then(() => makeState({ purpose: 0 }).then((wrong) => expect(compareSecureBootTrust(image, wrong).result).toBe('UNTRUSTED')));
+  });
+
+  it('keeps unknown security-version evidence unknown and reports a below-floor candidate as incompatible', async () => {
+    const { data, digest } = fixture();
+    const image = verifySecureBootV2Image(data); image.secureVersion = 1;
+    const state = await readEsp32S3SecureBootState(async (address) => deviceRegisters({ digest })(address), { model: 'ESP32-S3', revision: null });
+    state.secureVersion = { value: null, status: 'unavailable' } as typeof state.secureVersion;
+    expect(compareSecureBootTrust(image, state).result).toBe('UNKNOWN');
+    state.secureVersion = { value: 2, status: 'verified' } as typeof state.secureVersion;
+    expect(compareSecureBootTrust(image, state)).toMatchObject({ result: 'INCOMPATIBLE', trustedKeyMatch: true, securityVersionStatus: 'below-floor' });
   });
 });

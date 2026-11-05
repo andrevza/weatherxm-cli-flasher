@@ -455,11 +455,10 @@ export function compareSecureBootTrust(image: SecureBootImageEvidence, device: S
     : 'unknown';
   if (onlyRevokedMatches) return { result: 'REVOKED', trustedKeyMatch: false, keyStatus: 'verified', securityVersionStatus, explanation: 'Candidate signature key matches only a revoked device key digest.' };
   if (!trustedKeyMatch) return { result: 'UNTRUSTED', trustedKeyMatch: false, keyStatus: 'verified', securityVersionStatus, explanation: 'Candidate signing-key digest does not match an active, non-revoked device digest.' };
-  if (securityVersionStatus === 'below-floor' && device.antiRollbackEnforcement.state === 'enabled') return { result: 'INCOMPATIBLE', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: 'Candidate security_version is below the device eFuse floor.' };
-  if (securityVersionStatus === 'unknown' || device.antiRollbackEnforcement.state === 'unknown') {
-    return { result: 'UNKNOWN', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: securityVersionStatus === 'below-floor'
-      ? 'The RSA-PSS signature and device key match, but the candidate is below the security-version eFuse floor and enforcement by the installed bootloader is unknown.'
-      : 'The RSA-PSS signature and device key match, but the security-version floor or installed bootloader anti-rollback enforcement is unknown.' };
-  }
-  return { result: 'TRUSTED', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: 'Signature, image digest, active device key, and anti-rollback compatibility all verified.' };
+  if (securityVersionStatus === 'below-floor') return { result: 'INCOMPATIBLE', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: 'Candidate security_version is below the observed device eFuse floor.' };
+  if (securityVersionStatus === 'unknown') return { result: 'UNKNOWN', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: 'The RSA-PSS signature and device key match, but the candidate security version or device eFuse floor could not be established.' };
+  // Trust answers whether this image is cryptographically accepted by the
+  // observed device policy. Unknown bootloader configuration is a separate
+  // installation-readiness concern, and must not erase verified trust.
+  return { result: 'TRUSTED', trustedKeyMatch: true, keyStatus: 'verified', securityVersionStatus, explanation: 'Image signature and digest are valid, the signing key matches an active device digest, and the candidate meets the observed security-version floor.' };
 }

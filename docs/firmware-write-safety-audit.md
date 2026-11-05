@@ -258,6 +258,102 @@ sector but is not separately compared byte-for-byte.
 
 ## F. Failure and recovery matrix
 
+## G. Trust classification and deployed-boot investigation (5 November 2026)
+
+### Trust semantics
+
+`security check` now treats cryptographic image validity, trust under observed
+device Secure Boot state, and installation readiness as separate results.
+`trust.result` can be `TRUSTED` when image structure/digest/signature pass, an
+eligible correctly purposed non-revoked device digest matches, and the
+candidate meets the observed eFuse security-version floor. The anti-rollback
+bootloader option is not needed to conclude the candidate meets that measured
+floor; its enablement remains a separate unknown. An unreadable floor remains
+`UNKNOWN`, a lower candidate is `INCOMPATIBLE`, and invalid signature,
+untrusted key, or revoked key retain negative results. `installation.readiness`
+is independently `BLOCKED`, and the existing write gate remains unconditionally
+closed. This is not a bootability claim.
+
+### Evidence available for the installed bootloader
+
+The latest supplied physical evidence is from the running gateway and says
+Secure Boot V2 is enabled, the candidate signer matches active logical slot 0,
+and candidate/floor security versions are both 0. It does not identify the
+installed second-stage bootloader binary or prove its build options.
+
+There is a locally available public WeatherXM firmware checkout at
+`a30374b045c138dac3f6dd4267ef8eb7390a7670`. Its `sdkconfig.wg1200_release`
+sets Secure Boot V2 and signed application binaries, leaves
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` unset, and enables ROM download mode.
+The source's `main/boot_guard.cpp` documents field bootloaders without
+bootloader rollback and implements an app-level alternative: after three
+crash-class boots it selects the other OTA partition if its descriptor is
+readable, then restarts; a 600-second healthy uptime or ThingsBoard connection
+clears the crash counter. This is matching public-source/build-configuration
+evidence only. No exact deployed bootloader binary, reproducible build match,
+or installed-image hash is available, so it does not establish the gateway's
+actual configuration. Public source revision is distinct from the
+maintainer-supplied app firmware build.
+
+The same source's OTA updater calls `esp_ota_set_boot_partition()` and restarts.
+The inspected CLI instead writes the selected OTA metadata record directly as
+`VALID`; it does not stage `NEW` / `PENDING_VERIFY`. Therefore generic ESP-IDF
+pending-verification rollback cannot be relied on for this CLI flow. The app's
+own crash guard only runs after the application starts and can execute. It
+cannot catch bootloader rejection, a boot loop before `BootGuard::init`, or
+failure before its counter/rollback decision works.
+
+Generic ESP-IDF 5.5 documentation describes Secure Boot V2 signature-failure
+fallback and OTA state handling, and says automatic pending-verification
+rollback depends on `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`. See the official
+[ESP32-S3 Secure Boot V2 guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/security/secure-boot-v2.html)
+and [ESP32-S3 OTA guide](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/system/ota.html).
+These are generic documented behavior, not proof of the installed gateway's
+exact ESP-IDF version or behavior.
+
+| Case | Assessment for this gateway |
+|---|---|
+| Invalid format / invalid signing key | ESP-IDF Secure Boot V2 documentation says a selected application that fails verification can cause another application to be tried. Generic documented behavior only; installed bootloader behavior and alternate-slot validity are not established. |
+| Candidate below security-version floor | Candidate version 0 equals observed floor 0. Public WG1200 release config does not establish anti-rollback enablement. Floor comparison is verified; bootloader enforcement is unknown. |
+| Valid image crashes immediately | Public app source supports rollback after three classified crash boots if the other slot descriptor is usable. Exact deployed code and successful recovery not verified; crashes before app guard initialization remain a concern. |
+| Initialization fails without classified reset | No general app-init failure rollback is proven. The guard counts panic/watchdog/soft-watchdog resets; a failure that does not produce those signals may not roll back. |
+| App never confirms successful boot | Generic ESP-IDF `PENDING_VERIFY` rollback applies only with bootloader rollback enabled and a `NEW` state. Public WG1200 release config disables it; source has an independent uptime/ThingsBoard health marker. Neither is verified in the installed binary. |
+| OTA metadata commit interrupted | ESP-IDF uses two independently written sectors for resilience. The CLI targets one sector and validates readback; the other is left intact. This is code/design evidence, not a physical power-cut test or proof of how this exact bootloader resolves damaged records. |
+| Both OTA apps invalid | No verified automatic recovery. ROM download mode is enabled in the public configuration and ROM access succeeded during maintainer-reported inspection. Entry after a failed app, manual boot strap access, and reinstall procedure have not been validated. |
+
+No matching signed bootloader artifact or installed bootloader dump was
+identified. Bootloader flash reads could in principle be bounded and
+read-only after identity/layout checks, but a dump would expose firmware bytes
+and missing config strings cannot prove options are off. This audit therefore
+does not add a raw bootloader export command. Higher-value evidence is an
+officially reproducible signed bootloader artifact/build record tied to the
+device batch, plus read-only boot logs and a documented physical ROM-entry
+procedure. Logs may reveal version/build strings but cannot alone prove
+compile-time Kconfig values.
+
+### Recovery and readiness
+
+ROM-loader recovery is plausible, not yet an approved demonstrated recovery
+procedure. The reported gateway was reachable in ROM mode for read-only
+inspection and the public build permits ROM download mode. That does not prove
+the CH340 interface can assert the required boot strap after every boot failure
+or that the existing host tools can safely restore the intended OTA selection.
+The prior `ota_1` app is not overwritten when targeting `ota_0`, but the CLI
+then selects the new slot as `VALID`; the preservation of that old app does not
+mean the bootloader will automatically fall back. If metadata is invalid or
+ambiguous, current inspection must remain fail-closed. Do not use the generic
+whole-flash restore/recovery helpers as an OTA recovery plan: they are
+destructive and outside this task's authorization.
+
+A recovery procedure should be bench-tested on a sacrificial equivalent
+gateway, explicitly demonstrate ROM entry with the enclosure/adapter access
+available, and define an image/metadata-only repair that preserves factory,
+certificates, NVS, NVS keys, SPIFFS, and the known-good OTA image. No such
+approved procedure is presently evidenced. In addition, the existing audit
+finds post-write preservation hashes omit factory, PHY and SPIFFS, and there
+has been no physical firmware-write/boot-health validation. These remain
+independent blockers even with `TRUSTED` image/device trust.
+
 | Failure point | Expected state / recovery | Retry guidance and report |
 | --- | --- | --- |
 | Download, manifest, hash, descriptor | Flash untouched | Correct input/connectivity; safe to retry. |

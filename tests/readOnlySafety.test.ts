@@ -70,7 +70,7 @@ describe('read-only safety validation', () => {
   });
   it('fails closed when device-specific Secure Boot and rollback evidence is unavailable', () => {
     expect(firmwareSecurityReady()).toBe(false);
-    expect(() => assertFirmwareSecurityReady()).toThrow(/Secure Boot V2 signature trust and gateway anti-rollback compatibility are not verified/);
+    expect(() => assertFirmwareSecurityReady()).toThrow(/installed bootloader rollback and recovery behaviour/);
   });
   it('parses and accepts a fixture with the complete signed-off partition table structure', () => {
     const parsed = parsePartitionTableWithMetadata(makeTableFixture());

@@ -28,6 +28,7 @@ export interface FirmwareSecurityCheckResult {
   device: SecureBootDeviceState;
   trust: ReturnType<typeof compareSecureBootTrust>;
   applicationBootAndRollbackEstablished: false;
+  installation: { readiness: 'BLOCKED'; reason: string };
   explanation: string;
 }
 
@@ -61,7 +62,8 @@ export async function checkFirmwareSecurity(options: DeviceOptions & { firmwareK
     firmware: { key: options.firmwareKey, version: selected.descriptor.version,
       manifestSha256: selected.verified.sha256, descriptorSecureVersion: selected.descriptor.secureVersion },
     image, device, trust, applicationBootAndRollbackEstablished: false,
-    explanation: `${trust.explanation} This command does not establish application boot health or rollback behavior; firmware writing remains blocked.`,
+    installation: { readiness: 'BLOCKED', reason: 'Installed bootloader OTA selection, rollback, and recovery behavior remains unverified; firmware writing remains disabled.' },
+    explanation: `${trust.explanation} This trust result does not establish application boot health or rollback behavior; firmware writing remains blocked.`,
   };
 }
 export interface FirmwareCheckResult {
