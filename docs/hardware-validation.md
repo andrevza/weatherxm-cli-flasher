@@ -1,5 +1,62 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Candidate artifact static review (5 November 2026)
+
+The repository candidate `dist/weatherxm-flash-linux-arm64-protected-region`
+was reviewed from macOS ARM64; it was not executed. Its SHA-256 is
+`256f8345aa9bc6445c69aa5ce108318e660a477ba8a79bbba6e280ef7d858a16`.
+The embedded build metadata extracted from the ELF identifies package `0.1.0`,
+build time `2026-11-05T10:30:51.347Z`, source SHA-256
+`787606c7b69207f5fca1a4fe737027193abc0691e635a48b9c5df422c6807db8`, Git
+commit `675233492afe6d86b76d219a37a9b36cf2a3a6cf`, clean tree, and Node.js
+`v26.8.2`. Recomputing the builder's source hash from the current TypeScript
+files produced the same digest. Source inspection confirms this commit contains
+the pre-write OTA-sector revalidation, full preserved-OTA and fixed-region
+SHA-256 checks, and the unconditional installation security gate.
+
+An independent ELF64 parser confirmed `EM_AARCH64` (183), a dynamic Linux
+interpreter, five loadable segments, `p_align=0x10000` for each, and 16 KiB
+offset/address congruence. This establishes the ELF layout check for the main
+executable. The matching staged `linux-arm64/@serialport+bindings-cpp.armv8.glibc.node`
+addon was also present and statically checked: AArch64, two loadable segments,
+64 KiB alignment, and 16 KiB congruence. It declares `libstdc++.so.6`,
+`libm.so.6`, `libgcc_s.so.1`, and `libc.so.6`; the executable declares those
+plus `libatomic.so.1`, `libdl.so.2`, `libpthread.so.0`, and
+`ld-linux-aarch64.so.1`. This does not prove the candidate can load the
+embedded addon at runtime. The host had no Node/npm executable; Docker was installed but
+the daemon socket denied access. Consequently typecheck, source tests, source
+build, standalone tests, and native-binding smoke tests were not run in this
+validation pass. The candidate is not a newly generated artifact from this
+pass, and no physical device was accessed.
+
+On the Raspberry Pi 5, run the following before any hardware command:
+
+```sh
+cd /path/to/weatherxm-cli-flasher
+BIN="$PWD/dist/weatherxm-flash-linux-arm64-protected-region"
+sha256sum "$BIN"
+"$BIN" --version --verbose
+"$BIN" --version --json
+WG1200_STANDALONE_BINARY="$BIN" npm test
+```
+
+The last command exercises the standalone binary fixtures and redaction
+regressions. Then perform only read-only device checks, reviewing output before
+sharing it:
+
+```sh
+"$BIN" security check weatherxm --port /dev/ttyUSB0 --json --redact
+"$BIN" info --port /dev/ttyUSB0 --json --redact
+"$BIN" verify --port /dev/ttyUSB0 --json --redact
+"$BIN" status --port /dev/ttyUSB0 --json --redact
+"$BIN" flash weatherxm --port /dev/ttyUSB0 --dry-run --json --redact
+```
+
+These inspection commands can reset the gateway while entering ROM mode;
+`security` reads eFuse registers without a RAM stub or flash access. The dry
+run does not write flash. Do not treat artifact execution or these checks as
+firmware-installation validation.
+
 ## Latest maintainer-reported trust and dry-run validation (5 November 2026)
 
 The maintainer reports that the Linux ARM64 executable built from commit

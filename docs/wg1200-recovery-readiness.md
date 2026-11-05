@@ -1,5 +1,55 @@
 # WG1200 recovery readiness
 
+## Bootloader identification research (5 November 2026)
+
+Espressif documents the ESP32-S3 second-stage bootloader at flash offset
+`0x00000`; the WG1200's validated partition table begins at `0x00C000`, so
+`0x00000..0x00BFFF` is the device-specific upper bound for that flash area.
+This is an address bound, not a proven bootloader file length. The standard
+ESP image begins with magic `0xE9`, a segment count, and segment headers with
+lengths. Its checksum has alignment padding; an optional SHA-256 digest may
+follow, and Secure Boot V2 uses a signature sector. A read covering the whole
+area can therefore include erased/padding bytes and cannot be called the
+bootloader binary hash without reliable end-boundary parsing. `esptool image-info`
+can decode image structure and, when a bootloader descriptor is present,
+report its version, ESP-IDF version, and build time. Those fields are optional
+and do not reveal the complete compile-time Kconfig.
+
+The current CLI has no read-only command that exports and validates precisely
+the bootloader image extent. No such command was added: the exact binary end,
+including this unit's signed-image layout, has not been demonstrated. The
+existing internal full-flash reader is not an acceptable fallback because it
+does not enforce complete reads for every chunk and retains sensitive device
+data in memory. A future diagnostic needs exact layout validation, bounded
+reads, exact length checks, and hash calculation before it can be considered.
+
+The public WeatherXM WG1200 firmware repository and web flasher provide source
+and application firmware workflows, but this review did not identify an
+authoritative bootloader binary with a production build identifier/checksum
+that could be matched to this gateway. Application firmware artifacts cannot
+stand in for the bootloader. This finding is limited to the reviewed public
+repositories; it does not prove no vendor-held artifact exists. A future match
+would require the exact parsed installed bytes and an authoritative, signed or
+otherwise trustworthy vendor artifact/build record.
+
+Compile-time OTA rollback support remains unknown for the installed unit.
+ESP-IDF says rollback is implemented by the bootloader and is controlled by
+build configuration; observable application metadata or absent log strings do
+not establish that configuration. The public source profile is useful context,
+not proof of the installed binary's configuration. Likewise, absence of boot
+logs is inconclusive.
+
+To observe normal startup messages, connect the CH340 and passively listen:
+
+```sh
+wg1200 monitor --port /dev/ttyUSB0 --baud 115200 --timestamp --level info --redact
+```
+
+The monitor sends no serial bytes and does not toggle DTR/RTS. It only sees
+messages produced after it opens; a single ordinary reset is needed to see
+startup from the beginning, and should be done only when operationally safe.
+Do not provoke a crash or repeatedly power-cycle the gateway to infer rollback.
+
 **Status: NOT READY FOR PHYSICAL FLASH TEST.** This report describes evidence
 and a proposed read-only-first recovery runbook. The runbook has not been
 executed. No Codex-initiated physical device access, flash write, erase, OTA
