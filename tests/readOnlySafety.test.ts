@@ -157,21 +157,39 @@ describe('read-only safety validation', () => {
     expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
   });
 
-  it('stops the transaction after OTA metadata or protected-data verification fails', async () => {
+  it('checks protected data before committing OTA metadata and stops on either failure', async () => {
     const writeOtaSelectSector = vi.fn(async () => undefined);
     writeOtaSelectSector.mockRejectedValueOnce(new Error('metadata readback failed'));
     const base = {
       installApplication: vi.fn(async () => undefined), verifyApplicationFlash: vi.fn(async () => true),
       writeOtaSelectSector,
-      verifyProtectedRegions: vi.fn(async () => ({ valid: false, mismatches: ['nvs changed'] })),
+      verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => undefined),
     };
     await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/metadata readback failed/);
-    expect(base.verifyProtectedRegions).not.toHaveBeenCalled();
+    expect(base.verifyProtectedRegions).toHaveBeenCalledTimes(1);
     expect(base.hardReset).not.toHaveBeenCalled();
 
+    writeOtaSelectSector.mockClear();
+    base.verifyProtectedRegions.mockResolvedValueOnce({ valid: false, mismatches: ['nvs changed'] } as any);
     await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/nvs changed/);
+    expect(writeOtaSelectSector).not.toHaveBeenCalled();
     expect(base.hardReset).not.toHaveBeenCalled();
+  });
+
+  it('records the required order and never activates after protected-region mismatch', async () => {
+    const calls: string[] = [];
+    const mock = {
+      installApplication: vi.fn(async () => { calls.push('erase-write'); }),
+      verifyApplicationFlash: vi.fn(async () => { calls.push('image-verify'); return true; }),
+      verifyProtectedRegions: vi.fn(async () => { calls.push('protected-verify'); return { valid: false, mismatches: ['spiffs changed'] }; }),
+      writeOtaSelectSector: vi.fn(async () => { calls.push('ota-commit'); }),
+      hardReset: vi.fn(async () => { calls.push('reset'); }),
+    };
+    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/spiffs changed/);
+    expect(calls).toEqual(['erase-write', 'image-verify', 'protected-verify']);
+    expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
+    expect(mock.hardReset).not.toHaveBeenCalled();
   });
 
   it('reports flash, OTA, and protected-data verification only after each stage succeeds', async () => {

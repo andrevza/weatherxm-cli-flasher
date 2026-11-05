@@ -137,10 +137,11 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
   if (!(await transport.verifyApplicationFlash(input.targetOffset, expectedMd5, input.firmwareBytes.byteLength))) {
     throw new Error('On-chip flash MD5 mismatch; OTA activation was not attempted');
   }
+  // Do not make the new slot bootable until all protected-region checks pass.
+  const protectedResult = await transport.verifyProtectedRegions(input.snapshots);
+  if (!protectedResult.valid) throw new Error(`Protected flash data changed: ${protectedResult.mismatches.join('; ')}; OTA activation was not attempted`);
   const { targetAddress, sectorData } = buildTransactionalOtadataSector(input.nextSeq, input.targetSector);
   await transport.writeOtaSelectSector(targetAddress, sectorData, input.nextSeq);
-  const protectedResult = await transport.verifyProtectedRegions(input.snapshots);
-  if (!protectedResult.valid) throw new Error(`Protected flash data changed: ${protectedResult.mismatches.join('; ')}`);
   const resetResult = await transport.hardReset();
   return { flashVerified: true, otaMetadataVerified: true, protectedPartitionsVerified: true, deviceReleased: resetResult !== false };
 }
