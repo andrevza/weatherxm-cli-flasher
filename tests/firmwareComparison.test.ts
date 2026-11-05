@@ -70,7 +70,7 @@ describe('firmware version and build comparison', () => {
     expect(() => compareFirmware(descriptor('weatherxm', '0.8.34', buildA), invalidSelected)).toThrow(/Selected firmware descriptor/);
   });
 
-  it.each(['up-to-date', 'update-available', 'downgrade-blocked', 'approval-required', 'incompatible-firmware'] as const)(
+  it.each(['up-to-date', 'update-available', 'downgrade-blocked', 'approval-required', 'incompatible-firmware', 'security-blocked'] as const)(
     'returns success exit status for a completed check with status %s', (status) => {
       const result: FirmwareCheckResult = {
         device: { model: 'WG1200', identity: 'WG1200-test', identityValid: true, chip: 'ESP32-S3', flashBytes: 16 * 1024 * 1024 },
@@ -78,7 +78,7 @@ describe('firmware version and build comparison', () => {
         installedFirmware: { type: 'weatherxm', version: '1.2.3', build: buildA },
         availableFirmware: { type: 'weatherxm', version: '1.2.4', build: buildB },
         firmwareImageSha256: buildB, comparison: 'newer', updateAvailable: true,
-        flashingPermitted: true, approvalRequired: false, status, explanation: 'fixture result',
+        flashingPermitted: true, approvalRequired: false, status, securityEvidence: 'unverified', explanation: 'fixture result',
       };
       expect(checkExitCode(result)).toBe(0);
       expect(JSON.parse(serializeFirmwareCheckResult(result))).toMatchObject({ status, device: { model: 'WG1200' }, comparison: 'newer', firmwareImageSha256: buildB });

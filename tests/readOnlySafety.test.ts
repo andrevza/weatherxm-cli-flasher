@@ -5,10 +5,11 @@ import { validateManifest, fetchAndVerifyFirmware } from '../src/upstream/flashe
 import { determineActiveBootSlot, buildOtadataSector, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
 import { WG1200_CONSTANTS } from '../src/upstream/flasher/constants.js';
 import { assertAllowedApplicationWrite } from '../src/upstream/flasher/writeGuard.js';
-import { Wg1200Transport } from '../src/upstream/flasher/transport.js';
+import { Wg1200Transport, assertCompleteProtectedRegionSnapshots } from '../src/upstream/flasher/transport.js';
 import { configureEsptoolTrace } from '../src/upstream/flasher/transport.js';
 import { fetchCatalog } from '../src/catalog.js';
 import { md5Hex } from '../src/upstream/flasher/hashing.js';
+import { assertFirmwareSecurityReady, firmwareSecurityReady } from '../src/upstream/flasher/securityPolicy.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +36,12 @@ function makeTableFixture() {
   return bytes;
 }
 
+const OTA_BEFORE = (() => {
+  const bytes = new Uint8Array(WG1200_CONSTANTS.OTADATA.size).fill(0xff);
+  bytes.set(buildOtadataSector(1, ESP_OTA_IMG_VALID), 0);
+  return bytes;
+})();
+
 function fakeParsed(overrides: { extra?: string; duplicate?: boolean; md5Valid?: boolean | null; overlap?: boolean } = {}) {
   const partitions = Object.fromEntries(Object.entries(EXPECTED_WG1200_PARTITIONS).map(([label, p]) => [label, {
     label, offset: p.offset, size: p.size, type: p.type ?? 1, subtype: p.subtype ?? 0, flags: 0,
@@ -45,12 +52,25 @@ function fakeParsed(overrides: { extra?: string; duplicate?: boolean; md5Valid?:
 }
 
 describe('read-only safety validation', () => {
+  it('rejects an OTA sequence that would be interpreted as erased before any write', async () => {
+    const installApplication = vi.fn();
+    const transport = { installApplication } as unknown as Wg1200Transport;
+    await expect(runOtaWriteTransaction(transport, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset,
+      firmwareBytes: new Uint8Array([1]), nextSeq: 0xffffffff, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE }))
+      .rejects.toThrow(/sequence is outside/);
+    expect(installApplication).not.toHaveBeenCalled();
+  });
+
   it('summarizes post-boot firmware, Secure Boot, and calibration messages without printing raw logs', () => {
     expect(summarizeBootLog([
       'I secure_boot_v2: Signature verified successfully!',
       'I app_init: App version: 0.8.34-g86b609b',
       'I phy_init: Saving new calibration data due to checksum failure or outdated calibration data',
     ])).toEqual({ bootVersion: '0.8.34-g86b609b', secureBootVerified: true, calibrationUpdated: true });
+  });
+  it('fails closed when device-specific Secure Boot and rollback evidence is unavailable', () => {
+    expect(firmwareSecurityReady()).toBe(false);
+    expect(() => assertFirmwareSecurityReady()).toThrow(/Secure Boot V2 signature trust and gateway anti-rollback compatibility are not verified/);
   });
   it('parses and accepts a fixture with the complete signed-off partition table structure', () => {
     const parsed = parsePartitionTableWithMetadata(makeTableFixture());
@@ -133,14 +153,54 @@ describe('read-only safety validation', () => {
 
   it('blocks factory/protected writes before esptool can write flash', async () => {
     expect(assertAllowedApplicationWrite(WG1200_CONSTANTS.APP_OTA_0.offset, 4096)).toBe('ota_0');
-    expect(() => assertAllowedApplicationWrite(WG1200_CONSTANTS.APP_FACTORY.offset, 4096)).toThrow(/not fully contained/);
+    expect(() => assertAllowedApplicationWrite(WG1200_CONSTANTS.APP_FACTORY.offset, 4096)).toThrow(/protected partition|not fully contained/);
     const transport = new Wg1200Transport();
     const writeFlash = vi.fn();
     (transport as any).loader = { writeFlash };
-    await expect(transport.installApplication(WG1200_CONSTANTS.APP_FACTORY.offset, new Uint8Array(4096))).rejects.toThrow(/not fully contained/);
+    await expect(transport.installApplication(WG1200_CONSTANTS.APP_FACTORY.offset, new Uint8Array(4096))).rejects.toThrow(/protected partition|not fully contained/);
     // --force is a CLI duplicate-install override only; it is not accepted by or forwarded into the writer.
-    await expect((transport.installApplication as any)(WG1200_CONSTANTS.APP_FACTORY.offset, new Uint8Array(4096), undefined, true)).rejects.toThrow(/not fully contained/);
+    await expect((transport.installApplication as any)(WG1200_CONSTANTS.APP_FACTORY.offset, new Uint8Array(4096), undefined, true)).rejects.toThrow(/protected partition|not fully contained/);
     expect(writeFlash).not.toHaveBeenCalled();
+  });
+
+  it('requires complete exact protected-region snapshots and fails closed on short reads', async () => {
+    const required = [
+      { name: 'partition_table', ...WG1200_CONSTANTS.PARTITION_TABLE },
+      { name: 'esp_secure_cert', ...WG1200_CONSTANTS.SECURE_CERT },
+      { name: 'nvs', ...WG1200_CONSTANTS.NVS },
+      { name: 'phy_init', ...WG1200_CONSTANTS.PHY_INIT },
+      { name: 'factory', offset: WG1200_CONSTANTS.APP_FACTORY.offset, size: WG1200_CONSTANTS.APP_FACTORY.size },
+      { name: 'nvs_key', ...WG1200_CONSTANTS.NVS_KEY },
+      { name: 'spiffs', ...WG1200_CONSTANTS.SPIFFS },
+    ].map((region) => ({ ...region, sha256: 'a'.repeat(64) }));
+    expect(() => assertCompleteProtectedRegionSnapshots(required)).not.toThrow();
+    expect(() => assertCompleteProtectedRegionSnapshots(required.filter((r) => r.name !== 'factory'))).toThrow(/complete, exact/);
+    expect(() => assertCompleteProtectedRegionSnapshots([...required, required[0]])).toThrow(/complete, exact/);
+
+    const transport = new Wg1200Transport();
+    (transport as any).loader = { readFlash: vi.fn(async () => new Uint8Array(1)) };
+    await expect(transport.snapshotProtectedRegions()).rejects.toThrow(/Incomplete protected flash read/);
+  });
+
+  it('refuses OTA commit if metadata changed after the pre-write snapshot', async () => {
+    const transport = new Wg1200Transport();
+    const writeFlash = vi.fn(async (_options: any) => undefined);
+    (transport as any).loader = { writeFlash };
+    vi.spyOn(transport, 'readOtadataSnapshot').mockResolvedValue(new Uint8Array(WG1200_CONSTANTS.OTADATA.size).fill(0xff));
+    await expect(transport.writeOtaSelectSector(0x14000, buildOtadataSector(2), 2, OTA_BEFORE)).rejects.toThrow(/changed during app installation/);
+    expect(writeFlash).not.toHaveBeenCalled();
+  });
+
+  it('verifies the full OTA metadata readback and preserves the untouched peer sector', async () => {
+    const transport = new Wg1200Transport();
+    const writeFlash = vi.fn(async (_options: any) => undefined);
+    (transport as any).loader = { writeFlash };
+    const after = new Uint8Array(OTA_BEFORE);
+    after.set(buildOtadataSector(2), 4096);
+    vi.spyOn(transport, 'readOtadataSnapshot').mockResolvedValueOnce(OTA_BEFORE).mockResolvedValueOnce(after);
+    await expect(transport.writeOtaSelectSector(0x14000, buildOtadataSector(2), 2, OTA_BEFORE)).resolves.toBeUndefined();
+    expect(writeFlash).toHaveBeenCalledTimes(1);
+    expect(writeFlash.mock.calls[0]?.[0]?.eraseAll).toBe(false);
   });
 
   it('keeps OTA selection untouched when the application MD5 check fails', async () => {
@@ -152,7 +212,7 @@ describe('read-only safety validation', () => {
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => { calls.push('reset'); }),
     };
-    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/MD5 mismatch/);
+    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE })).rejects.toThrow(/MD5 mismatch/);
     expect(calls).toEqual(['write-app', 'verify-app']);
     expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
   });
@@ -166,13 +226,13 @@ describe('read-only safety validation', () => {
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => undefined),
     };
-    await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/metadata readback failed/);
+    await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE })).rejects.toThrow(/metadata readback failed/);
     expect(base.verifyProtectedRegions).toHaveBeenCalledTimes(1);
     expect(base.hardReset).not.toHaveBeenCalled();
 
     writeOtaSelectSector.mockClear();
     base.verifyProtectedRegions.mockResolvedValueOnce({ valid: false, mismatches: ['nvs changed'] } as any);
-    await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/nvs changed/);
+    await expect(runOtaWriteTransaction(base, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE })).rejects.toThrow(/nvs changed/);
     expect(writeOtaSelectSector).not.toHaveBeenCalled();
     expect(base.hardReset).not.toHaveBeenCalled();
   });
@@ -186,7 +246,7 @@ describe('read-only safety validation', () => {
       writeOtaSelectSector: vi.fn(async () => { calls.push('ota-commit'); }),
       hardReset: vi.fn(async () => { calls.push('reset'); }),
     };
-    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [] })).rejects.toThrow(/spiffs changed/);
+    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE })).rejects.toThrow(/spiffs changed/);
     expect(calls).toEqual(['erase-write', 'image-verify', 'protected-verify']);
     expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
     expect(mock.hardReset).not.toHaveBeenCalled();
@@ -199,7 +259,7 @@ describe('read-only safety validation', () => {
       writeOtaSelectSector: vi.fn(async () => undefined),
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => true),
-    }, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1, 2, 3]), nextSeq: 2, targetSector: 1, snapshots: [] });
+    }, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1, 2, 3]), nextSeq: 2, targetSector: 1, snapshots: [], otadataBefore: OTA_BEFORE });
     expect(result).toEqual({ flashVerified: true, otaMetadataVerified: true, protectedPartitionsVerified: true, deviceReleased: true });
   });
 
