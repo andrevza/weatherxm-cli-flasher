@@ -17,9 +17,9 @@
 
 The comparison uses application type, version, and the descriptor's embedded app ELF SHA-256 build identifier. An exact match is skipped unless `--force` is supplied. `--force` changes only that duplicate skip; it cannot bypass identity/layout/MD5/image-integrity/OTA/write-boundary/protected-region checks or explicit confirmation. Downgrades remain blocked with or without `--force`. Ambiguous version ordering and firmware-type changes need separate interactive approval and cannot be approved by `--yes` or `--force`.
 
-When OTA metadata is ambiguous, flashing fails by default. `--recover` explicitly opts into the upstream targeted recovery behavior, which writes the determined OTA target while preserving factory firmware and the other OTA metadata sector; the normal confirmation is still required.
+When OTA metadata is ambiguous, flashing fails by default. `--recover` is only an explicit opt-in for the bounded OTA-target calculation; it does not bypass the unconditional firmware-security gate. Any future authorized transaction must preserve the non-target OTA slot and complete all protected-region checks before OTA activation.
 
-The flasher never writes `phy_init`, but firmware may update calibration data during normal boot. The supplied update log showed the app saving new PHY calibration because existing calibration was outdated or had a checksum failure. The CLI protects calibration from its own OTA write range; it cannot promise byte-for-byte calibration preservation after the new firmware starts. Successful image/OTA/protected-region verification does not prove that application firmware booted. Boot fields report observed evidence independently; missing evidence is `not-observed`, and application health remains `not-checked` until a reliable health probe exists.
+The app writer never targets `phy_init`; transaction verification also compares its complete before/after SHA-256. Firmware may update calibration during normal boot, so preservation verification ends before reset and does not promise post-boot calibration identity. Successful image/OTA/protected-region verification does not prove that application firmware booted. Boot fields report observed evidence independently; missing evidence is `not-observed`, and application health remains `not-checked` until a reliable health probe exists.
 
 ## Identity and layout gate
 

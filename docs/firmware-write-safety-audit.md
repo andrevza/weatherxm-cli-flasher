@@ -44,7 +44,7 @@ layout validation, and post-write transaction wrapper.
 | Flash erase | `transport.ts` → `installApplication`; `writeGuard.ts` → `assertAllowedApplicationWrite`; `esptool-js` `flashDeflBegin` | `eraseAll:false`; per-image esptool erase, not whole-chip. Size/offset are guarded. |
 | Flash writing | `installApplication` calls `ESPLoader.writeFlash` compressed; esptool sends sequence-numbered blocks and checks command responses | Same esptool-js mechanism. Transport completion alone is not final verification. |
 | Flash verification | `transport.ts` → `verifyApplicationFlash` uses chip `flashMd5sum(offset,length)` | On-device MD5; independent host readback is not performed. |
-| Protected regions | `snapshotProtectedRegions` / `verifyProtectedRegions` hash table, secure cert, NVS, NVS key | Upstream snapshots same four. Write guard also excludes table, cert, NVS, otadata, PHY, NVS key and SPIFFS. Factory and PHY/SPIFFS are not hash-snapshotted. |
+| Protected regions | `snapshotProtectedRegions` / `verifyProtectedRegions` hash every fixed non-`otadata` region and the OTA slot preserved for this transaction | Upstream snapshots only four. The CLI uses 4 KiB incremental SHA-256 reads; active/preserved OTA is selected from the validated target metadata. |
 | OTA metadata | `otadata.ts` → `buildTransactionalOtadataSector`; `transport.ts` → `writeOtaSelectSector` validates one sector readback | One sector, sequence/state/CRC checked, peer sector left untouched. CLI now checks protected snapshots before this commit. |
 | Reset | `transport.ts` → `hardReset`, then `disconnect` | Serial line reset; not an OTA-specific firmware API. |
 | Boot / health | `serialLog.ts` → `captureBootLogs`, `analyzeBootLogs`; result reports boot indicators | Informational observation only. It does not prove application health; API marks health `not-checked`. |
@@ -162,16 +162,18 @@ the eFuse floor. The installed bootloader's anti-rollback configuration and
 OTA rollback behavior remain unknown, so this is not sufficient to permit
 writes and the fail-closed `securityPolicy.ts` remains unchanged.
 
-### Blocking: protection snapshots omit writable-but-protected regions
+### Corrected: protected-region coverage and preserved OTA slot
 
-**Severity: High / blocks physical flashing.** Snapshot code records SHA-256
-only for the partition table, `esp_secure_cert`, `nvs`, and `nvs_key`. The
-16 MiB map and write guard additionally designate factory, `phy_init`, and
-`spiffs` as protected, but those byte ranges are not compared after the app
-write. The range guard makes ordinary application writes disjoint from them,
-but the transaction currently has no runtime evidence that they remained
-unchanged. Add matching snapshots/checks (including factory if the chosen policy
-requires proof of preservation), with exact identical ranges and tests.
+The earlier statement that factory, `phy_init`, and `spiffs` were not hashed
+was inaccurate for the source at this baseline. `PROTECTED_REGIONS` contains
+all seven fixed non-`otadata` extents; `snapshotProtectedRegions` and
+`verifyProtectedRegions` hash each complete extent with bounded 4 KiB reads.
+This follow-up also adds a digest for the OTA slot preserved by the transaction
+(normally the active known-good slot), and rechecks the complete OTA metadata
+snapshot immediately before the application write. The target is rejected if
+it does not match the metadata-derived inactive OTA slot. Hash comparisons
+fail closed before activation. `otadata` remains intentionally handled by its
+separate precommit, target-sector, peer-sector, and readback checks.
 
 ### Blocking: no physical firmware-write evidence or confirmed health gate
 
@@ -247,14 +249,15 @@ ota_0 `0x420000/0x400000`; ota_1 `0x820000/0x400000`; NVS key
 MD5, duplicate labels, exact entries, overlaps, flags, and erased trailing
 bytes.
 
-The absolute application writer guard denies factory and any range outside
-exactly one OTA app partition. OTA metadata has a separate exact 4096-byte
-sector guard. The application erase rounded by esptool remains within a
-sector-aligned 4 MiB slot for accepted lengths. Current SHA-256 preservation
-evidence covers only table, secure cert, NVS and NVS key. Factory, PHY and
-SPIFFS preservation is range-policy evidence only, not post-write readback
-evidence. Metadata's untouched peer sector is protected by targeting the other
-sector but is not separately compared byte-for-byte.
+The application writer requires an exact OTA slot start and bounds the
+four-byte padded, 4 KiB sector-rounded erase interval within that slot.
+`esptool-js` 0.7.0's ESP32-S3 stub reports the requested erase length; rounding
+to erase sectors cannot cross the 4 MiB boundary because the slot start and
+size are sector-aligned and accepted images are at most 4 MiB. `eraseAll:false`
+prevents a whole-chip erase. The CLI snapshots all fixed non-`otadata` regions
+and the metadata-selected OTA slot preserved by the operation. The intentionally
+modified `otadata` partition is separately checked for exact target bytes and
+an unchanged peer sector.
 
 ## F. Failure and recovery matrix
 
@@ -349,9 +352,9 @@ A recovery procedure should be bench-tested on a sacrificial equivalent
 gateway, explicitly demonstrate ROM entry with the enclosure/adapter access
 available, and define an image/metadata-only repair that preserves factory,
 certificates, NVS, NVS keys, SPIFFS, and the known-good OTA image. No such
-approved procedure is presently evidenced. In addition, the existing audit
-finds post-write preservation hashes omit factory, PHY and SPIFFS, and there
-has been no physical firmware-write/boot-health validation. These remain
+approved procedure is presently evidenced. Complete preservation hashing is
+now implemented, but it has only synthetic regression coverage. There has
+been no physical firmware-write/boot-health validation. These remain
 independent blockers even with `TRUSTED` image/device trust.
 
 | Failure point | Expected state / recovery | Retry guidance and report |
@@ -400,7 +403,12 @@ workflow checks remain unrun. No physical tests were run. This audit's modified
 source must not be represented by the prior read-only hardware validation
 record.
 
-## H. Physical test readiness
+## H. Historical readiness at the earlier audit baseline
+
+The findings and readiness conclusion in this section describe the earlier
+source baseline. Later sections supersede its statement that Secure Boot trust
+was unavailable and that factory/PHY/SPIFFS lacked hashes. The installed
+bootloader and physical recovery gaps remain unresolved.
 
 **NOT READY FOR PHYSICAL FLASH TEST**
 
@@ -491,18 +499,17 @@ closed. ROM-loader reads do not intentionally mutate flash.
 | `otadata` | `0x13000` | `0x15000` | `0x2000` | Full snapshot / full precommit reread and postcommit read | Intentional target-sector mutation; validate state, sequence, CRC, target bytes and unchanged peer sector |
 | `phy_init` | `0x15000` | `0x16000` | `0x1000` | Full / full | SHA-256 equality; abort |
 | `factory` | `0x020000` | `0x420000` | `0x400000` | Full / full | SHA-256 equality; abort |
-| `ota_0` | `0x420000` | `0x820000` | `0x400000` | Not hashed as protected | OTA target exception; metadata-selected active slot is not targeted; app gets on-chip MD5 verification |
-| `ota_1` | `0x820000` | `0xC20000` | `0x400000` | Not hashed as protected | Same OTA-slot exception |
+| `ota_0` | `0x420000` | `0x820000` | `0x400000` | Full before/after when it is the preserved slot | The selected target slot is the only app-write exception; on-chip MD5 covers the new image |
+| `ota_1` | `0x820000` | `0xC20000` | `0x400000` | Full before/after when it is the preserved slot | Same OTA-slot handling |
 | `nvs_key` | `0xC20000` | `0xC21000` | `0x1000` | Full / full | SHA-256 equality; abort |
 | `spiffs` | `0xC21000` | `0xF21000` | `0x300000` | Full / full | SHA-256 equality; abort |
 
-Each non-OTA protected pass reads 7,372,800 bytes; both passes total
-14,745,600 bytes. At 115200 baud and 10 serial bits per byte, payload alone
-requires about 21.4 minutes. The 25 ms inter-chunk pacing adds about 90 seconds
-across both passes, before ROM protocol and response overhead. Memory remains
-bounded to a 4 KiB chunk plus hash state. Large ranges are not sampled and raw
-data or hashes are not printed. The active OTA slot is protected by the
-metadata-derived write guard rather than an additional full-slot digest.
+Each fixed non-`otadata` set is 7,376,896 bytes. The preserved OTA slot adds
+4,194,304 bytes, for 11,571,200 bytes per pass and 23,142,400 bytes across
+before/after reads. At 115200 baud and 10 serial bits per byte, payload alone
+is about 33.5 minutes; the 25 ms inter-chunk pacing adds about 141 seconds,
+before protocol overhead. Memory remains bounded to a 4 KiB chunk plus hash
+state. Large ranges are not sampled and raw data or hashes are not printed.
 
 The transaction reads both full OTA metadata sectors after confirmation and
 compares their derived active/target state with the initial inspection. Before
@@ -531,10 +538,13 @@ behavior. The physical-write and health-gate blocker remains unresolved.
 
 ### Current disposition
 
-Regression coverage checks exact snapshot membership, partial-read failure,
-OTA metadata precommit/readback, abort before activation on protected-check
-failure, the hard security gate, and OTA erased-sequence rejection. `factory`
-is newly included in protected hashes. Source tests and standalone validation
+Regression coverage checks exact fixed and preserved-slot snapshot membership,
+4 KiB streaming, short-read and timeout failure, hash mismatch, sector-rounded
+erase bounds, metadata recheck before application write, OTA readback, abort
+before activation on protected-check failure, the hard security gate, and OTA
+erased-sequence rejection. Factory, PHY and SPIFFS were already in the fixed
+protected set; the newly added coverage hashes the OTA slot preserved during
+the operation. Source tests and standalone validation
 results for this follow-up:
 
 - `npm run typecheck`, `npm test`, and `npm run build` passed in the Node 22
@@ -579,3 +589,115 @@ and security-version evidence (or authoritative attestation), the exact
 deployed bootloader/configuration and rollback behavior, and a separately
 approved staged hardware plan with recovery prerequisites. No physical writes
 should be attempted before then.
+
+## J. Protected-region and recovery-readiness follow-up (5 November 2026)
+
+This follow-up starts from clean commit
+`dc73da4a07eeb6cab5ed8ff8ae4f5ccc01c18622`. The maintainer-supplied validation
+for that commit's Linux ARM64 binary is recorded in `docs/hardware-validation.md`.
+It reports a `TRUSTED` security check and a no-write dry run for target
+`ota_0`; it does not validate source changes in this follow-up. Codex did not
+access the gateway.
+
+### Source-backed protected-region coverage
+
+At the current baseline, the later audit claim that factory, PHY, and SPIFFS
+were omitted from the SHA-256 snapshots was not accurate. `constants.ts`
+defines the requested extents in `PROTECTED_REGIONS`, including
+`factory`, `phy_init`, and `spiffs`. `transport.ts:hashRegionSha256` reads each
+extent in 4 KiB chunks and checks every read length; a short read or read error
+throws. `snapshotProtectedRegions` hashes all fixed non-`otadata` regions.
+`assertCompleteProtectedRegionSnapshots` validates the exact set of names,
+offsets, sizes, and 64-digit hashes; `verifyProtectedRegions` hashes the same
+extents and reports mismatch names without raw data or digest values. Errors
+propagate out of `runOtaWriteTransaction` before its metadata commit.
+
+The one genuine gap was the preserved OTA image: static snapshots excluded both
+OTA apps. The follow-up now snapshots the full OTA slot opposite the validated
+target (the active/known-good OTA for valid metadata), and includes that slot in
+the exact required snapshot set. In an ambiguous recovery selection, it hashes
+the non-target OTA slot; this preserves bytes but does not establish that the
+slot is bootable. `runOtaWriteTransaction` validates snapshot completeness and
+target bounds before app write, rereads both OTA sectors immediately before
+writing, and rejects changed bytes or a target inconsistent with the captured
+selection. It verifies the fixed and preserved-slot hashes after app MD5 and
+before OTA activation. `otadata` remains outside this list because it is the
+intentional commit target; `writeOtaSelectSector` separately checks precommit
+state, alternate sector, exact 4 KiB payload, expected sequence/CRC, full
+readback, and unchanged peer sector.
+
+| Region | Offset / size | Before/after evidence | Write isolation |
+|---|---|---|---|
+| Partition table | `0x0C000/0x1000` | Full incremental SHA-256 | Exact table validation; app target cannot overlap |
+| `esp_secure_cert` | `0x0D000/0x2000` | Full incremental SHA-256 | App target cannot overlap |
+| `nvs` | `0x0F000/0x4000` | Full incremental SHA-256 | App target cannot overlap |
+| `otadata` | `0x13000/0x2000` | Full metadata snapshot and reread, targeted sector validation, peer equality | Intentionally changed only after all protected hashes pass |
+| `phy_init` | `0x15000/0x1000` | Full incremental SHA-256 | App target cannot overlap |
+| Factory app | `0x020000/0x400000` | Full incremental SHA-256 | Factory app is rejected by the app writer |
+| Preserved OTA app | Active/preserved slot, `0x400000` | Full incremental SHA-256 | Exact target is the other OTA slot; stale metadata is rejected |
+| Target OTA app | Target slot, `0x400000` | Intended write; image verified by on-chip MD5 | `eraseAll:false`; exact slot start, <=4 MiB, sector-rounded erase stays within slot |
+| `nvs_key` | `0xC20000/0x1000` | Full incremental SHA-256 | App target cannot overlap |
+| SPIFFS | `0xC21000/0x300000` | Full incremental SHA-256 | App target cannot overlap |
+
+The exact partition ranges are also in
+`EXPECTED_WG1200_PARTITIONS` (`partitions.ts`) and
+`WG1200_CONSTANTS` (`constants.ts`). Hardware evidence in this task reports a
+validated 16 MiB WG1200 table. Code fails closed on an unexpected table before
+reaching write setup. The current write gate is still unconditional and
+`flashDevice` calls it before the transaction; `--force`, `--recover`, and
+`--yes` do not override it. The new transaction tests use mocks only.
+
+### Erase/write bounds and failure behavior
+
+`writeGuard.ts:getApplicationEraseRange` requires the exact OTA start, applies
+four-byte image padding and rounds the end to a 4 KiB sector. It rejects an
+erase end beyond the 4 MiB slot. `transport.ts:installApplication` passes one
+file at that offset to esptool-js 0.7.0 with `eraseAll:false`; it never writes
+factory or `otadata`. Integer overflow, negative/noninteger ranges, zero or
+oversize images, flash-bound violations and writes outside an exact app
+partition are rejected. `flashDevice` derives the target from `otadata`,
+compares a fresh inspection and exact metadata snapshot, and the transaction
+checks the captured selection again immediately before the app writer.
+
+If a write/erase times out or disconnects, the target OTA slot may be partial;
+the old metadata selection has not been committed. There is no automatic
+destructive retry. A short hash read, read timeout, protected hash mismatch, or
+prewrite OTA mismatch prevents activation. If the metadata write itself
+partially fails, selection may be uncertain; the peer sector is preserved by
+the intended transaction, but physical power-loss semantics have not been
+tested on this bootloader. The metadata phase occurs only after app MD5 and all
+protected digests pass.
+
+### Bootloader and recovery assessment
+
+The reported device state and source-vs-device distinctions are documented in
+[`wg1200-recovery-readiness.md`](wg1200-recovery-readiness.md). In summary, ROM
+loader entry and eFuse reads were demonstrated by the maintainer; the installed
+second-stage bootloader binary/configuration was not read or matched. The
+public WeatherXM source profile disables IDF app rollback and contains an
+application crash guard; neither proves installed behavior. Secure Boot trust
+does not establish download-mode write permission, app fallback behavior, or
+recovery of a corrupt second-stage bootloader. The CH340 ROM path is plausible
+because it worked for read-only inspection and relevant download-disable
+eFuses were reported clear, but recovery after a failed app has not been
+demonstrated. Flash-encryption state, a validated sensitive backup, an exact
+bootloader artifact, and a vendor-approved recovery procedure remain missing.
+
+Normal boot logs can be passively captured with `monitor --port ... --baud
+115200 --redact`; the public release profile enables INFO logs at UART0
+115200. Use one normal reset only if safe. Logs can show version/slot/errors,
+not establish Kconfig behavior; missing output is inconclusive. A
+partition-bounded esptool read can inspect flash offset zero through the
+validated table offset, but no binary match has been established. Do not
+restore or rewrite that data based on a hash alone.
+
+### Updated readiness
+
+The protected-region hash omissions are resolved in source, with extra
+synthetic coverage for factory, PHY, SPIFFS, the preserved OTA app, partial
+reads, read timeout, hash mismatch, padded/sector-rounded write bounds,
+stale OTA metadata and activation ordering. The implementation remains
+hardware-unvalidated and full preserved-slot hashing adds substantial
+read time. Recovery after boot failure, exact bootloader semantics, flash
+encryption status, and safe backup/recovery prerequisites are not established.
+The security write gate must remain blocked. **NOT READY FOR PHYSICAL FLASH TEST.**
