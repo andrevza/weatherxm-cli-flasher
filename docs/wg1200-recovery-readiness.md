@@ -23,6 +23,25 @@ does not enforce complete reads for every chunk and retains sensitive device
 data in memory. A future diagnostic needs exact layout validation, bounded
 reads, exact length checks, and hash calculation before it can be considered.
 
+For manual read-only triage, an operator with Espressif `esptool` may capture
+the validated pre-table area to a local file:
+
+```sh
+esptool --chip esp32s3 --port /dev/ttyUSB0 read-flash \
+  0x000000 0x00C000 wg1200-pre-table-area.bin
+sha256sum wg1200-pre-table-area.bin
+esptool --chip esp32s3 image-info wg1200-pre-table-area.bin
+```
+
+This reads flash and resets/enters the ROM loader, but does not write or erase.
+The SHA-256 is for the entire 48 KiB pre-table area, not the bootloader image.
+The `image-info` output is exploratory because the capture may contain padding
+after the image; do not treat its file length or extracted strings as a
+verified bootloader extent, signature result, configuration record, or vendor
+match. Keep the capture local and review it before sharing. A trustworthy
+bootloader-only digest still needs a format-aware, Secure-Boot-V2-aware
+boundary determination validated for the installed layout.
+
 The public WeatherXM WG1200 firmware repository and web flasher provide source
 and application firmware workflows, but this review did not identify an
 authoritative bootloader binary with a production build identifier/checksum
