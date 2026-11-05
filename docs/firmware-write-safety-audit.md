@@ -370,17 +370,18 @@ results for this follow-up:
   ARM64 container after installing `libatomic1`. The builder's normal Git probe
   could not read mounted `.git` metadata, so a second build used its explicit
   `WG1200_GIT_COMMIT` / `WG1200_GIT_DIRTY` overrides after confirming clean
-  commit `6c35e65b2d748320d68b3f11277fcddc034b1a55`.
+  commit `c8ce1d61708d864355be1349773024323b588d93`.
 - Final artifact: `dist/weatherxm-flash-linux-arm64`, SHA-256
-  `1329813656666376ef450f41b090e488cdda596f35a86ff5635b13909c6630b8`, size
+  `93960c611d568f2883a827626fa404bbb909bb054b84e8dfcdc66f4b07e93bde`, size
   143 MiB. Embedded metadata reports package `0.1.0`, Node `v26.8.2`, source
   SHA-256 `8e57578c017c85f534e66a01dd5e6dc35ab3c2cfbc17fe02f8bff89fc8c00e3e`,
-  commit `6c35e65b2d748320d68b3f11277fcddc034b1a55`, and `gitDirty: false`.
+  commit `c8ce1d61708d864355be1349773024323b588d93`, and `gitDirty: false`.
 - `--version --verbose --json`, `--help`, and `firmware list` passed. ELF
   validation passed: executable 5 PT_LOAD segments and embedded SerialPort
   addon 2 PT_LOAD segments, all compatible with 16 KiB pages. `ldd` checks ran
   in the builder and found the expected runtime dependency set.
-- Full ARM64 standalone suite passed: 9 files, 77 tests, zero skipped. This
+- Final full ARM64 standalone suite passed with the full 40-character embedded
+  commit SHA: 9 files, 77 tests, zero skipped. This
   verifies the executable and addon in the container, not on a Raspberry Pi or
   gateway.
 - Previous artifact preserved at
