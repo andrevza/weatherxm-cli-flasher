@@ -2,10 +2,10 @@
 import { createHash } from 'node:crypto';
 import { ESPLoader, Transport, ESPError, getStubJsonByChipName } from 'esptool-js';
 import { parseAppDescriptor, type AppDescriptor } from './appDescriptor';
-import { WG1200_CONSTANTS } from './constants';
+import { PROTECTED_REGIONS, WG1200_CONSTANTS } from './constants';
 import { compareHexHashes, sha256Hex } from './hashing';
 import { formatWg1200DeviceName, verifySecureCertIdentity, type SecureCertVerificationResult } from './identity';
-import { determineActiveBootSlot, parseOtadataSector, type OtadataStatus } from './otadata';
+import { buildOtadataSector, determineActiveBootSlot, parseOtadataSector, type OtadataStatus } from './otadata';
 import { parsePartitionTableWithMetadata, verifyWg1200PartitionTable, type PartitionRecord } from './partitions';
 import {
   assertAllowedApplicationWrite,
@@ -746,21 +746,36 @@ export class Wg1200Transport {
     throw lastError;
   }
 
+  private async hashRegionSha256(offset: number, size: number): Promise<string> {
+    if (!this.loader) throw new Error('Not connected');
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
+      throw new Error(`Invalid protected flash range offset=${offset} size=${size}`);
+    }
+    const hash = createHash('sha256');
+    const chunkSize = 4096;
+    let bytesRead = 0;
+    while (bytesRead < size) {
+      const requestSize = Math.min(chunkSize, size - bytesRead);
+      const chunk = await this.readChunkWithRetry(offset + bytesRead, requestSize, 2);
+      if (chunk.byteLength !== requestSize) {
+        throw new Error(`Incomplete protected flash read at 0x${(offset + bytesRead).toString(16)}: expected ${requestSize} bytes, received ${chunk.byteLength}`);
+      }
+      hash.update(chunk);
+      bytesRead += chunk.byteLength;
+      if (bytesRead < size) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return hash.digest('hex');
+  }
+
   /**
    * Snapshots SHA-256 hashes of all protected regions before flashing.
    */
   public async snapshotProtectedRegions(): Promise<ProtectedRegionSnapshot[]> {
-    const targets = [
-      { name: 'partition_table', ...WG1200_CONSTANTS.PARTITION_TABLE },
-      { name: 'esp_secure_cert', ...WG1200_CONSTANTS.SECURE_CERT },
-      { name: 'nvs', ...WG1200_CONSTANTS.NVS },
-      { name: 'nvs_key', ...WG1200_CONSTANTS.NVS_KEY },
-    ];
+    const targets = PROTECTED_REGIONS.filter((region) => region.name !== 'otadata');
 
     const snapshots: ProtectedRegionSnapshot[] = [];
     for (const target of targets) {
-      const bytes = await this.readRegion(target.offset, target.size);
-      const hash = await sha256Hex(bytes);
+      const hash = await this.hashRegionSha256(target.offset, target.size);
       snapshots.push({
         name: target.name,
         offset: target.offset,
@@ -778,11 +793,11 @@ export class Wg1200Transport {
   public async verifyProtectedRegions(
     beforeSnapshots: ProtectedRegionSnapshot[]
   ): Promise<{ valid: boolean; mismatches: string[] }> {
+    assertCompleteProtectedRegionSnapshots(beforeSnapshots);
     const mismatches: string[] = [];
 
     for (const snap of beforeSnapshots) {
-      const currentBytes = await this.readRegion(snap.offset, snap.size);
-      const currentHash = await sha256Hex(currentBytes);
+      const currentHash = await this.hashRegionSha256(snap.offset, snap.size);
       if (!compareHexHashes(snap.sha256, currentHash)) {
         mismatches.push(
           `Protected partition '${snap.name}' was modified! Expected SHA ${snap.sha256}, got ${currentHash}`
@@ -850,6 +865,10 @@ export class Wg1200Transport {
     return compareHexHashes(chipMd5, expectedMd5);
   }
 
+  public async readOtadataSnapshot(): Promise<Uint8Array> {
+    return this.readRegion(WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size);
+  }
+
   /**
    * Transactionally updates a single 4 KB otadata sector.
    * - Uses assertAllowedOtaSelectWrite to enforce that the target is strictly 0x13000 or 0x14000.
@@ -859,10 +878,29 @@ export class Wg1200Transport {
   public async writeOtaSelectSector(
     targetAddress: number,
     sectorBytes: Uint8Array,
-    expectedSeq: number
+    expectedSeq: number,
+    beforeOtadata: Uint8Array
   ): Promise<void> {
     if (!this.loader) throw new Error('Not connected');
     const { sector, address } = assertAllowedOtaSelectWrite(targetAddress, sectorBytes.byteLength);
+    if (beforeOtadata.byteLength !== WG1200_CONSTANTS.OTADATA.size) {
+      throw new Error('OTA metadata commit requires a complete 8192-byte pre-write snapshot');
+    }
+    const expectedState = determineActiveBootSlot(beforeOtadata);
+    if (expectedState.nextSeq !== expectedSeq || expectedState.targetSector !== sector) {
+      throw new Error('OTA metadata target no longer matches the pre-write OTA state');
+    }
+    if (expectedState.activeSector === sector) {
+      throw new Error('Refusing to erase the currently active OTA metadata sector');
+    }
+    const currentBeforeWrite = await this.readOtadataSnapshot();
+    if (!currentBeforeWrite.every((byte, index) => byte === beforeOtadata[index])) {
+      throw new Error('OTA metadata changed during app installation; refusing activation');
+    }
+    const intendedSector = buildOtadataSector(expectedSeq);
+    if (!sectorBytes.every((byte, index) => byte === intendedSector[index])) {
+      throw new Error('OTA metadata payload does not match the intended sequence/state/CRC record');
+    }
 
     this.logger.log(`Transactionally writing otadata sector ${sector} @ 0x${address.toString(16)}…`);
 
@@ -880,15 +918,22 @@ export class Wg1200Transport {
       compress: false,
     });
 
-    // Read back and verify the sector
-    this.logger.log(`Verifying written otadata sector ${sector} @ 0x${address.toString(16)}…`);
-    const readBack = await this.readRegion(address, 4096);
-    const parsed = parseOtadataSector(readBack);
+    // Read back both sectors: validate intended bytes and preserve the peer exactly.
+    this.logger.log(`Verifying written otadata partition after sector ${sector} commit…`);
+    const readBack = await this.readOtadataSnapshot();
+    const targetStart = sector * 4096;
+    const peerStart = (1 - sector) * 4096;
+    const targetReadBack = readBack.subarray(targetStart, targetStart + 4096);
+    const peerBefore = beforeOtadata.subarray(peerStart, peerStart + 4096);
+    const peerAfter = readBack.subarray(peerStart, peerStart + 4096);
+    const parsed = parseOtadataSector(targetReadBack);
 
-    if (!parsed.valid || parsed.seq !== expectedSeq) {
+    if (!parsed.valid || parsed.seq !== expectedSeq ||
+        !targetReadBack.every((byte, index) => byte === sectorBytes[index]) ||
+        !peerAfter.every((byte, index) => byte === peerBefore[index])) {
       throw new Error(
-        `Otadata write verification failed! Expected seq ${expectedSeq}, got seq ${parsed.seq} (valid: ${parsed.valid}). ` +
-        `The previous active sector remains untouched.`
+        `Otadata write verification failed! Expected seq ${expectedSeq}, got seq ${parsed.seq} (valid: ${parsed.valid}); ` +
+        'target payload or untouched peer sector differs from the expected bytes.'
       );
     }
 
@@ -1155,5 +1200,18 @@ export class Wg1200Transport {
     }
     this.loader = null;
     this.port = null;
+  }
+}
+
+export function assertCompleteProtectedRegionSnapshots(snapshots: ProtectedRegionSnapshot[]): void {
+  const required = PROTECTED_REGIONS.filter((region) => region.name !== 'otadata')
+    .map(({ name, offset, size }) => ({ name, offset, size }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const provided = snapshots.map(({ name, offset, size, sha256 }) => {
+    if (!/^[a-f0-9]{64}$/i.test(sha256)) throw new Error(`Protected region '${name}' has an invalid SHA-256 snapshot`);
+    return { name, offset, size };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  if (JSON.stringify(provided) !== JSON.stringify(required)) {
+    throw new Error('Protected-region verification requires complete, exact pre-write snapshots');
   }
 }

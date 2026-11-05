@@ -8,7 +8,7 @@ type StatusView = {
   firmwareSlots: SlotMap;
 };
 type DryRunView = {
-  targetSlot: string; targetOffset: number; sha256: string; inactiveMatch?: boolean;
+  targetSlot: string; targetOffset: number; sha256: string; inactiveMatch?: boolean; writeBlockedReason?: string;
   comparison: { kind: string; message: string; installed: { type: string; version: string; build: string }; selected: { type: string; version: string; build: string } };
   ota?: { activeSlot: string | null; inactiveSlot: string | null };
   firmwareSlots?: SlotMap;
@@ -37,6 +37,7 @@ export function formatCheckOutput(result: FirmwareCheckResult): string {
     'up-to-date': 'UP TO DATE', 'update-available': 'UPDATE AVAILABLE',
     'downgrade-blocked': 'DOWNGRADE BLOCKED', 'approval-required': 'APPROVAL REQUIRED',
     'incompatible-firmware': 'INCOMPATIBLE FIRMWARE',
+    'security-blocked': 'SECURITY EVIDENCE REQUIRED',
   };
   const selectedLabel = result.availableFirmware.type === 'weatherxm' ? 'WeatherXM' : result.availableFirmware.type === 'meshtastic' ? 'Meshtastic' : result.availableFirmware.type;
   const activeName = result.ota?.activeSlot ?? null;
@@ -74,7 +75,7 @@ export function standalonePresentationFixture(mode: 'status' | 'check' | 'dry-ru
     firmwareSlots: slots, inactiveMatch: false, otaState: { ambiguous: false, explanation: 'valid' },
     installedFirmware: { type: 'weatherxm', version: '0.8.34-g86b609b', build: a }, availableFirmware: selected,
     firmwareImageSha256: 'f'.repeat(64), comparison: 'identical', updateAvailable: false, flashingPermitted: false,
-    approvalRequired: false, status: 'up-to-date', explanation: 'Already installed' });
+    approvalRequired: false, status: 'up-to-date', securityEvidence: 'unverified', explanation: 'Already installed' });
   return formatDryRunOutput({ targetSlot: 'ota_0', targetOffset: 0x420000, sha256: 'f'.repeat(64), inactiveMatch: mode === 'dry-run-match',
     ota: { activeSlot: 'ota_1', inactiveSlot: 'ota_0' }, firmwareSlots: slots,
     comparison: { kind: 'older', message: 'Selected image is older.', installed: { type: 'weatherxm', version: '0.8.34-g86b609b', build: a }, selected } });

@@ -61,6 +61,7 @@ export const PROTECTED_REGIONS: readonly ProtectedRegionDef[] = [
   { name: 'nvs', ...WG1200_CONSTANTS.NVS },
   { name: 'otadata', ...WG1200_CONSTANTS.OTADATA },
   { name: 'phy_init', ...WG1200_CONSTANTS.PHY_INIT },
+  { name: 'factory', offset: WG1200_CONSTANTS.APP_FACTORY.offset, size: WG1200_CONSTANTS.APP_FACTORY.size },
   { name: 'nvs_key', ...WG1200_CONSTANTS.NVS_KEY },
   { name: 'spiffs', ...WG1200_CONSTANTS.SPIFFS },
 ];

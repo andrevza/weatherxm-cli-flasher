@@ -3,7 +3,7 @@ import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { EXPECTED_WG1200_PARTITIONS, parsePartitionTableWithMetadata } from './upstream/flasher/partitions.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
 import { fetchAndVerifyFirmware } from './upstream/flasher/manifest.js';
-import { buildTransactionalOtadataSector } from './upstream/flasher/otadata.js';
+import { buildTransactionalOtadataSector, determineActiveBootSlot } from './upstream/flasher/otadata.js';
 import { md5Hex } from './upstream/flasher/hashing.js';
 import { fetchCatalog } from './catalog.js';
 import { analyzeBootLogs, captureBootLogs } from './upstream/flasher/serialLog.js';
@@ -11,6 +11,7 @@ import { parseAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { isValidAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from './upstream/flasher/firmwareComparison.js';
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
+import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
 
 export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; }
 export interface FlashConfirmation {
@@ -29,7 +30,8 @@ export interface FirmwareCheckResult {
   updateAvailable: boolean;
   flashingPermitted: boolean;
   approvalRequired: boolean;
-  status: 'up-to-date' | 'update-available' | 'downgrade-blocked' | 'approval-required' | 'incompatible-firmware';
+  status: 'up-to-date' | 'update-available' | 'downgrade-blocked' | 'approval-required' | 'incompatible-firmware' | 'security-blocked';
+  securityEvidence: 'unverified';
   explanation: string;
   ota?: { activeSlot: string | null; inactiveSlot: string | null; nextTargetSlot: string | null; nextTargetOffset: number | null; activeSeq: number | null; nextSeq: number | null; ambiguous: boolean; state?: string };
   firmwareSlots?: Record<string, { active: boolean; version: string | null; firmwareType: string | null; build: string | null; descriptorStatus: 'valid' | 'invalid' | 'unknown' }>;
@@ -87,7 +89,8 @@ export async function checkFirmware(options: DeviceOptions & { firmwareKey: stri
       : comparison.kind === 'older' ? 'downgrade-blocked'
         : comparison.kind === 'different-type' ? 'incompatible-firmware' : 'approval-required';
   const approvalRequired = installPolicy.approvalRequired || inspection.otadata.isAmbiguous;
-  const finalStatus = status === 'update-available' && inspection.otadata.isAmbiguous ? 'approval-required' : status;
+  const finalStatus = !firmwareSecurityReady() && comparison.kind !== 'identical' ? 'security-blocked'
+    : status === 'update-available' && inspection.otadata.isAmbiguous ? 'approval-required' : status;
   const explanation = inspection.otadata.isAmbiguous
     ? `${comparison.message} OTA metadata is ambiguous: ${inspection.otadata.description}`
     : comparison.message;
@@ -98,8 +101,10 @@ export async function checkFirmware(options: DeviceOptions & { firmwareKey: stri
     installedFirmware: comparison.installed, availableFirmware: comparison.selected,
     firmwareImageSha256: selected.verified.sha256, comparison: comparison.kind,
     updateAvailable: comparison.kind === 'newer',
-    flashingPermitted: installPolicy.flashingPermitted && !inspection.otadata.isAmbiguous,
-    approvalRequired, status: finalStatus, explanation,
+    flashingPermitted: firmwareSecurityReady() && installPolicy.flashingPermitted && !inspection.otadata.isAmbiguous,
+    approvalRequired, status: finalStatus,
+    securityEvidence: 'unverified',
+    explanation: `${explanation} ${FIRMWARE_SECURITY_BLOCK_REASON}`,
     ...slots,
     inactiveMatch: Boolean(inspection.inactiveFirmware && isValidAppDescriptor(inspection.inactiveFirmware) &&
       inspection.inactiveFirmware.version === selected.descriptor.version && inspection.inactiveFirmware.appElfSha256 === selected.descriptor.appElfSha256 &&
@@ -123,7 +128,7 @@ export function summarizeBootLog(lines: string[]) {
 export interface OtaWriteOperations {
   installApplication(offset: number, bytes: Uint8Array, onProgress?: (percent: number) => void): Promise<void>;
   verifyApplicationFlash(offset: number, expectedMd5: string, length: number): Promise<boolean>;
-  writeOtaSelectSector(address: number, bytes: Uint8Array, expectedSeq: number): Promise<void>;
+  writeOtaSelectSector(address: number, bytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void>;
   verifyProtectedRegions(snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>): Promise<{ valid: boolean; mismatches: string[] }>;
   hardReset(): Promise<void | boolean>;
 }
@@ -131,7 +136,11 @@ export interface OtaWriteOperations {
 export async function runOtaWriteTransaction(transport: OtaWriteOperations, input: {
   targetOffset: number; firmwareBytes: Uint8Array; nextSeq: number; targetSector: 0 | 1;
   snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>;
+  otadataBefore: Uint8Array;
 }, onProgress?: (percent: number) => void): Promise<{ flashVerified: true; otaMetadataVerified: true; protectedPartitionsVerified: true; deviceReleased: boolean }> {
+  if (!Number.isSafeInteger(input.nextSeq) || input.nextSeq <= 0 || input.nextSeq >= 0xffffffff) {
+    throw new Error('OTA sequence is outside the safely supported range; OTA activation was not attempted');
+  }
   await transport.installApplication(input.targetOffset, input.firmwareBytes, onProgress);
   const expectedMd5 = md5Hex(input.firmwareBytes);
   if (!(await transport.verifyApplicationFlash(input.targetOffset, expectedMd5, input.firmwareBytes.byteLength))) {
@@ -141,7 +150,7 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
   const protectedResult = await transport.verifyProtectedRegions(input.snapshots);
   if (!protectedResult.valid) throw new Error(`Protected flash data changed: ${protectedResult.mismatches.join('; ')}; OTA activation was not attempted`);
   const { targetAddress, sectorData } = buildTransactionalOtadataSector(input.nextSeq, input.targetSector);
-  await transport.writeOtaSelectSector(targetAddress, sectorData, input.nextSeq);
+  await transport.writeOtaSelectSector(targetAddress, sectorData, input.nextSeq, input.otadataBefore);
   const resetResult = await transport.hardReset();
   return { flashVerified: true, otaMetadataVerified: true, protectedPartitionsVerified: true, deviceReleased: resetResult !== false };
 }
@@ -249,7 +258,7 @@ export async function flashDevice(options: DeviceOptions & {
   bootLogSeconds?: number; onBootLine?: (line: string) => void;
   confirm: (summary: FlashConfirmation) => Promise<boolean>;
   approveComparisonException?: (comparison: FirmwareComparison) => Promise<boolean>;
-}): Promise<{ deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; firmwareSlots?: ReturnType<typeof firmwareSlotSummary>['firmwareSlots']; ota?: ReturnType<typeof firmwareSlotSummary>['ota']; inactiveMatch?: boolean; bootSignature?: string; bootVersion?: string; secureBootVerified?: boolean; calibrationUpdated?: boolean; dryRun?: boolean; alreadyInstalled?: boolean; comparison: FirmwareComparison; flashVerified?: boolean; otaMetadataVerified?: boolean; protectedPartitionsVerified?: boolean; bootObserved?: boolean; expectedSlotObserved?: boolean | null; expectedFirmwareObserved?: boolean | null; applicationStarted?: boolean; applicationHealthy?: 'not-checked'; bootFailureObserved?: boolean; bootFailureLines?: string[]; bootLines?: string[] }> {
+}): Promise<{ deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; firmwareSlots?: ReturnType<typeof firmwareSlotSummary>['firmwareSlots']; ota?: ReturnType<typeof firmwareSlotSummary>['ota']; inactiveMatch?: boolean; bootSignature?: string; bootVersion?: string; secureBootVerified?: boolean; calibrationUpdated?: boolean; dryRun?: boolean; writeBlockedReason?: string; alreadyInstalled?: boolean; comparison: FirmwareComparison; flashVerified?: boolean; otaMetadataVerified?: boolean; protectedPartitionsVerified?: boolean; bootObserved?: boolean; expectedSlotObserved?: boolean | null; expectedFirmwareObserved?: boolean | null; applicationStarted?: boolean; applicationHealthy?: 'not-checked'; bootFailureObserved?: boolean; bootFailureLines?: string[]; bootLines?: string[] }> {
   const { entry, verified, descriptor: selectedDescriptor } = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl);
 
   const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
@@ -286,12 +295,13 @@ export async function flashDevice(options: DeviceOptions & {
     };
     if (options.dryRun) return { deviceName: summary.deviceName, firmwareKey: options.firmwareKey,
       targetSlot: summary.targetSlot, targetOffset: summary.targetOffset, sha256: verified.sha256, dryRun: true, comparison,
-      ...slotSummary, inactiveMatch };
+      ...slotSummary, inactiveMatch, writeBlockedReason: FIRMWARE_SECURITY_BLOCK_REASON };
     if (installPolicy.alreadyInstalled) {
       return { deviceName: before.deviceName ?? 'WeatherXM WG1200', firmwareKey: options.firmwareKey,
         targetSlot: before.otadata.targetSlot, targetOffset: before.otadata.targetOffset,
         sha256: verified.sha256, alreadyInstalled: true, comparison };
     }
+    assertFirmwareSecurityReady();
     if (installPolicy.approvalRequired) {
       if (!options.approveComparisonException || !(await options.approveComparisonException(comparison))) {
         throw new Error(`${comparison.message} Explicit interactive approval is required; --yes cannot approve this change.`);
@@ -315,10 +325,18 @@ export async function flashDevice(options: DeviceOptions & {
     }
 
     const snapshots = await transport.snapshotProtectedRegions();
+    const otadataBefore = await transport.readOtadataSnapshot();
+    const preCommitOta = determineActiveBootSlot(otadataBefore);
+    if (preCommitOta.activeSlot !== fresh.otadata.activeSlot || preCommitOta.activeSeq !== fresh.otadata.activeSeq ||
+        preCommitOta.nextSeq !== fresh.otadata.nextSeq || preCommitOta.targetSector !== fresh.otadata.targetSector ||
+        preCommitOta.targetSlot !== fresh.otadata.targetSlot || preCommitOta.targetOffset !== fresh.otadata.targetOffset ||
+        preCommitOta.isAmbiguous !== fresh.otadata.isAmbiguous) {
+      throw new Error('OTA metadata changed after confirmation; refusing application write');
+    }
     let lastProgress = -5;
     const transactionResult = await runOtaWriteTransaction(transport, {
       targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data,
-      nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots,
+      nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots, otadataBefore,
     }, (percent) => {
       if (percent === 100 || percent >= lastProgress + 5) {
         lastProgress = percent;

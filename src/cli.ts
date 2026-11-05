@@ -255,8 +255,9 @@ async function main() {
       return;
     }
     if (result.dryRun) {
-      if (args.json) process.stdout.write(`${JSON.stringify({ dryRun: true, installedFirmware: result.comparison.installed, selectedFirmware: result.comparison.selected, firmwareImageSha256: result.sha256, comparison: result.comparison.kind, target: { slot: result.targetSlot, offset: result.targetOffset }, ota: result.ota, firmwareSlots: result.firmwareSlots, inactiveMatch: result.inactiveMatch, flashModified: false }, null, 2)}\n`);
+      if (args.json) process.stdout.write(`${JSON.stringify({ dryRun: true, installedFirmware: result.comparison.installed, selectedFirmware: result.comparison.selected, firmwareImageSha256: result.sha256, comparison: result.comparison.kind, target: { slot: result.targetSlot, offset: result.targetOffset }, ota: result.ota, firmwareSlots: result.firmwareSlots, inactiveMatch: result.inactiveMatch, writeBlockedReason: result.writeBlockedReason, flashModified: false }, null, 2)}\n`);
       else process.stdout.write(formatDryRunOutput(result));
+      if (result.writeBlockedReason) process.stderr.write(`WRITE BLOCKED: ${result.writeBlockedReason}\n`);
       if (args.monitor) await runMonitor(args);
       return;
     }
