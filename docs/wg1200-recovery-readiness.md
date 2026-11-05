@@ -517,3 +517,201 @@ is prohibited.
 - [ESP32-S3 esptool read-flash command](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/esptool/basic-commands.html)
 - WeatherXM [`main/utils.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/utils.cpp#L1381-L1528), [`main/tb_json.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/tb_json.cpp#L383-L394), [`main/boot_guard.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/boot_guard.cpp), [`sdkconfig.wg1200_release`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/sdkconfig.wg1200_release), and [`tools/update_wg1200_bootloader.py`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/tools/update_wg1200_bootloader.py) at reviewed source revision `a30374b045c138dac3f6dd4267ef8eb7390a7670` (source evidence only)
 - WeatherXM web-flasher: `35b2ecc4ccb31799ecd720609786362a99b3e33a` (implementation reference only)
+
+## Final read-only recovery assessment (5 November 2026)
+
+This section supersedes earlier references to the redaction-follow-up binary
+being untested on hardware. The maintainer now reports a successful physical
+normal-boot capture using executable SHA-256
+`bf474a648d0d115ba053c94f9b85095f32694eb9efe461b685c664ef7d8a10db`, built
+from source commit `7686ce95ba202499946c8f15e35f0e89dc809e56`. The supplied
+capture reports ESP32-S3 revision 0.2, ESP-IDF 5.1.2 second-stage bootloader,
+Secure Boot V2 verification success, selected `ota_1` at `0x820000`, and
+WeatherXM application `0.8.34-g86b609b` reaching normal startup/MQTT. It also
+reports continuous RTS/DTR capture and corrected redaction working. This is
+one maintainer-supplied successful startup; it is not a failed-boot,
+fallback, crash-guard, ROM-recovery, or write test. The pre-table fingerprint
+prefix `64e8c47e` remains unmatched to an exact bootloader binary/configuration.
+No raw transcript or device identifiers are stored here.
+
+### Bootloader selection and fallback: ESP-IDF v5.1.2 source model
+
+The reviewed ESP-IDF v5.1.2 `bootloader_utility.c` reads the two 4 KiB OTA
+select entries, chooses the valid record with the active sequence, and maps
+`(ota_seq - 1) % app_count` to an OTA slot. If no valid selection exists, its
+selection routine chooses the factory app when that partition exists; without
+factory it begins at OTA slot 0. During image loading, it tries the selected
+index and then walks lower indices through factory before trying later OTA
+indices. An image that fails `bootloader_load_image()` (including image
+validation/signature checks) is skipped, so another loadable partition may be
+tried. In the WG1200 layout reviewed by this repository, a factory partition
+is present; thus it is part of generic IDF's fallback walk. These are
+source-derived expectations for unmodified IDF v5.1.2, not a binary match to
+the installed bootloader. The device's log establishes only that its
+currently selected signed app passed verification and started.
+
+OTA metadata uses two independently erasable sectors. A CRC-valid record is
+chosen over an invalid peer; with both records invalid/initial, generic IDF
+selection falls back to factory if present, otherwise starts trying OTA
+images. If one record survives a power loss during the other-sector update,
+the surviving entry can still select an app. If the partition is unreadable,
+too small, or partition-table loading fails, outcomes take other error paths;
+do not generalize the simple CRC fallback to all metadata/flash faults. Actual
+behavior depends on the installed binary, bootloader rollback and anti-rollback
+Kconfig, partition table, and current image validity. `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+controls NEW/PENDING_VERIFY handling; `CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK`
+changes selection against the eFuse secure-version floor. Neither installed
+option is established by the boot log.
+
+Generic bootloader fallback only responds to failures detectable while
+loading/validating an image. A correctly signed image that loads and then
+crashes after the jump is not thereby rejected at boot. IDF's
+PENDING_VERIFY rollback requires both the rollback option and a NEW state;
+the CLI transaction currently writes a VALID selection record, so that
+first-boot rollback path is not staged by this CLI.
+
+### WeatherXM application boot guard (reviewed source only)
+
+At source revision `a30374b045c138dac3f6dd4267ef8eb7390a7670`,
+`main/boot_guard.cpp` describes `BootGuard` as an application-level OTA
+crash-recovery mechanism for field bootloaders without IDF rollback. It must
+run in application code after NVS initializes; `main/include/boot_guard.h`
+requires calling `BootGuard::init()` early in `app_main`. It cannot run when
+ROM or the second-stage bootloader rejects an image, when an app never reaches
+`app_main`/guard initialization, or when NVS cannot be opened.
+
+The guard stores `crash_cnt` and `swd_flag` in NVS namespace `bootguard`.
+`note_soft_wd_reset()` sets and commits `swd_flag` before the software
+watchdog restarts, because that reset otherwise looks like an ordinary
+`ESP_RST_SW`. At the next guard initialization, a nonzero flag itself
+classifies the preceding boot as a crash and is erased; otherwise reset
+reasons `ESP_RST_PANIC`, `ESP_RST_INT_WDT`, `ESP_RST_TASK_WDT`, and
+`ESP_RST_WDT` count as crashes. Other reasons do not increment the counter.
+`ESP_RST_POWERON` explicitly resets the counter to zero, breaking the crash
+chain. The threshold is three classified crash boots. At/above threshold,
+`try_rollback()` refuses when running from factory; from an OTA slot it asks
+`esp_ota_get_next_update_partition(NULL)` for the other OTA slot and requires
+`esp_ota_get_partition_description()` to succeed, then calls
+`esp_ota_set_boot_partition()` and restarts. The source comment says Secure
+Boot makes that setter verify the target signature; this does not prove the
+exact deployed build or target integrity on this gateway. If rollback is
+impossible, it stores a failure record and clears the counter so attempts can
+continue.
+
+A 600-second one-shot healthy-uptime timer and successful ThingsBoard
+connection call `mark_healthy()`, which clears `crash_cnt` and reports a
+pending rollback record. Thus the guard is a best-effort application feature,
+not an unconditional “three failed boots always recover” guarantee. It also
+depends on NVS health, early initialization, reset classification, an OTA
+target with a readable app descriptor, and the target passing Secure Boot.
+Power-on resets do not accumulate toward the threshold. The public release
+configuration at the same source revision leaves
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` unset, enables Secure Boot V2 signing,
+leaves flash encryption and NVS encryption unset, and configures UART ROM
+download mode enabled rather than Secure Download Mode. These facts describe
+that public configuration only. The observed app version and bootloader IDF
+version are not source/binary provenance, so deployed guard and encryption
+settings remain unverified.
+
+### ROM serial recovery boundary
+
+Maintainer-supplied prior read-only checks establish that UART ROM serial
+access, eFuse reads, RAM-stub flash inspection, and ordinary app startup worked
+on this unit; the new boot transcript establishes normal ROM-to-bootloader
+startup. No report demonstrates entering downloader mode after an app failure
+or writing through that route. The reported eFuse evidence says ROM download
+mode was not disabled and Secure Download Mode was off. This supports
+availability of the full ROM command set under the then-observed state, but
+does not prove every write command or failure mode.
+
+ROM serial recovery would require deliberate downloader entry, a supported
+host tool/transport, the exact validated partition map, a trusted
+device-compatible RSA-PSS-signed application image, correct flash-encryption
+handling (if enabled), and explicit targeting of an OTA app partition. Secure
+Boot remains enforced at subsequent boot: ROM access does not authorize an
+unsigned or wrongly signed app. With flash encryption enabled, direct ROM
+writes may require correctly pre-encrypted ciphertext at the exact offset;
+production eFuse restrictions can disable ROM encryption/decryption
+assistance. Flash-encryption eFuse state was not reported, despite the public
+source config leaving it off. Therefore this CLI's normal plaintext
+esptool-js write path cannot yet be assumed to be compatible with this
+device's encryption policy.
+
+For an interrupted inactive-slot write before metadata activation, a valid
+old metadata entry should continue to point at the preserved active app under
+the generic IDF model. This app has not physically been interrupted mid-write.
+For a signed but runtime-broken selected image, recovery could involve the
+app guard if it is present and executes, generic IDF rollback only if properly
+enabled/staged, bootloader fallback only if the bootloader detects a load
+failure, or ROM serial recovery with a known-good signed image. None of those
+recovery paths is physically demonstrated. A loss of ROM serial access leaves
+no validated local recovery route; vendor service/RMA may be necessary.
+
+### Failure matrix
+
+| Scenario | Expected behavior and evidence class | Device evidence | Available recovery / uncertainty |
+|---|---|---|---|
+| Interrupted OTA slot write, before metadata change | The CLI writes only the selected inactive 4 MiB slot with `eraseAll:false`; metadata commit occurs after host signature checks, chip-side image MD5, and protected-range checks. Source/tests: `src/device.ts`, `transport.ts`, `writeGuard.ts`, `tests/readOnlySafety.test.ts`. | No interrupted-write test. Current active `ota_1` booted normally. | Active selection should remain on old active app if metadata untouched. After power returns, inspect read-only and use ROM only with known signed artifact. Partial target is not usable evidence; physical fault tolerance unknown. |
+| Corrupted OTA application / bad image structure | Generic IDF v5.1.2 load validation skips an app whose load/verification fails, then walks other app indices. | No corrupted app/fallback test. | Other OTA or factory may load if valid and permitted. Installed bootloader match and all alternate images' integrity/signatures unknown. |
+| Invalid firmware signature | Secure Boot V2 rejects the candidate when bootloader validates it; generic image-loader walk may try another app. | Current selected app signature verification succeeded; no rejection case observed. | Use ROM only with trusted signed image if bootloader remains usable. Automatic fallback not confirmed on device. |
+| Wrong but validly signed firmware | Signature check alone can pass; compatibility/runtime behavior is application-level. IDF rollback needs config/state not staged by this CLI. | No such candidate tried. | Public app guard may switch after three classified crashes; deployed code and reset sequence are unverified. ROM recovery still requires supported signed firmware and encryption-compatible access. |
+| Application crash during startup | Bootloader cannot detect after jump. Public guard counts panic and watchdog reset reasons, plus its explicit SW-watchdog NVS marker, if early app guard initializes. | Normal startup only; no crash induced or observed. | Guard could count one failure; failures before guard init or NVS availability bypass it. Do not deliberately crash. |
+| Repeated application crash | Public source threshold is 3 classified crash boots; after each recognized boot, app code checks the count and selects the other OTA slot if its app descriptor can be read, then restarts. Power-on clears the count; healthy uptime of 600 s or ThingsBoard connect clears it. | No counter values or rollback behavior observed. | Depends on installed app matching reviewed source, failure reset reason, guard/NVS execution, alternate app and valid signature. No guarantee for three arbitrary reboots. |
+| Power failure during OTA metadata commit | CLI writes one alternate 4 KiB sector, validates readback and checks peer unchanged. Generic IDF keeps two sectors and selects a valid CRC/sequence record. | No power-interruption test. | Surviving old record may select old active app; if selection is uncertain, only read both sectors. Do not clear or repair metadata. Actual bootloader semantics remain unmatched. |
+| Invalid OTA metadata | Generic IDF selects factory when both records are invalid/initial and factory is configured; otherwise it tries OTA apps. Non-readable/undersized metadata can error separately. | Current metadata selected `ota_1`; invalid state not observed. | WG1200 layout contains factory, but factory image validity/signature is unverified. CLI intentionally reports ambiguous state and remains blocked. |
+| Loss of ROM serial access | No software guarantee; ROM may be disabled, inaccessible through physical wiring/strap, or otherwise fail. | ROM access/read-only eFuse/flash inspection reported successful in prior validation, not after app failure. | No validated fallback. Stop; seek vendor service/RMA. Do not attempt blind full-flash restoration. |
+
+### Write-path review and readiness decision
+
+The current source enforces a constant `BLOCKED` readiness in
+`src/upstream/flasher/securityPolicy.ts`; `flashDevice()` calls
+`assertFirmwareSecurityReady()` before transaction writes. User flags do not
+change that constant. Existing automated tests assert the gate and test
+mocked write bounds, preservation hashes, metadata re-read/commit/readback,
+and abort-before-activation. No test performs a physical write.
+
+The modeled transaction has useful safeguards: it selects only an inactive
+OTA slot after strict partition/metadata validation; protects the active
+non-target slot and fixed protected regions with full before/after SHA-256;
+validates the candidate and signing key before any write; confines erase to
+one 4 MiB slot; checks the written bytes using chip-side MD5; and writes one
+alternate metadata sector only after preservation checks. The metadata writer
+verifies the written record and unchanged peer. Post-boot slot/version/signature
+logs are observational, and application health is deliberately
+`not-checked`.
+
+Important unsatisfied safeguards/evidence remain: (1) the inactive slot's
+current firmware is overwritten and the transaction does not create a
+recoverable same-device backup of that target; determine whether the active
+running image is acceptable as the recovery candidate and preserve a verified
+read-only backup before authorizing any write; (2) no physical exact-byte
+backup/restore process exists, and flash-encryption/NVS-encryption status is
+unknown; (3) the installed bootloader, fallback/rollback configuration,
+factory image, alternate app signature, and ROM recovery after app failure
+are unverified; (4) there is no independent application-health confirmation;
+and (5) read/hash/write interruption behavior is only modeled in tests.
+The CLI must not expose a physical install until a separate review closes
+these items. Do not test by reinstalling the identical active firmware.
+
+**Decision: NOT READY FOR A CONTROLLED PHYSICAL FIRMWARE INSTALLATION.**
+Minimum additional evidence is: exact bootloader image/build provenance tied
+to the device (or vendor attestation of selection/rollback Kconfig); read-only
+flash-encryption and ROM-download eFuse state; full, verified, encrypted
+same-device backups plus a demonstrated restore plan on sacrificial matching
+hardware; cryptographic validity and preservation of both current OTA images
+and factory candidate; documented and demonstrated ROM entry/recovery on a
+matching sacrificial unit; and explicit post-install app health criteria that
+can distinguish boot messages from working application. Then review the
+specific signed firmware, target slot, preservation set, interruption plan,
+and abort/recovery steps before a separately authorized staged write. Do not
+use an identical active-firmware reinstall as a probe.
+
+References for exact source behavior: Espressif
+[`bootloader_utility.c` at v5.1.2](https://github.com/espressif/esp-idf/blob/v5.1.2/components/bootloader_support/src/bootloader_utility.c#L330-L525),
+[ESP-IDF v5.1.2 ESP32-S3 OTA guide](https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/api-reference/system/ota.html),
+[ESP-IDF v5.1.2 Secure Boot V2 guide](https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/security/secure-boot-v2.html),
+[ESP-IDF v5.1.2 Flash Encryption guide](https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/security/flash-encryption.html),
+WeatherXM [`boot_guard.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/boot_guard.cpp#L10-L298)
+and [`sdkconfig.wg1200_release`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/sdkconfig.wg1200_release).
+All WeatherXM conclusions remain source-derived, not proof of the installed
+application/bootloader binary.

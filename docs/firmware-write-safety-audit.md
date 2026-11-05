@@ -714,3 +714,39 @@ hardware-unvalidated and full preserved-slot hashing adds substantial
 read time. Recovery after boot failure, exact bootloader semantics, flash
 encryption status, and safe backup/recovery prerequisites are not established.
 The security write gate must remain blocked. **NOT READY FOR PHYSICAL FLASH TEST.**
+
+## Final recovery-readiness review (5 November 2026)
+
+The maintainer subsequently reported a successful normal boot and corrected
+redacted continuous capture from the latest standalone executable. This is
+positive evidence for the monitor, redaction, current signed image, and current
+boot path. It does not establish how the installed bootloader handles a bad
+signature, a loadable app that crashes, corrupted metadata, or power loss. The
+exact bootloader remains unmatched; its whole pre-table region hash prefix is
+not an image-only hash or configuration identity.
+
+The reviewed ESP-IDF v5.1.2 source walks fallback app partitions when image
+loading/verification fails and selects factory on initial/invalid OTA metadata
+when factory is present. Those expectations are conditional on matching
+bootloader source/configuration and valid remaining images. Runtime crashes
+are outside that load-time fallback. The reviewed WeatherXM `BootGuard` is an
+app-level mechanism: `swd_flag` marks a software-watchdog restart, panic and
+hardware/task/watchdog resets increment NVS `crash_cnt`, power-on clears it,
+and three classified crash boots can select the other OTA slot after app
+startup if its descriptor is readable. The release profile does not enable
+ESP-IDF pending-verify rollback and leaves flash encryption unset; neither
+setting is evidence of what is installed on the tested gateway. Full failure
+matrix and source/device evidence distinctions are in
+[`wg1200-recovery-readiness.md`](wg1200-recovery-readiness.md#final-read-only-recovery-assessment-5-november-2026).
+
+The write-path review found no basis to relax policy. Transaction tests cover
+the inactive-slot write boundary, preserved non-target slot and fixed-region
+hashes, candidate checks, alternate-sector metadata commit/readback, peer
+preservation, and abort on verification failure. They do not prove the
+installed bootloader's recovery semantics, flash-encryption compatibility,
+or any power-interruption case on hardware. The currently inactive image is
+replaced by an OTA install, so it is not preserved as a separate candidate;
+the active running app would be the remaining OTA recovery image and needs
+independent integrity/backup evidence before any write is justified. The
+existing `BLOCKED` security gate remains mandatory. No new code or destructive
+test was needed for this documentation assessment.

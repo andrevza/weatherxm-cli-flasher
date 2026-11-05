@@ -337,3 +337,26 @@ An earlier Linux ARM64 trace showed that a late 16-byte raw MD5 digest from a co
 These were read-only flash-inspection and validation commands. Inspection enters the ROM loader, resets the gateway, and performs the documented volatile register workaround, but these commands did not write or erase flash. No actual firmware installation, OTA activation, erase, or recovery operation has been physically tested with this standalone executable. Firmware-write behavior remains covered only by automated fixtures and mocks. Do not describe the full flashing workflow as hardware validated.
 
 This record is based on the test report supplied by the maintainer; raw serial captures are not included. For future reproduction, record the executable's `--version --verbose` output and run the read-only hardware check script with the Pi's serial device configured. Review and redact any captured output before sharing it.
+
+## Maintainer-reported boot monitor/redaction validation (5 November 2026)
+
+The maintainer reports that the Linux ARM64 standalone executable built from
+source commit `7686ce95ba202499946c8f15e35f0e89dc809e56`, SHA-256
+`bf474a648d0d115ba053c94f9b85095f32694eb9efe461b685c664ef7d8a10db`, was
+run on Raspberry Pi 5 `bugs` with the WG1200 attached. The supplied continuous
+capture reports ESP32-S3 revision 0.2, ESP-IDF 5.1.2 second-stage bootloader,
+successful Secure Boot V2/RSA-PSS verification, active boot from `ota_1` at
+`0x820000`, application `0.8.34-g86b609b` startup and MQTT connectivity. The
+maintainer confirms RTS/DTR normal-reset capture and corrected redaction
+worked. This record is a summary of supplied evidence; the complete raw log
+and gateway-specific identifiers are intentionally not retained here.
+
+This validates one successful normal boot and the tested monitor/redaction
+path. It does not demonstrate automatic fallback, app crash recovery,
+bootloader rollback configuration, ROM recovery after app failure, flash
+encryption state, any flash write/erase, OTA metadata update, or recovery
+after interruption. It does not identify the exact bootloader binary. The
+reported `64e8c47e` pre-table fingerprint prefix is not a bootloader-only
+digest or a match to a known artifact. See
+[`wg1200-recovery-readiness.md`](wg1200-recovery-readiness.md#final-read-only-recovery-assessment-5-november-2026)
+for the final evidence-based failure matrix and readiness decision.
