@@ -38,8 +38,10 @@ describe('output redaction', () => {
 
   it('redacts Secure Boot public-key digests in text and JSON', () => {
     const digest = 'a'.repeat(64);
-    const json = JSON.parse(redactOutput(JSON.stringify({ keyBlocks: [{ publicKeyHash: digest }] })));
+    const diagnostic = { operation: 'READ_REG', logicalSlot: 0, physicalBlock: 4, registerBaseOffset: '0x09c', expectedWords: 8, wordsRead: 3, errorCategory: 'serial-read-failed', failedWordIndex: 3, failedRegisterOffset: '0x0a8' };
+    const json = JSON.parse(redactOutput(JSON.stringify({ keyBlocks: [{ publicKeyHash: digest, readDiagnostic: diagnostic }] })));
     expect(json.keyBlocks[0].publicKeyHash).toBe('[REDACTED PUBLIC KEY]');
+    expect(json.keyBlocks[0].readDiagnostic).toEqual(diagnostic);
     expect(redactOutput(`Public key hash: ${digest}`)).toBe('Public key hash: [REDACTED PUBLIC KEY]');
   });
 });
