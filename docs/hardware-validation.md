@@ -1,5 +1,23 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Continuous startup capture follow-up
+
+Source now provides `monitor --boot`: the receive listener is attached before
+port open, one SerialPort instance remains open, DTR stays deasserted and RTS
+is asserted for 120 ms to pulse EN into normal app boot (50 ms setup, 150 ms
+after release). This matches the existing transport signal convention.
+Espressif documents the CH340/ESP32-S3 mapping RTS-to-EN and DTR-to-GPIO0;
+the WG1200 PCB traces have not been physically checked. The new mode has not
+been physically validated. USB power stays connected and no flash, OTA or
+eFuse operation is performed.
+
+The `gw_bootloader_sha256` telemetry attribute is the app's hash of the full
+`0xC000`-byte pre-partition-table region, not an image-only bootloader digest.
+No authorized ThingsBoard connector/session is available here to retrieve it.
+An already-authorized operator can export that device attribute and compare
+the full value with the known-image table; the current `64e8c47e` prefix does
+not match the listed known reset-pin variants.
+
 ## Maintainer-reported validation of the protected-region candidate (5 November 2026)
 
 The maintainer reports that `dist/weatherxm-flash-linux-arm64-protected-region`

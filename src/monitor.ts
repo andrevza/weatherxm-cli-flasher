@@ -9,6 +9,8 @@ export interface MonitorOptions {
   timestamp?: boolean;
   level?: MonitorLevel;
   raw?: boolean;
+  boot?: boolean;
+  resetDelay?: (ms: number) => Promise<void>;
   noColor?: boolean;
   color?: boolean;
   header?: string;
@@ -22,6 +24,25 @@ export interface MonitorPort {
   close(callback: (error?: Error | null) => void): void;
   on(event: string, listener: (...args: any[]) => void): unknown;
   removeListener(event: string, listener: (...args: any[]) => void): unknown;
+  set?(options: { dtr: boolean; rts: boolean }, callback: (error: Error | null) => void): void;
+}
+
+export async function resetForNormalBoot(port: MonitorPort, delay: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms))): Promise<void> {
+  if (!port.set) throw new Error('Serial port does not support RTS/DTR reset signals');
+  const set = (dtr: boolean, rts: boolean) => new Promise<void>((resolve, reject) => port.set!({ dtr, rts }, (error) => error ? reject(error) : resolve()));
+  try {
+    // DTR maps to GPIO0 and RTS to EN in the esptool/CLI adapter convention.
+    // These are active-low: keep GPIO0 released, pulse EN low, then release EN.
+    await set(false, false);
+    await delay(50);
+    await set(false, true);
+    await delay(120);
+    await set(false, false);
+    await delay(150);
+  } catch (error) {
+    try { await set(false, false); } catch { /* preserve the original failure */ }
+    throw error;
+  }
 }
 
 const rank: Record<MonitorLevel, number> = { error: 0, warn: 1, info: 2, debug: 3, verbose: 4 };
@@ -123,7 +144,8 @@ export async function monitorSerial(options: MonitorOptions): Promise<string[]> 
     await new Promise<void>((resolve, reject) => port.open((error) => error ? reject(error) : resolve()));
     openResolved = true;
     signalSource.on('SIGINT', onSigint);
-    options.output?.(options.header ?? `WeatherXM WG1200 — Serial Monitor\n${'─'.repeat(46)}\nPort        ${options.portPath}\nBaud        ${baudRate}\nMode        Passive / Receive-only\nStatus      CONNECTED\n\nListening for serial output...\nPress Ctrl+C to disconnect.\n`);
+    options.output?.(options.header ?? `WeatherXM WG1200 — Serial Monitor\n${'─'.repeat(46)}\nPort        ${options.portPath}\nBaud        ${baudRate}\nMode        ${options.boot ? 'Normal-boot capture' : 'Passive / Receive-only'}\nStatus      CONNECTED\n\n${options.boot ? 'Resetting via RTS/EN; capturing startup...' : 'Listening for serial output...'}\nPress Ctrl+C to disconnect.\n`);
+    if (options.boot) await resetForNormalBoot(port, options.resetDelay);
     for (const chunk of pendingChunks) consume(chunk);
     pendingChunks.length = 0;
     await completion;

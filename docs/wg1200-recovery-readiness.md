@@ -92,7 +92,12 @@ bootloader artifact or proof of its complete Kconfig.
 The same source publishes the full region digest as `gw_bootloader_sha256` in
 its ThingsBoard attribute JSON. If that existing telemetry is available, the
 operator can compare the full value with the source table without exporting a
-flash dump. The tool's device modes were not run. In particular,
+flash dump. No authorized ThingsBoard connector/session is available here.
+The reviewed local HTTP API source did not expose this internal attribute.
+An already-authorized operator can retrieve `gw_bootloader_sha256` from the
+gateway's ThingsBoard device attributes/telemetry view or export it through
+their existing authorized workflow; anonymous access is not assumed. The
+tool's device modes were not run. In particular,
 `--backup-only` creates raw device backups and is not a no-export diagnostic.
 
 The reviewed `sdkconfig.wg1200_release` leaves
@@ -127,9 +132,19 @@ To observe normal startup messages, connect the CH340 and passively listen:
 wg1200 monitor --port /dev/ttyUSB0 --baud 115200 --timestamp --level info --redact
 ```
 
-The monitor sends no serial bytes and does not toggle DTR/RTS. It only sees
-messages produced after it opens; a single ordinary reset is needed to see
-startup from the beginning, and should be done only when operationally safe.
+The monitor sends no serial bytes and does not toggle DTR/RTS unless `--boot`
+is explicitly supplied. `monitor --boot` installs the data handler before
+opening the serial port, keeps that one connection open, then leaves DTR
+deasserted (GPIO0 released) and pulses RTS asserted for 120 ms (EN low) after
+50 ms idle; RTS is then deasserted and the monitor continues through startup.
+This reuses the existing transport's signal convention; the GPIO mapping is
+supported by successful ROM-loader entry and Espressif's documented CH340
+auto-reset mapping, but WG1200 board traces have not been independently
+inspected. The reset holds USB power and does not require unplugging the CH340.
+It sends no serial payload and performs no flash/eFuse/OTA operation. When
+`--boot` is omitted, the monitor only sees messages produced after it opens.
+The explicit `--boot` reset starts a fresh capture without unplugging USB and
+should be used only when an ordinary gateway reboot is operationally safe.
 Do not provoke a crash or repeatedly power-cycle the gateway to infer rollback.
 
 **Status: NOT READY FOR PHYSICAL FLASH TEST.** This report describes evidence
@@ -367,10 +382,9 @@ This is a plan, not authorization to write, erase, or change metadata.
 1. Keep stable power. If the app is crash-looping, capture logs passively and
    allow its self-restart behavior to run without repeated manual power cycles.
    Stop if heat, electrical, or other hardware concerns arise.
-2. Capture UART logs at 115200 baud using the passive `monitor` command below.
-   A single intentional reset is required to capture startup from the top;
-   reset the unit only if the maintainer judges that operationally safe. The
-   monitor itself sends no bytes and does not toggle DTR/RTS.
+2. Capture UART logs at 115200 baud using `monitor --boot` to begin at normal
+   startup without disconnecting USB. Use it only if an ordinary reset is
+   operationally safe. Ordinary `monitor` remains fully passive.
 3. Re-enter ROM and run only `security`, `info`, `status`, and `flash --dry-run`.
    Record the exact binary build metadata, chip/flash capacity, validated
    partition layout, OTA sectors, descriptors, eFuse download restrictions,
@@ -408,13 +422,16 @@ write/erase flash or program eFuses:
 ./weatherxm-flash-linux-arm64 flash weatherxm --port /dev/ttyUSB0 --dry-run --json --redact
 ```
 
-For normal startup logs without changing serial control lines, start this in
-one terminal, then (only if safe) press the gateway's normal reset control
-once while it is running:
+For passive normal startup observation without changing serial control lines,
+start this in one terminal and use the normal reset control only if safe:
 
 ```sh
 ./weatherxm-flash-linux-arm64 monitor --port /dev/ttyUSB0 --baud 115200 \
   --redact --output ./wg1200-boot-redacted.log
+
+# To capture from the start using the serial reset line (one port, no USB unplug):
+./weatherxm-flash-linux-arm64 monitor --port /dev/ttyUSB0 --baud 115200 \
+  --boot --timestamp --redact --output ./wg1200-boot-redacted.log
 ```
 
 Stop with Ctrl+C. The public release config uses INFO logging on UART0 at

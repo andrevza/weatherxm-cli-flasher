@@ -690,11 +690,15 @@ but recovery after failed app boot has not been demonstrated. Flash-encryption
 state, a validated sensitive backup, an exact matching bootloader artifact,
 and a vendor-approved recovery procedure remain missing.
 
-Normal boot logs can be passively captured with `monitor --port ... --baud
-115200 --redact`; the public release profile enables INFO logs at UART0
-115200. The supplied log includes the inventory line; logs can show
-version/slot/errors but do not establish Kconfig behavior, and missing output
-is inconclusive. The app also publishes the full `gw_bootloader_sha256`
+Normal boot logs can be captured with `monitor --port ... --baud 115200
+--boot --redact`; the public release profile enables INFO logs at UART0
+115200. This installs the receiver before opening the port and keeps it open
+while DTR remains deasserted (GPIO0 released) and RTS is pulsed asserted for
+120 ms (EN low), with 50 ms setup and 150 ms after release. This follows the
+existing transport convention; board traces have not been independently
+verified. Ordinary `monitor` remains passive. The supplied log includes the
+inventory line; logs can show version/slot/errors but do not establish Kconfig
+behavior, and missing output is inconclusive. The app also publishes the full `gw_bootloader_sha256`
 pre-table-area digest as a ThingsBoard attribute. If that existing telemetry
 is available, it can be compared with the known full-region table without
 exporting flash bytes. No raw region capture or matching artifact was supplied.

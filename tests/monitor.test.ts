@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { formatMonitorLine, monitorSerial, parseSerialLevel } from '../src/monitor.js';
+import { formatMonitorLine, monitorSerial, parseSerialLevel, resetForNormalBoot } from '../src/monitor.js';
 import { analyzeBootLogs, captureBootLogs } from '../src/upstream/flasher/serialLog.js';
 
 class FakeMonitorPort extends EventEmitter {
@@ -12,6 +12,8 @@ class FakeMonitorPort extends EventEmitter {
   openNow() { this.isOpen = true; this.openCallback?.(null); }
   close(callback: (error?: Error | null) => void) { this.isOpen = false; this.closeCount++; this.emit('close'); callback(null); }
   send(value: string | Uint8Array) { this.emit('data', Buffer.from(value)); }
+  signals: Array<{ dtr: boolean; rts: boolean }> = [];
+  set(options: { dtr: boolean; rts: boolean }, callback: (error: Error | null) => void) { this.signals.push(options); callback(null); if (options.rts === false && this.signals.length === 3) this.send('ROM boot\r\nI bootloader: ready\r\nI app: started\r\n'); }
 }
 
 describe('passive serial monitor', () => {
@@ -65,6 +67,39 @@ describe('passive serial monitor', () => {
     const openFailure = monitorSerial({ portPath: '/dev/missing', signalSource: signals, portFactory: () => failed });
     failed.openCallback?.(new Error('no such device'));
     await expect(openFailure).rejects.toThrow(/Could not open passive serial monitor on \/dev\/missing/);
+
+    const errored = new FakeMonitorPort();
+    const serialError = monitorSerial({ portPath: '/dev/fake', signalSource: signals, portFactory: () => errored });
+    errored.openNow();
+    errored.emit('error', new Error('adapter failure'));
+    await expect(serialError).rejects.toThrow(/Serial monitor disconnected: adapter failure/);
+  });
+
+  it('captures a continuous ROM-to-app stream with receiver installed before normal-boot reset', async () => {
+    const port = new FakeMonitorPort();
+    const signals = new EventEmitter();
+    const output: string[] = [];
+    const delays: number[] = [];
+    const monitoring = monitorSerial({ portPath: '/dev/fake', boot: true, resetDelay: async (ms) => { delays.push(ms); }, signalSource: signals, portFactory: () => port, output: (line) => output.push(line) });
+    await Promise.resolve();
+    expect(port.eventNames()).toContain('data');
+    expect(port.listenerCount('data')).toBe(1);
+    port.openNow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(port.signals).toEqual([{ dtr: false, rts: false }, { dtr: false, rts: true }, { dtr: false, rts: false }]);
+    expect(delays).toEqual([50, 120, 150]);
+    expect(output.join('')).toContain('ROM boot');
+    expect(output.join('')).toContain('I app: started');
+    signals.emit('SIGINT');
+    await monitoring;
+    expect(port.closeCount).toBe(1);
+  });
+
+  it('restores deasserted reset signals if the reset pulse fails', async () => {
+    const port = new FakeMonitorPort();
+    port.set = (options, callback) => { port.signals.push(options); callback(port.signals.length === 2 ? new Error('signal failure') : null); };
+    await expect(resetForNormalBoot(port, async () => {})).rejects.toThrow('signal failure');
+    expect(port.signals.at(-1)).toEqual({ dtr: false, rts: false });
   });
 
   it('parses severity, applies filters, timestamps, raw mode and no-color mode', () => {

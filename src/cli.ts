@@ -13,7 +13,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -64,7 +64,7 @@ function parseArgs(argv: string[]): Args {
   let helpRequested = false;
   let manifestProvided = false;
   let bootLogProvided = false;
-  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, traceSerial: false, monitor: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
+  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--port' || arg === '-p') out.port = argv[++i];
@@ -78,6 +78,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === '--dry-run') out.dryRun = true;
     else if (arg === '--trace-serial') out.traceSerial = true;
     else if (arg === '--monitor') out.monitor = true;
+    else if (arg === '--boot') out.boot = true;
     else if (arg === '--timestamp') out.timestamp = true;
     else if (arg === '--level') out.level = argv[++i] as MonitorLevel;
     else if (arg === '--output') out.outputFile = argv[++i];
@@ -100,6 +101,7 @@ function parseArgs(argv: string[]): Args {
     if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
     if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
+    if (out.boot && out.command !== 'monitor') throw new Error('--boot is supported only by monitor');
     if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
@@ -123,7 +125,7 @@ function help(command?: string, plain = false) {
       verify: `USAGE\n  ${name} verify --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nValidates WG1200 identity, exact partition layout, partition-table MD5, credentials and OTA metadata. Read-only; resets the gateway.`,
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
-      monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nPassively receives serial output in receive-only mode. Does not send bytes, toggle DTR/RTS, enter ROM loader, or reset the gateway. Ctrl+C closes the serial port.`,
+      monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nPassively receives serial output. --boot first installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n\nLists validated firmware releases from the official HTTPS manifest.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
       flash: `USAGE\n  ${name} flash <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--dry-run] [--force] [--recover] [--yes] [--monitor] [--boot-log-seconds <0..3600>] [--json] [--redact] [--trace-serial]\n\nWrites only the validated inactive OTA slot and selected OTA metadata sector after validation and confirmation. --dry-run is read-only. --force permits only an identical-build reinstall; it does not bypass identity, layout, integrity, OTA, boundary or confirmation checks. Downgrades remain blocked. Boot capture defaults to 15 seconds; zero disables it; --monitor captures continuously after release.`,
@@ -143,7 +145,7 @@ function help(command?: string, plain = false) {
   output += `\n${heading('FIRMWARE COMMANDS')}\n`;
   output += commandRow('firmware list', 'List available firmware releases');
   output += commandRow('flash <firmware>', 'Install to the inactive OTA slot');
-  output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
+  output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --boot              Reset via RTS/EN and capture startup from boot\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
   output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Firmware writing is blocked pending device trust and rollback evidence.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
   output = output.replace('  -h, --help          Show help', '  -v, --version       Show application version; add --verbose for build details\n  -h, --help          Show help');
   output = output.replace('  --manifest <url>', '  --redact            Mask device and certificate identifiers in output\n  --manifest <url>');
@@ -199,13 +201,14 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
   const color = Boolean(target.isTTY) && !args.noColor && !process.env.NO_COLOR && process.env.TERM !== 'dumb';
   try {
     const lines = await monitorSerial({
-      portPath: args.port, baudRate: args.baud, timestamp: args.timestamp, level: args.level,
+      portPath: args.port, baudRate: args.baud, boot: args.boot, timestamp: args.timestamp, level: args.level,
       raw: args.raw, noColor: args.noColor, color, header,
       output: (value) => {
         const rendered = `${value}${value.endsWith('\n') ? '' : '\n'}`;
-        target.write(rendered);
-        const plain = rendered.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
-        file?.write(args.redact ? redactOutput(plain) : plain);
+        const safeRendered = args.redact ? redactOutput(rendered) : rendered;
+        target.write(safeRendered);
+        const plain = safeRendered.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+        file?.write(plain);
       },
     });
     target.write('Serial port released.\n');

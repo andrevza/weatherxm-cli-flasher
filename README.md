@@ -132,6 +132,9 @@ wg1200 status --port /dev/ttyUSB0 --json
 # Passively monitor the device console without entering the bootloader
 wg1200 monitor --port /dev/ttyUSB0 --timestamp --level info
 
+# Reset into normal application boot and capture ROM, bootloader and app logs
+wg1200 monitor --port /dev/ttyUSB0 --baud 115200 --boot --redact --timestamp --output ./wg1200-boot.log
+
 # Check a release against the active app descriptor without changing flash
 wg1200 check weatherxm --port /dev/ttyUSB0 --json
 
@@ -182,7 +185,7 @@ Baud defaults to 115200, matching the WG1200 web flasher. Firmware writes report
 
 `check <firmware>` downloads and validates the actual firmware image, inspects the gateway, then applies the same descriptor comparison policy as flash preflight. Completed checks always exit `0`, including up-to-date, update available, downgrade blocked, approval required, and incompatible firmware results. Invalid input, unavailable manifests, image-integrity failures, and device-validation errors exit nonzero. A firmware-type change is reported as incompatible/approval-required and is never described as a normal version upgrade.
 
-`monitor` opens a receive-only serial session without creating an esptool loader, sending serial bytes, or changing DTR/RTS. It supports `--timestamp`, `--level error|warn|info|debug|verbose`, `--output <file>`, `--raw`, and `--no-color`. The monitor sanitizes certificate/key blocks and long hex values even in raw mode. `--monitor` on a device operation starts this same passive reader after the operation closes and releases its own serial connection; duplicate owners are never kept open together. Because the monitor must reopen after the inspection/reset handoff, some early boot messages can occur before it begins listening.
+`monitor` opens a receive-only serial session without creating an esptool loader or sending serial bytes. It supports `--timestamp`, `--level error|warn|info|debug|verbose`, `--output <file>`, `--raw`, and `--no-color`. The monitor sanitizes certificate/key blocks and long hex values even in raw mode. `--boot` attaches the raw receive handler before opening the port, then holds DTR deasserted (GPIO0 released), asserts RTS for 120 ms (EN reset), and releases RTS; it keeps that same port open through ROM, bootloader, and application output until Ctrl+C. The reset sequence also waits 50 ms before asserting EN and 150 ms after release. This mapping follows the existing esptool transport convention; board-level tracing has not independently verified the WG1200 wiring. Do not infer device configuration from missing log messages. Redaction is best-effort; inspect captures before sharing. `--monitor` on a device operation starts this passive reader after the operation closes and releases its own serial connection; early boot messages can occur before that reader opens.
 
 `--redact` masks MAC addresses, gateway/device and station identifiers/names, certificate common names, fingerprints and PEM blocks, public keys/hashes, serial-number fields, access tokens, MQTT credentials, and labeled location/coordinate fields in human-readable and JSON output, including application diagnostics and monitor output files. It does not alter values used internally for device identity, validation, or cryptographic checks. It preserves operational details such as chip model, firmware version, flash size, and partition layout. Redaction uses field names and recognizable text patterns; it is best-effort and cannot guarantee that every application-generated secret or location value is detected. Review logs before sharing them.
 
