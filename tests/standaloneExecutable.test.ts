@@ -48,6 +48,9 @@ describe('standalone executable packaging', () => {
     const monitorHelp = execFileSync(executable, ['monitor', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(monitorHelp).toContain('receive-only');
     expect(monitorHelp).toContain('--boot');
+    const bootWithoutPort = spawnSync(executable, ['monitor', '--boot'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
+    expect(bootWithoutPort.status).toBe(1);
+    expect(bootWithoutPort.stderr).toContain('monitor requires --port');
     const securityHelp = execFileSync(executable, ['security', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
     expect(securityHelp).toContain('security check <firmware>');
     const badInput = spawnSync(executable, ['check', 'weatherxm', '--json'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
