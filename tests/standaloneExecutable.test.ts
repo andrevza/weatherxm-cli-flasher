@@ -119,6 +119,11 @@ describe('standalone executable packaging', () => {
     expect(safe).not.toContain('18.4');
     expect(safe).not.toContain('a'.repeat(64));
     expect(safe).not.toContain('b'.repeat(64));
+    expect(safe).not.toContain('0x00001234');
+    expect(safe).not.toContain('Synthetic City');
+    expect(safe).not.toContain('wxm-gw-a1b2c3.local');
+    expect(safe).not.toContain('11:22:33:44');
+    expect(safe).toContain('reset=');
   });
 
   it.skipIf(!builtExecutable)('reports embedded source and build metadata', () => {

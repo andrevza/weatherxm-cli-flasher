@@ -1,5 +1,73 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Maintainer-supplied physical boot capture (5 November 2026)
+
+The maintainer supplied a complete `monitor --boot --redact` transcript captured
+on a Raspberry Pi 5 running Linux ARM64. The executable was
+`~/weatherxm-flash-boot-monitor`, SHA-256
+`115fb7f481f023374a9a95a1c8eedc06143397130cda016717f5e53b0de50c37`, with
+embedded source SHA-256
+`3e4f23a22cd07689569c2bf96bae2faf50c9384ce83c7707772f408866fd4a43`, Git
+commit `d9b2ff0b221a7b2680e37f9b1ca0aeebe524efea`, a clean source tree, and
+Node.js `v26.8.2`. Codex did not access the Pi or gateway. The full transcript
+is deliberately not stored here because it contains device identifiers,
+locations, and radio packet bytes.
+
+The capture showed `ESP-ROM:esp32s3-20210327`, a power-on reset line, the
+ESP-IDF 5.1.2 second-stage bootloader, 16 MiB flash, and the WG1200 partition
+layout. The ROM printed `Valid secure boot key blocks: 0` followed by
+`secure boot verification succeeded`. The second-stage bootloader then
+reported successful RSA-PSS signature verification, loaded the application
+from `0x820000` (`ota_1` in the observed partition table), and the application
+started as version `0.8.34-g86b609b` under ESP-IDF 6.0.1. The app connected to
+MQTT and processed station traffic. These are observations from one supplied
+startup, not a test of fallback, rollback, or recovery behavior.
+
+The ROM line's trailing `0` is consistent with a listed valid key-block index,
+not a count of valid keys: Espressif's own examples show the same format with
+`Valid secure boot key blocks: 0` and successful verification, and an issue
+shows multiple indices (`0 1 2`). The ROM source's exact formatting contract
+was not located, so this interpretation is supported by the examples and
+surrounding successful signature checks rather than a source-level proof.
+Secure Boot V2 verifies the image signature against key digests held in eFuse;
+the log is not evidence that Secure Boot was disabled. See Espressif's
+[ESP-IDF Secure Boot V2 guide](https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32s3/security/secure-boot-v2.html),
+[ROM log example](https://developer.espressif.com/blog/flash-encryption-and-secure-boot/),
+and [multiple-block log example](https://github.com/espressif/esp-idf/issues/12851).
+
+The application read the `bootguard` NVS namespace keys `swd_flag` and
+`crash_cnt`; the transcript did not expose their values or report a rollback.
+At pinned WeatherXM source revision
+`a30374b045c138dac3f6dd4267ef8eb7390a7670`, the app-side guard classifies
+selected watchdog/panic resets and its software-watchdog flag as crash boots,
+clears the counter on power-on reset, and tries the other OTA app after three
+crash boots if its descriptor is valid. Its health reset is tied to 600 seconds
+of uptime or successful ThingsBoard connectivity. This is source behavior,
+not proof that this exact source and configuration are installed. The
+`POWERON` log describes this observed startup only. A settings-commit log line
+follows station traffic in this capture. In the reviewed application source,
+the WS1300 ADV/BOOT handler can save a changed paired-station serial/public-key
+profile through `Settings::commit()`. That makes an application NVS settings
+commit a plausible explanation for the log; the transcript does not identify
+the fields or prove that this exact branch ran. It is not evidence of an OTA
+metadata write.
+
+The installed bootloader is not identified by an exact artifact. Its second
+stage reports ESP-IDF 5.1.2 while the app reports ESP-IDF 6.0.1; this is
+consistent with separately built components but does not identify either
+binary. The app's `unknown pin` inventory label comes from a hash comparison
+in the public source; it means no known pin mapping matched the full pre-table
+region digest, not that a physical pin is unknown. Exact image extent,
+full digest, build configuration, and rollback support remain unconfirmed.
+No raw flash or provisioning data was read by this review.
+
+The transcript also demonstrated that the earlier binary's `--redact` missed
+station telemetry IDs, a serial field, an mDNS identity and partial MAC, a
+public API address, and raw radio packet bytes. The source changes in this
+follow-up address those known forms and suppress packet byte rows in redacted
+monitor mode; the updated implementation still needs its automated validation
+below and has not been physically retested. This is best-effort filtering.
+
 ## Continuous startup capture follow-up
 
 Source now provides `monitor --boot`: the receive listener is attached before
@@ -7,9 +75,11 @@ port open, one SerialPort instance remains open, DTR stays deasserted and RTS
 is asserted for 120 ms to pulse EN into normal app boot (50 ms setup, 150 ms
 after release). This matches the existing transport signal convention.
 Espressif documents the CH340/ESP32-S3 mapping RTS-to-EN and DTR-to-GPIO0;
-the WG1200 PCB traces have not been physically checked. The new mode has not
-been physically validated. USB power stays connected and no flash, OTA or
-eFuse operation is performed.
+the WG1200 PCB traces have not been physically checked. A maintainer-supplied
+capture using the earlier candidate demonstrated a ROM-to-app startup with
+the gateway attached; it does not validate the latest redaction changes. USB
+power stays connected and no monitor-initiated flash, OTA or eFuse operation
+is performed.
 
 The `gw_bootloader_sha256` telemetry attribute is the app's hash of the full
 `0xC000`-byte pre-partition-table region, not an image-only bootloader digest.

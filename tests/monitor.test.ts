@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { formatMonitorLine, monitorSerial, parseSerialLevel, resetForNormalBoot } from '../src/monitor.js';
 import { analyzeBootLogs, captureBootLogs } from '../src/upstream/flasher/serialLog.js';
+import { LogSanitizer } from '../src/upstream/flasher/serialLog.js';
 
 class FakeMonitorPort extends EventEmitter {
   isOpen = false;
@@ -17,6 +18,27 @@ class FakeMonitorPort extends EventEmitter {
 }
 
 describe('passive serial monitor', () => {
+  it('suppresses radio payload byte rows in redacted mode while retaining packet diagnostics', () => {
+    const sanitizer = new LogSanitizer({ suppressRadioPayloads: true });
+    expect(sanitizer.sanitizeLine('--- WS1300 Packet Received ---')).toContain('Packet Received');
+    expect(sanitizer.sanitizeLine('RSSI: -91, SNR: 7.5')).toBe('RSSI: -91, SNR: 7.5');
+    expect(sanitizer.sanitizeLine('--- WS1300 ADV Packet Decoded Parameters ---')).toContain('Decoded Parameters');
+    expect(sanitizer.sanitizeLine('=========================')).toBe('=========================');
+    expect(sanitizer.sanitizeLine('01 02 ab cd')).toBe('[REDACTED RADIO PAYLOAD; 4 bytes]');
+    expect(sanitizer.sanitizeLine('=========================')).toBe('=========================');
+    expect(sanitizer.sanitizeLine('--- WS1300 Packet Response ---')).toContain('Packet Response');
+    expect(sanitizer.sanitizeLine('=========================')).toBe('=========================');
+    expect(sanitizer.sanitizeLine('aa bb cc')).toBe('[REDACTED RADIO PAYLOAD; 3 bytes]');
+    expect(sanitizer.sanitizeLine('=========================')).toBe('=========================');
+    expect(sanitizer.sanitizeLine('reset=1 load=0x820000')).toBe('reset=1 load=0x820000');
+  });
+
+  it('keeps labeled SHA-256 diagnostics while masking unlabeled 64-digit values', () => {
+    const sanitizer = new LogSanitizer();
+    const hash = 'a'.repeat(64);
+    expect(sanitizer.sanitizeLine(`SHA-256: ${hash}`)).toBe(`SHA-256: ${hash}`);
+    expect(sanitizer.sanitizeLine(hash)).toBe('[REDACTED_64_HEX]');
+  });
   it('shows CONNECTED only after open and uses a receive-only open configuration', async () => {
     const port = new FakeMonitorPort();
     const signals = new EventEmitter();

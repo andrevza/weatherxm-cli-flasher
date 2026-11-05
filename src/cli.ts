@@ -201,7 +201,7 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
   const color = Boolean(target.isTTY) && !args.noColor && !process.env.NO_COLOR && process.env.TERM !== 'dumb';
   try {
     const lines = await monitorSerial({
-      portPath: args.port, baudRate: args.baud, boot: args.boot, timestamp: args.timestamp, level: args.level,
+      portPath: args.port, baudRate: args.baud, boot: args.boot, redact: args.redact, timestamp: args.timestamp, level: args.level,
       raw: args.raw, noColor: args.noColor, color, header,
       output: (value) => {
         const rendered = `${value}${value.endsWith('\n') ? '' : '\n'}`;

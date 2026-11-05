@@ -10,6 +10,7 @@ export interface MonitorOptions {
   level?: MonitorLevel;
   raw?: boolean;
   boot?: boolean;
+  redact?: boolean;
   resetDelay?: (ms: number) => Promise<void>;
   noColor?: boolean;
   color?: boolean;
@@ -84,7 +85,7 @@ export async function monitorSerial(options: MonitorOptions): Promise<string[]> 
   const port = factory({ path: options.portPath, baudRate, autoOpen: false, hupcl: false });
   const signalSource = options.signalSource ?? process;
   const lines: string[] = [];
-  const sanitizer = new LogSanitizer();
+  const sanitizer = new LogSanitizer({ suppressRadioPayloads: options.redact });
   const decoder = new StringDecoder('utf8');
   const pendingChunks: Buffer[] = [];
   let buffer = '';

@@ -2,6 +2,42 @@
 
 ## Bootloader identification research (5 November 2026)
 
+### Supplied continuous boot capture evidence
+
+The maintainer-supplied 5 November capture records a single normal startup:
+ROM power-on message, successful ROM secure-boot verification, successful
+second-stage RSA-PSS verification, selection of `ota_1` at `0x820000`, and
+application startup. It also records `Valid secure boot key blocks: 0`. This
+format is consistent with the ROM listing key-block index zero; it should not
+be interpreted as a zero-key count. The successful verification lines and
+previous read-only trusted-key evidence are consistent with Secure Boot V2
+being active. The exact ROM implementation and installed image are not matched
+to source. See the physical transcript evidence section in
+[`hardware-validation.md`](hardware-validation.md).
+
+| Question | Evidence from the supplied capture | Assessment |
+|---|---|---|
+| Did the selected signed application boot? | ROM and second-stage verification succeeded; app loaded from `ota_1` and started | Observed for this startup |
+| Did fallback occur? | No failure of the selected app or alternate-slot selection was logged | Not observed |
+| Did rollback occur? | No rollback was logged; app read `bootguard` keys without showing values | Not observed |
+| Is the installed second-stage configuration known? | IDF 5.1.2 bootloader log; app reports IDF 6.0.1; no matched artifact/config | Unknown |
+| Does `Valid secure boot key blocks: 0` mean none are valid? | Same Espressif ROM format appears with successful verification and index lists | No; consistent with index 0, though exact ROM format source was not located |
+
+The capture's reported power-on reset is only the reset reason for this run. It
+does not establish prior crash-counter state or show fallback behavior. The
+app's “settings commit requested” message followed station traffic. In the
+reviewed source, a WS1300 ADV/BOOT packet can update paired-station identity
+data and call `Settings::commit()`; that is a plausible explanation, although
+the exact branch is not proven from the transcript. It is not evidence of an
+OTA metadata transaction. Monitor redaction also proved incomplete for this older
+binary: it emitted identifiers, location text, and raw radio packet bytes.
+The follow-up code adds patterns for those observed leaks and suppresses
+recognized radio payload rows only when `--redact` is enabled; this source
+change has passed the full source suite and standalone suite in Docker on
+Linux ARM64 with Node.js 26.8.2 (87 source tests passed, 7 skipped; all 94
+standalone tests passed). The updated redaction has not been physically
+revalidated.
+
 Espressif documents the ESP32-S3 second-stage bootloader at flash offset
 `0x00000`; the WG1200's validated partition table begins at `0x00C000`, so
 `0x00000..0x00BFFF` is the device-specific upper bound for that flash area.

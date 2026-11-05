@@ -77,4 +77,11 @@ describe('output redaction', () => {
     expect(json.keyBlocks[0].readDiagnostic).toEqual(diagnostic);
     expect(redactOutput(`Public key hash: ${digest}`)).toBe('Public key hash: [REDACTED PUBLIC KEY]');
   });
+
+  it('covers telemetry station IDs, serial fragments, mDNS identity and public API locations', () => {
+    const text = redactOutput('Station ID, Val: 15428\nI: {"ws_fo_id": "0x00001234"}\nS/N: ABCD123456\nI MdnsDiscovery: mDNS announced: wxm-gw-a1b2c3.local, service: _weatherxm._tcp (id: [REDACTED MAC]:11:22:33:44)\nI PubApi: address=Example City, ZZ; reset=1; boot=8\n');
+    for (const secret of ['15428', '0x00001234', 'ABCD123456', 'wxm-gw-a1b2c3.local', '11:22:33:44', 'Example City, ZZ']) expect(text).not.toContain(secret);
+    expect(text).toContain('reset=1');
+    expect(text).toContain('boot=8');
+  });
 });

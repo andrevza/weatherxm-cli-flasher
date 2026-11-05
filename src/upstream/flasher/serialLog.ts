@@ -72,6 +72,12 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
 export class LogSanitizer {
   private inRedactionBlock = false;
 
+  private inRadioPacket = false;
+
+  private inRadioPayload = false;
+
+  public constructor(private readonly options: { suppressRadioPayloads?: boolean } = {}) {}
+
   public sanitizeLine(line: string): string | null {
     const trimmed = line.trim();
 
@@ -89,9 +95,30 @@ export class LogSanitizer {
       return null;
     }
 
+    if (this.options.suppressRadioPayloads) {
+      if (/---.*\bPacket\s+(?:Received|Response)\b.*---/i.test(trimmed)) {
+        this.inRadioPacket = true;
+        this.inRadioPayload = false;
+        return line;
+      }
+      if (this.inRadioPacket && /^={3,}\s*$/.test(trimmed)) {
+        if (this.inRadioPayload) {
+          this.inRadioPayload = false;
+          this.inRadioPacket = false;
+        } else {
+          this.inRadioPayload = true;
+        }
+        return line;
+      }
+      if (this.inRadioPayload && /^(?:[0-9a-f]{2}(?:\s+|$)){2,}$/i.test(trimmed)) {
+        const bytes = trimmed.split(/\s+/).filter(Boolean).length;
+        return `[REDACTED RADIO PAYLOAD; ${bytes} bytes]`;
+      }
+    }
+
     return line
-      .replace(/(?:[0-9a-fA-F]{64})/g, '[REDACTED_64_HEX]')
-      .replace(/(?:wifi_password|pass|secret|token)\s*[:=]\s*\S+/gi, '$1=[REDACTED]');
+      .replace(/[0-9a-fA-F]{64}/gi, (digest, index: number, source: string) => /sha-?256\s*[:=]?\s*$/i.test(source.slice(Math.max(0, index - 16), index)) ? digest : '[REDACTED_64_HEX]')
+      .replace(/\b(wifi_password|pass|secret|token)\s*([:=])\s*\S+/gi, '$1$2[REDACTED]');
   }
 
   public sanitizeText(text: string): string {
