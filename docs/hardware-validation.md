@@ -1,5 +1,32 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Latest maintainer-reported trust and dry-run validation (5 November 2026)
+
+The maintainer reports that the Linux ARM64 executable built from commit
+`dc73da4a07eeb6cab5ed8ff8ae4f5ccc01c18622` (Node.js `v26.8.2`, artifact
+SHA-256
+`0946f8f9f5b414be15353e9f027fde0dcf3d7bc202c1488e23ef6b72b9a43a82`)
+completed the following on a Raspberry Pi 5 running Debian ARM64 with 16 KB
+kernel pages:
+
+```sh
+./weatherxm-flash-linux-arm64 security check weatherxm \
+  --port /dev/ttyUSB0 --json --redact
+./weatherxm-flash-linux-arm64 flash weatherxm \
+  --port /dev/ttyUSB0 --dry-run --json --redact
+```
+
+The security command reported `TRUSTED`: RSA-PSS signature and image digest
+valid, signing-key digest matched an eligible non-revoked device key, and the
+candidate met the observed eFuse security-version floor. Installation
+readiness remained `BLOCKED`. The dry run reported active `ota_1`, inactive
+`ota_0`, active OTA sequence 4, proposed sequence 5, target offset `0x420000`,
+installed/selected WeatherXM `0.8.34-g86b609b`, comparison `identical`, and
+`flashModified: false`. This evidence was supplied by the maintainer; Codex did
+not independently access the gateway. It verifies only the named executable
+and read-only flow. It does not validate the protected-region hashing added
+after this commit or any physical recovery procedure.
+
 ## Maintainer-reported Secure Boot validation (4 November 2026)
 
 The maintainer reports that Linux ARM64 executable version `0.1.0`, built
