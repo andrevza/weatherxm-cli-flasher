@@ -1,5 +1,59 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Maintainer-reported validation of the protected-region candidate (5 November 2026)
+
+The maintainer reports that `dist/weatherxm-flash-linux-arm64-protected-region`
+with SHA-256
+`256f8345aa9bc6445c69aa5ce108318e660a477ba8a79bbba6e280ef7d858a16`, embedded
+Git commit `675233492afe6d86b76d219a37a9b36cf2a3a6cf`, ran on a Raspberry Pi 5
+running Debian Linux ARM64 with a 16 KB page kernel. Codex did not connect to
+or independently access the gateway.
+
+The maintainer reports successful `--version --verbose`, `security check
+weatherxm --json --redact`, `info --json --redact`, `verify --json --redact`,
+`status --json --redact`, `flash weatherxm --dry-run --json --redact`, and
+passive `monitor --baud 115200 --timestamp --level info --redact` commands.
+Security output was `TRUSTED`, with valid candidate signature and digest and a
+matching device key. The device reported active WeatherXM
+`0.8.34-g86b609b` in `ota_1`, sequence 4; inactive `ota_0` contained
+`v0.6.1-dirty`. Metadata was valid and unambiguous. The proposed target was
+`ota_0` at `0x420000`, comparison `identical`, and dry-run `flashModified`
+was `false`.
+
+Passive monitor output included:
+
+```text
+W (28449) Utils: Bootloader inventory: unknown pin (May 27 2024, sha=64e8c47e)
+```
+
+The application source review explains this as an app-generated inventory
+based on a SHA-256 of the whole `0x000000..0x00BFFF` pre-table flash area; the
+log says no known pin mapping matched. The reviewed source table's known
+full-region digests also have different prefixes from `64e8c47e`. This is
+useful physical evidence, but is not a bootloader-only digest or exact build
+match. See the updated recovery readiness notes.
+
+No firmware writes, flash erases, OTA metadata changes, or eFuse modifications
+were performed. The preserved-slot before/after hashing has not been exercised
+during a physical firmware write. The latest standalone automated test suite
+remains unverified; these maintainer-reported command runs do not replace that
+suite. They do not establish firmware-installation readiness.
+
+The physical run used the pre-follow-up executable from commit `6752334`.
+This follow-up changes source redaction behavior and its fixtures, so that
+binary does not contain the new redaction rules. It remains preserved at the
+path and checksum above. A new Linux ARM64 candidate was not built here because
+this host has no Node/npm CLI and the authorized Docker daemon was unavailable.
+Rebuild and rerun standalone tests on the Raspberry Pi or another authorized
+native Linux ARM64 host before treating the updated source as covered.
+
+The maintainer also observed application settings, station identifiers,
+credential fields, and location-related data in serial logs. No unredacted
+capture was added to this repository. `--redact` now masks structured and
+labeled station identifiers, credentials/tokens, and location coordinates;
+this remains best-effort for arbitrary application-generated text. Review all
+logs before sharing them.
+
 ## Candidate artifact static review (5 November 2026)
 
 The repository candidate `dist/weatherxm-flash-linux-arm64-protected-region`

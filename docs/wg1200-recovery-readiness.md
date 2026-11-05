@@ -43,13 +43,16 @@ bootloader-only digest still needs a format-aware, Secure-Boot-V2-aware
 boundary determination validated for the installed layout.
 
 The public WeatherXM WG1200 firmware repository and web flasher provide source
-and application firmware workflows, but this review did not identify an
-authoritative bootloader binary with a production build identifier/checksum
-that could be matched to this gateway. Application firmware artifacts cannot
-stand in for the bootloader. This finding is limited to the reviewed public
-repositories; it does not prove no vendor-held artifact exists. A future match
-would require the exact parsed installed bytes and an authoritative, signed or
-otherwise trustworthy vendor artifact/build record.
+and application firmware workflows. The firmware repository also contains
+`tools/update_wg1200_bootloader.py`, which builds or validates local signed
+bootloader artifacts, checks configured safety settings and Secure Boot V2
+signature information, and has device backup/update modes. No exact production
+artifact is tracked in the reviewed checkout, and no matching artifact was
+located; the reviewed [GitHub Releases page](https://github.com/WeatherXM/wg1200-firmware/releases)
+lists no releases. The helper is a build/replacement tool, not evidence that
+its current source output matches this gateway. Its backup-only path exports
+raw device data; it was not run. Application firmware artifacts cannot stand
+in for the bootloader. This review does not prove no vendor-held artifact exists.
 
 Compile-time OTA rollback support remains unknown for the installed unit.
 ESP-IDF says rollback is implemented by the bootloader and is controlled by
@@ -57,6 +60,66 @@ build configuration; observable application metadata or absent log strings do
 not establish that configuration. The public source profile is useful context,
 not proof of the installed binary's configuration. Likewise, absence of boot
 logs is inconclusive.
+
+### Maintainer-reported app-side bootloader inventory
+
+The Pi monitor report now includes `unknown pin (May 27 2024, sha=64e8c47e)`.
+In the stated WeatherXM source revision
+`a30374b045c138dac3f6dd4267ef8eb7390a7670`, this line is produced by
+`main/utils.cpp:1404-1528` in `Utils::detect_bootloader()`, called by the
+getters in `tb_json.cpp`. The function reads `0xC000` bytes from flash offset
+zero with `esp_flash_read()` in 2048-byte chunks, computes SHA-256 over that
+entire region, and exposes the full digest as `gw_bootloader_sha256`. The
+reported 8-hex-character value is the log prefix of that region hash; it is
+not a hash of only the parsed ESP image. The application therefore did inspect
+flash independently of its own build metadata, assuming the reported line is
+from this implementation and the hash completed successfully.
+
+`KNOWN_BOOTLOADERS` compares the full `0xC000`-byte-region digest against five
+known entries labeled with their factory-reset GPIO mapping. `unknown pin`
+means no table entry matched, so the source has no known reset-pin mapping for
+the observed image. It does not mean the chip pin itself is unknown. The
+prefix `64e8c47e` does not match the prefixes of any entry in the reviewed
+table; the full device digest was not included in the report. The source scans
+raw region bytes for the first string shaped like `Mmm DD 20YY`; it does not
+parse or validate an ESP bootloader descriptor before printing it. `May 27
+2024` is consistent with the bootloader compile date and the public config
+enables `CONFIG_BOOTLOADER_COMPILE_TIME_DATE`, but the scan alone cannot prove
+the date belongs to the image. The source's current full table, date, and
+region hash are useful classification evidence, not a matching official
+bootloader artifact or proof of its complete Kconfig.
+
+The same source publishes the full region digest as `gw_bootloader_sha256` in
+its ThingsBoard attribute JSON. If that existing telemetry is available, the
+operator can compare the full value with the source table without exporting a
+flash dump. The tool's device modes were not run. In particular,
+`--backup-only` creates raw device backups and is not a no-export diagnostic.
+
+The reviewed `sdkconfig.wg1200_release` leaves
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` unset. The same source's
+`main/boot_guard.cpp` implements an application-level fallback after three
+classified crash boots, using the other OTA slot if it has a valid app
+descriptor; a power-on reset clears the crash counter, and 600 seconds of
+healthy uptime or ThingsBoard connectivity clears it as well. This guard can
+only run after an application starts and initializes NVS. The physical log
+proves the running application executed its bootloader inventory code, but it
+does not identify that app's exact source build or prove this `boot_guard.cpp`
+was installed. The boot-guard source is already present in WeatherXM's public
+v0.8.27 source snapshot, earlier than the maintainer-reported app version
+`0.8.34`; that makes deployment plausible but the app version string is not a
+source/binary match. Keep deployed rollback behavior unconfirmed.
+
+Generic ESP-IDF Secure Boot V2 documentation says the bootloader tries another
+application image if verification of the selected image fails. Generic ESP-IDF
+OTA data uses two sectors with CRC/sequence selection and rollback states are
+conditional on bootloader configuration. Those are platform behaviors, not
+verified behavior of the unmatched installed bootloader. The CLI's own
+transaction writes only the inactive OTA slot and changes one validated OTA
+metadata sector after checks; it preserves the active slot in code and in
+mocked tests. The maintainer's dry run selected `ota_0` while `ota_1` was
+active, but no physical write exercised that preservation. A partial metadata
+commit can leave selection uncertain; do not manually repair or clear
+`otadata`.
 
 To observe normal startup messages, connect the CH340 and passively listen:
 
@@ -92,10 +155,11 @@ restriction not enabled, and security-version floor 0.
 The supplied dry run reported 16 MiB flash, active `ota_1` sequence 4,
 inactive/target `ota_0` at `0x420000`, proposed sequence 5, active and selected
 WeatherXM `0.8.34-g86b609b`, comparison `identical`, and `flashModified: false`.
-The earlier supplied inspection also reported `ota_0` at `v0.6.1-dirty`. No
-flash backup or read of the second-stage bootloader is reported. These records
-are maintainer-supplied evidence for the named executable, not evidence that
-the modified source in this follow-up has run on hardware.
+The earlier supplied inspection also reported `ota_0` at `v0.6.1-dirty`. The
+maintainer subsequently reported the app-side pre-table hash log documented
+below, but supplied neither a raw flash capture nor the full hash. No flash
+backup is reported. These are maintainer-supplied records, not Codex hardware
+access.
 
 ## B. Protected-region integrity matrix
 
@@ -158,8 +222,9 @@ binary itself is exactly that size. ESP-IDF describes the ESP32-S3 bootloader
 load address and image format in its [startup guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/startup.html)
 and [bootloader image format guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-reference/system/bootloader_image_format.html).
 
-No installed bootloader bytes, hash, build identifier, or exact official
-bootloader artifact has been supplied. Public source commit
+No exact bootloader binary, image-only digest, or artifact match has been
+supplied. The maintainer-reported app-side full pre-table-area digest prefix is
+new content evidence, not an image-only hash. Public source commit
 `a30374b045c138dac3f6dd4267ef8eb7390a7670` is evidence about a source
 snapshot only. Its WG1200 release config enables Secure Boot V2 and signed
 apps, does not set ESP-IDF application rollback, and enables UART ROM download
@@ -175,24 +240,27 @@ proof that logging or those options are enabled in the gateway. Normal logs
 can reveal a bootloader version string, selected app offset, and some failures;
 they cannot establish rollback Kconfig. Missing log lines prove nothing.
 
-A bounded read-only dump for inspection is technically possible after
-validating the device's 16 MiB flash and table offset. With Espressif esptool
-5.x, the command is:
+Prefer retrieving the existing `gw_bootloader_sha256` telemetry attribute
+before extracting anything. The app already computes this region digest at
+boot; a raw flash capture would add sensitive device data without improving
+the current `unknown pin` classification. Only if independent byte-level
+corroboration is specifically needed, a bounded read-only capture is
+technically possible after validating the device's 16 MiB flash and table
+offset. With Espressif esptool 5.x, the commands are:
 
 ```sh
 esptool --chip ESP32-S3 --port /dev/ttyUSB0 --baud 115200 \
   read-flash 0x0 0xC000 /secure/local/path/wg1200-boot-region.bin
 sha256sum /secure/local/path/wg1200-boot-region.bin
-esptool image-info /secure/local/path/wg1200-boot-region.bin
 ```
 
 This performs reads only and creates a local binary containing the reserved
-bootloader area up to (not including) the validated partition table. Do not
-share it or console logs without review. It may include padding; compare against
-an authoritative artifact only after normalizing the same address span and
-confirming its signature/image structure. A hash or missing string by itself
-does not establish build options. No exact WeatherXM bootloader artifact was
-found in the inspected source checkouts.
+pre-table area, not a proven exact bootloader file. Do not share it or console
+logs. Its hash can corroborate `gw_bootloader_sha256` only if the read returns
+all 0xC000 bytes and no flash contents changed. Because this capture contains
+padding and possibly Secure Boot V2 signature data, do not call it a
+bootloader-only digest or infer configuration from it. No exact matching
+WeatherXM artifact was found in the inspected source checkout.
 
 ## D. ROM-loader recovery capabilities
 
@@ -233,9 +301,14 @@ test of any recovery method was performed.
 
 ## E. Recovery inventory
 
-No pre-existing full-flash or partition backup is recorded. Read-only backup
-is technically possible where ROM download commands and flash access permit
-it, but it would contain credentials and device-specific data. The actual
+No pre-existing full-flash or partition backup is recorded. The app-side
+48 KiB region digest provides integrity evidence for the pre-table area but
+not a retained bootloader file. Read-only full-content inventory is technically
+possible where ROM download commands and flash access permit it, but the
+resulting files would contain credentials and device-specific data. Current
+CLI inspection establishes partition metadata, descriptors, selected
+identity/eFuse evidence, and OTA state; it does not hash or retain every
+partition's full contents as a standalone read-only inventory. The actual
 flash-encryption eFuse state must first be established from read-only eFuse
 summary evidence; the public source's flash-encryption build settings are not
 device evidence. Store any backup encrypted, locally, with restricted access,
@@ -246,7 +319,7 @@ another gateway is unsafe.
 | Data | Recovery role | Device-specific / reconstructable | Backup and restore position |
 |---|---|---|---|
 | Flash chip / full 16 MiB | Capacity and geometry bound all offsets | Physical flash model is not identified in supplied evidence; 16 MiB capacity is reported | Read-only `flash-id` is possible. Do not infer manufacturer/model from capacity alone. |
-| Bootloader `0x00000` to table boundary | Starts second-stage boot and enforces signatures | Binary/configuration not identified; source rebuild may not match release | Read-only bounded dump/hash possible. Restore only an exact supported signed artifact under a reviewed procedure; not available now. |
+| Bootloader region `0x00000..0x00BFFF` | Starts second-stage boot and enforces signatures | App-reported full-region hash exists in principle; supplied log has only prefix `64e8c47e`, unmatched in reviewed source table. Exact image/configuration not identified. | App reads/hash the region; no raw dump retained. Restore only an exact supported signed artifact under a reviewed procedure; no matching artifact established. |
 | Partition table `0x0C000/0x1000` | Defines all partition boundaries | Public layout is reproducible; installed table was reportedly validated | Back up with full flash inventory; restoration could change layout and strand data. Do not rewrite as recovery shortcut. |
 | Factory app `0x020000/0x400000` | Potential fallback when OTA metadata selects factory | Firmware bytes/version may be factory-specific to this batch, not expected to contain individual credentials | Full read and SHA-256 possible; currently no backup. Preserve. Replacement must be trusted/signed and compatible. |
 | Active OTA app (`ota_1` at reported state) | Current known-good application | Firmware image can be re-downloaded only if exact signed release artifact remains available; its bytes are not guaranteed from descriptor alone | No backup recorded. Preserve and hash before any recovery. |
@@ -371,8 +444,9 @@ is prohibited.
 
 - The installed bootloader binary/configuration and exact rollback semantics
   remain unidentified.
-- UART logs and bootloader-range read/hash have not been captured for this
-  follow-up.
+- The Pi monitor line is maintainer-reported; the full
+  `gw_bootloader_sha256` telemetry value and an exact artifact match have not
+  been obtained.
 - Flash-encryption state and an approved sensitive backup procedure are
   unknown; no full backup exists.
 - Recovery by CH340 after failed application boot has not been demonstrated.
@@ -385,7 +459,8 @@ is prohibited.
 
 - [ESP32-S3 Secure Boot V2](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/security/secure-boot-v2.html)
 - [ESP32-S3 OTA and rollback](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/system/ota.html)
+- [ESP32-S3 bootloader image description](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-reference/system/bootloader_image_format.html)
 - [ESP32-S3 ROM download security configuration](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/kconfig.html)
 - [ESP32-S3 esptool read-flash command](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/esptool/basic-commands.html)
-- WeatherXM public firmware source: `a30374b045c138dac3f6dd4267ef8eb7390a7670` (source evidence only)
+- WeatherXM [`main/utils.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/utils.cpp#L1381-L1528), [`main/tb_json.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/tb_json.cpp#L383-L394), [`main/boot_guard.cpp`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/main/boot_guard.cpp), [`sdkconfig.wg1200_release`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/sdkconfig.wg1200_release), and [`tools/update_wg1200_bootloader.py`](https://github.com/WeatherXM/wg1200-firmware/blob/a30374b045c138dac3f6dd4267ef8eb7390a7670/tools/update_wg1200_bootloader.py) at reviewed source revision `a30374b045c138dac3f6dd4267ef8eb7390a7670` (source evidence only)
 - WeatherXM web-flasher: `35b2ecc4ccb31799ecd720609786362a99b3e33a` (implementation reference only)

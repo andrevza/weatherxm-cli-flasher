@@ -672,24 +672,33 @@ protected digests pass.
 
 The reported device state and source-vs-device distinctions are documented in
 [`wg1200-recovery-readiness.md`](wg1200-recovery-readiness.md). In summary, ROM
-loader entry and eFuse reads were demonstrated by the maintainer; the installed
-second-stage bootloader binary/configuration was not read or matched. The
-public WeatherXM source profile disables IDF app rollback and contains an
-application crash guard; neither proves installed behavior. Secure Boot trust
-does not establish download-mode write permission, app fallback behavior, or
-recovery of a corrupt second-stage bootloader. The CH340 ROM path is plausible
-because it worked for read-only inspection and relevant download-disable
-eFuses were reported clear, but recovery after a failed app has not been
-demonstrated. Flash-encryption state, a validated sensitive backup, an exact
-bootloader artifact, and a vendor-approved recovery procedure remain missing.
+loader entry and eFuse reads were demonstrated by the maintainer. A later
+maintainer-reported passive monitor run produced an application-side bootloader
+inventory line. The source implementation reads and SHA-256 hashes the whole
+`0x000000..0x00BFFF` pre-table area and maps a full digest against known
+factory-reset-pin labels. Its `unknown pin` output with prefix `64e8c47e`
+provides useful evidence that the region was read and did not match the
+reported application's known table; it is not a bootloader-only hash or exact
+artifact match. The date is found by scanning raw bytes, not by parsing and
+validating a bootloader descriptor. Installed bootloader configuration and
+exact rollback semantics remain unknown. The source profile disables IDF app
+rollback and contains an application crash guard; neither proves the exact
+running app/bootloader build. Secure Boot trust does not establish download-
+mode write permission, app fallback behavior, or recovery of a corrupt
+second-stage bootloader. The CH340 ROM path has demonstrated read-only access,
+but recovery after failed app boot has not been demonstrated. Flash-encryption
+state, a validated sensitive backup, an exact matching bootloader artifact,
+and a vendor-approved recovery procedure remain missing.
 
 Normal boot logs can be passively captured with `monitor --port ... --baud
 115200 --redact`; the public release profile enables INFO logs at UART0
-115200. Use one normal reset only if safe. Logs can show version/slot/errors,
-not establish Kconfig behavior; missing output is inconclusive. A
-partition-bounded esptool read can inspect flash offset zero through the
-validated table offset, but no binary match has been established. Do not
-restore or rewrite that data based on a hash alone.
+115200. The supplied log includes the inventory line; logs can show
+version/slot/errors but do not establish Kconfig behavior, and missing output
+is inconclusive. The app also publishes the full `gw_bootloader_sha256`
+pre-table-area digest as a ThingsBoard attribute. If that existing telemetry
+is available, it can be compared with the known full-region table without
+exporting flash bytes. No raw region capture or matching artifact was supplied.
+Do not restore or rewrite the region based on a hash alone.
 
 ### Updated readiness
 

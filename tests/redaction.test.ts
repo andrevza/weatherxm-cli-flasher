@@ -6,7 +6,11 @@ describe('output redaction', () => {
     const output = redactOutput(JSON.stringify({
       macAddress: 'AA:BB:CC:DD:EE:FF', deviceName: 'WeatherXM WG1200 1234',
       gatewayId: 'gateway-secret-id', device_id: 'device-secret-id', serialNumber: 'serial-secret', serial_number: 'serial-secret-snake', certificate: [1, 2, 3],
+      stationId: 'station-secret-id',
       identity: { valid: true, commonName: 'gateway-secret.example', fingerprint: 'AB12CD34EF56', publicKeyHash: 'a'.repeat(64) },
+      mqtt_username: 'wxm-user', mqtt_password: 'wxm-password', accessToken: 'access-secret', refresh_token: 'refresh-secret',
+      location: { latitude: -33.9, longitude: 18.4 },
+      cloud_ws_id: 'cloud-station-id', ws_sn: 'station-serial', ws_pubkey: 'station-public-key', gps_lat: -33.9, gps_lon: 18.4,
       chip: 'ESP32-S3', flashBytes: 16777216,
     }));
     const parsed = JSON.parse(output);
@@ -17,7 +21,18 @@ describe('output redaction', () => {
     expect(parsed.serialNumber).toBe('[REDACTED SERIAL NUMBER]');
     expect(parsed.serial_number).toBe('[REDACTED SERIAL NUMBER]');
     expect(parsed.certificate).toBe('[REDACTED CERTIFICATE]');
+    expect(parsed.stationId).toBe('[REDACTED STATION ID]');
     expect(parsed.identity).toEqual({ valid: true, commonName: '[REDACTED COMMON NAME]', fingerprint: '[REDACTED CERTIFICATE FINGERPRINT]', publicKeyHash: '[REDACTED PUBLIC KEY]' });
+    expect(parsed.mqtt_username).toBe('[REDACTED CREDENTIAL]');
+    expect(parsed.mqtt_password).toBe('[REDACTED CREDENTIAL]');
+    expect(parsed.accessToken).toBe('[REDACTED CREDENTIAL]');
+    expect(parsed.refresh_token).toBe('[REDACTED CREDENTIAL]');
+    expect(parsed.location).toBe('[REDACTED LOCATION]');
+    expect(parsed.cloud_ws_id).toBe('[REDACTED STATION ID]');
+    expect(parsed.ws_sn).toBe('[REDACTED STATION ID]');
+    expect(parsed.ws_pubkey).toBe('[REDACTED PUBLIC KEY]');
+    expect(parsed.gps_lat).toBe('[REDACTED LOCATION]');
+    expect(parsed.gps_lon).toBe('[REDACTED LOCATION]');
     expect(parsed.chip).toBe('ESP32-S3');
     expect(parsed.flashBytes).toBe(16777216);
   });
@@ -34,6 +49,24 @@ describe('output redaction', () => {
     expect(output).toContain('ESP32-S3');
     expect(redactOutput('Device validation failed: partition table mismatch')).toContain('Device validation failed: partition table mismatch');
     expect(redactOutput('-----BEGIN CERTIFICATE-----\nsynthetic-certificate-bytes\n-----END CERTIFICATE-----')).toBe('[REDACTED CERTIFICATE]');
+  });
+
+  it('redacts credentials, station identifiers and coordinates in serial-style JSON and key-value lines', () => {
+    const prefixed = redactOutput('I (123) settings: {"station_id":"station-secret","cloud_ws_id":"cloud-station-secret","ws_sn":"station-serial-secret","ws_pubkey":"public-key-secret","mqtt_password":"mqtt-secret","access_token":"token-secret","gps_lat":-33.9,"gps_lon":18.4,"coordinates":[-33.9,18.4]}');
+    expect(prefixed).not.toContain('station-secret');
+    expect(prefixed).not.toContain('cloud-station-secret');
+    expect(prefixed).not.toContain('station-serial-secret');
+    expect(prefixed).not.toContain('public-key-secret');
+    expect(prefixed).not.toContain('mqtt-secret');
+    expect(prefixed).not.toContain('token-secret');
+    expect(prefixed).not.toContain('-33.9');
+    expect(prefixed).not.toContain('18.4');
+
+    const plain = redactOutput('station id: station-secret; ws_id: 12345; ws_sn: serial-secret; ws_pubkey: public-key-secret; MQTT password: mqtt-secret; access token: token-secret; GPS latitude: -33.9; GPS longitude: 18.4');
+    for (const secret of ['station-secret', '12345', 'serial-secret', 'public-key-secret', 'mqtt-secret', 'token-secret', '-33.9', '18.4']) expect(plain).not.toContain(secret);
+    expect(plain).toContain('[REDACTED STATION ID]');
+    expect(plain).toContain('[REDACTED CREDENTIAL]');
+    expect(plain).toContain('[REDACTED LOCATION]');
   });
 
   it('redacts Secure Boot public-key digests in text and JSON', () => {
