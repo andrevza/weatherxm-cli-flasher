@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, sign, constants } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { assertInstallSecurityEvidence } from '../src/device.js';
+import { assertInstallSecurityEvidence, assertStageOnlySecurityEvidence } from '../src/device.js';
 import { compareSecureBootTrust, ESP32S3_EFUSE, readEsp32S3SecureBootState, verifySecureBootV2Image } from '../src/upstream/flasher/secureBoot.js';
 
 function sha(data: Uint8Array) { return new Uint8Array(createHash('sha256').update(data).digest()); }
@@ -164,6 +164,23 @@ describe('ESP32-S3 Secure Boot V2 read-only evidence', () => {
     expect(() => assertInstallSecurityEvidence(image, state)).toThrow(/anti-rollback configuration is not established/);
     const invalid = { ...image, signatureValid: false };
     expect(() => assertInstallSecurityEvidence(invalid, state)).toThrow(/signature verification failed/);
+  });
+
+  it('permits stage-only security preflight with verified slot-0 trust and unknown bootloader rollback, but rejects concrete eFuse blockers', async () => {
+    const { data, digest } = fixture();
+    const image = verifySecureBootV2Image(data); image.secureVersion = 2;
+    const readState = async (reader: (address: number) => number = deviceRegisters({ digest })) =>
+      readEsp32S3SecureBootState(async (address) => reader(address), { model: 'ESP32-S3', revision: '0.2' });
+    const trusted = await readState();
+    expect(trusted.antiRollbackEnforcement.state).toBe('unknown');
+    expect(() => assertStageOnlySecurityEvidence(image, trusted)).not.toThrow();
+    await expect(readState(deviceRegisters({ digest: '22'.repeat(32) })).then((state) => assertStageOnlySecurityEvidence(image, state))).rejects.toThrow(/signer\/security-version check/);
+    await expect(readState(deviceRegisters({ digest, revoke: true })).then((state) => assertStageOnlySecurityEvidence(image, state))).rejects.toThrow(/signer\/security-version check/);
+    await expect(readState((address) => address === ESP32S3_EFUSE.block0 + 8 ? deviceRegisters({ digest })(address) | (1 << 18) : deviceRegisters({ digest })(address))
+      .then((state) => assertStageOnlySecurityEvidence(image, state))).rejects.toThrow(/flash encryption is enabled/);
+    await expect(readState((address) => address === ESP32S3_EFUSE.block0 + 16 ? deviceRegisters({ digest })(address) | 1 : deviceRegisters({ digest })(address))
+      .then((state) => assertStageOnlySecurityEvidence(image, state))).rejects.toThrow(/ROM serial flash writing is restricted/);
+    expect(() => assertStageOnlySecurityEvidence({ ...image, signatureValid: false }, trusted)).toThrow(/signature is invalid/);
   });
 
   it('keeps unknown security-version evidence unknown and reports a below-floor candidate as incompatible', async () => {

@@ -15,6 +15,11 @@ import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from 
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
 import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
 import { compareSecureBootTrust, verifySecureBootV2Image, type SecureBootDeviceState, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
+import { createInactiveBackup, validateInactiveBackup, runStageOnlyTransaction, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
+import { getApplicationEraseRange } from './upstream/flasher/writeGuard.js';
+import { DEFAULT_MANIFEST_URL } from './catalog.js';
+
+export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
 export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; }
 export interface FlashConfirmation {
@@ -52,6 +57,157 @@ export function assertInstallSecurityEvidence(image: SecureBootImageEvidence, de
   if (device.antiRollbackEnforcement.state !== 'disabled') {
     throw new Error('Installed bootloader anti-rollback configuration is not established; application write was not attempted');
   }
+}
+
+export function assertStageOnlySecurityEvidence(image: SecureBootImageEvidence, device: SecureBootDeviceState): void {
+  if (!device.chip.model.toLowerCase().includes('esp32-s3') || device.chip.status !== 'verified') throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: unsupported or unverified chip');
+  if (!image.imageFormatValid || !image.imageDigestValid || !image.signatureValid) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: candidate Secure Boot V2 signature is invalid');
+  if (device.secureBootV2.state !== 'enabled' || device.secureBootV2.status !== 'verified') throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: device Secure Boot V2 state is not verified enabled');
+  const trust = compareSecureBootTrust(image, device);
+  if (trust.result !== 'TRUSTED' || trust.securityVersionStatus !== 'meets-floor') throw new Error(`STAGING BLOCKED — PREFLIGHT FAILED: candidate signer/security-version check is ${trust.result}/${trust.securityVersionStatus}`);
+  const digest0 = device.keyBlocks.find((block) => block.purposeCode === 9);
+  if (!digest0 || digest0.digestStatus !== 'verified' || !digest0.publicKeyHash || device.revocation[0]?.revoked !== false ||
+      !image.blocks.some((block) => block.blockValid && block.publicKeyHash?.toLowerCase() === digest0.publicKeyHash!.toLowerCase())) {
+    throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: candidate signer does not match active, non-revoked Secure Boot digest slot 0');
+  }
+  if (device.flashEncryption.status !== 'verified' || device.flashEncryption.enabled !== false ||
+      device.flashEncryption.cryptCount !== 0 || device.flashEncryption.disableManualEncryption !== false) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: flash encryption is enabled or unknown');
+  if (device.downloadMode.status !== 'verified' || device.downloadMode.disableAllDownload !== false ||
+      device.downloadMode.disableUsbSerialJtagDownload !== false || device.downloadMode.disableUsbOtgDownload !== false ||
+      device.downloadMode.securityDownloadEnabled !== false) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: ROM serial flash writing is restricted or unknown');
+}
+
+/** Stream a full inactive OTA partition backup to disk; never reads credential partitions. */
+export async function backupInactiveOta(options: DeviceOptions & { outputPath: string }): Promise<{ manifest: InactiveBackupManifest; manifestPath: string }> {
+  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const port = new NodeSerialPort(options.portPath, trace);
+  const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
+  const transport = new Wg1200Transport({ log: (message) => process.stderr.write(`[wg1200] ${message}\n`), error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`), debug: (message) => process.stderr.write(`${message}\n`) }, options.traceSerial);
+  try {
+    const inspection = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    assertSafeInspection(inspection, await exactLayoutErrors(transport));
+    if (inspection.otadata.isAmbiguous || !['ota_0', 'ota_1'].includes(inspection.otadata.activeSlot)) throw new Error('BACKUP FAILED: OTA selection is ambiguous; inactive partition cannot be established');
+    const activeSlot = inspection.otadata.activeSlot as 'ota_0' | 'ota_1';
+    const targetSlot = inspection.otadata.targetSlot as 'ota_0' | 'ota_1';
+    if (targetSlot === activeSlot) throw new Error('BACKUP FAILED: selected partition is active; refusing to create an inactive-slot backup');
+    const partition = targetSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+    if (inspection.otadata.targetOffset !== partition.offset || partition.size !== WG1200_CONSTANTS.MAX_APP_SIZE_BYTES) throw new Error('BACKUP FAILED: validated target does not match an exact WG1200 OTA partition');
+    const security = await transport.readSecureBootConfiguration();
+    const manifest = await createInactiveBackup({
+      outputPath: options.outputPath, label: targetSlot, offset: partition.offset, length: partition.size,
+      chip: { model: security.chip.model, revision: security.chip.revision },
+      readChunks: transport.readRegionChunks(partition.offset, partition.size),
+      hashLivePartition: () => transport.hashRegionSha256(partition.offset, partition.size),
+    });
+    return { manifest, manifestPath: `${options.outputPath}.manifest.json` };
+  } finally { await transport.disconnect(); }
+}
+
+/** First physical stage-only operation: writes only ota_0 and never commits OTA metadata. */
+export async function stageOnlyFirmware(options: DeviceOptions & {
+  backupManifestPath: string;
+  confirm: (summary: StageOnlySummary) => Promise<boolean>;
+}): Promise<{
+  outcome: 'STAGED AND VERIFIED — NOT ACTIVATED'; targetSlot: 'ota_0'; activeSlot: 'ota_1';
+  firmwareVersion: string; secureBootSignatureVerified: true; signerSlot0Trusted: true;
+  firmwareSha256: string; actualSha256: string; expectedMd5: string; hardwareMd5Verified: true; bytesRead: number;
+  targetRange: { start: number; end: number }; eraseRange: { start: number; end: number };
+  backupSha256: string; otaMetadataUnchanged: true; activeApplicationUnchanged: true;
+  protectedRegionsUnchanged: true; automaticActivation: false;
+}> {
+  const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL);
+  if (selected.entry.version !== '0.8.34' || selected.entry.sha256.toLowerCase() !== STAGE_ONLY_WXM_0834_SHA256 ||
+      selected.descriptor.firmwareType !== 'weatherxm' || selected.entry.category !== 'weatherxm') {
+    throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: official WeatherXM 0.8.34 artifact identity does not match the approved digest');
+  }
+  const image = verifySecureBootV2Image(selected.verified.data);
+  image.secureVersion = selected.descriptor.secureVersion;
+  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const port = new NodeSerialPort(options.portPath, trace);
+  const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
+  const transport = new Wg1200Transport({ log: (message) => process.stderr.write(`[wg1200] ${message}\n`), error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`), debug: (message) => process.stderr.write(`${message}\n`) }, options.traceSerial);
+  let released = false;
+  let writeStarted = false;
+  try {
+    const before = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    assertSafeInspection(before, await exactLayoutErrors(transport));
+    if (before.otadata.isAmbiguous || before.otadata.activeSlot !== 'ota_1' || before.otadata.targetSlot !== 'ota_0' ||
+        before.otadata.targetOffset !== WG1200_CONSTANTS.APP_OTA_0.offset) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: live OTA state must select ota_1 with ota_0 inactive');
+    if (!isValidAppDescriptor(before.currentFirmware) || before.currentFirmware?.firmwareType !== 'weatherxm' || before.currentFirmware.version !== '0.8.34-g86b609b') {
+      throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: active ota_1 firmware is not the confirmed WeatherXM 0.8.34-g86b609b build');
+    }
+    const security = await transport.readSecureBootConfiguration();
+    assertStageOnlySecurityEvidence(image, security);
+    const target = WG1200_CONSTANTS.APP_OTA_0;
+    const backup = await validateInactiveBackup(options.backupManifestPath, { label: 'ota_0', offset: target.offset, length: target.size });
+    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size);
+    if (liveBackupHash.toLowerCase() !== backup.manifest.sha256.toLowerCase()) throw new Error('STAGING BLOCKED — BACKUP INVALID: live ota_0 no longer matches the verified backup');
+
+    const otadataBefore = await transport.readOtadataSnapshot();
+    if (otadataBefore.byteLength !== WG1200_CONSTANTS.OTADATA.size) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: incomplete OTA metadata snapshot');
+    const metadataState = determineActiveBootSlot(otadataBefore);
+    if (metadataState.isAmbiguous || metadataState.activeSlot !== 'ota_1' || metadataState.targetSlot !== 'ota_0' || metadataState.targetOffset !== target.offset) {
+      throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: raw OTA metadata does not confirm active ota_1 and inactive ota_0');
+    }
+    const protectedSnapshots = await transport.snapshotProtectedRegions('ota_1');
+    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset);
+    const eraseRange = getApplicationEraseRange(target.offset, selected.verified.data.byteLength);
+    const summary: StageOnlySummary = {
+      deviceModel: security.chip.model, deviceName: before.deviceName ?? 'WeatherXM WG1200', activeSlot: 'ota_1', activeFirmware: before.currentFirmware?.version ?? null,
+      targetSlot: 'ota_0', targetOffset: target.offset, targetLength: target.size,
+      firmwareVersion: selected.entry.version, firmwareSha256: selected.verified.sha256, imageBytes: selected.verified.data.byteLength,
+      backupFile: backup.backupPath, backupSha256: backup.manifest.sha256,
+      backupFirmwareVersion: backup.manifest.firmwareVersion,
+      backupSignatureStatus: backup.manifest.signatureVerification.status,
+      eraseStart: eraseRange.start, eraseEnd: eraseRange.end, flashEncryption: security.flashEncryption.enabled === true,
+      metadataWillChange: false, autoActivation: false,
+    };
+    const confirmed = await options.confirm(summary);
+    const shaReadback = async (offset: number, length: number) => transport.hashRegionSha256(offset, length);
+    const transaction = await runStageOnlyTransaction({
+      revalidate: async () => {
+        const fresh = await transport.inspect();
+        assertSafeInspection(fresh, await exactLayoutErrors(transport));
+        if (fresh.secureCert.sha256 !== before.secureCert.sha256 || fresh.currentFirmware?.appElfSha256 !== before.currentFirmware?.appElfSha256 ||
+            fresh.otadata.activeSlot !== 'ota_1' ||
+            fresh.otadata.targetSlot !== 'ota_0' || fresh.otadata.targetOffset !== target.offset) return false;
+        const currentOtadata = await transport.readOtadataSnapshot();
+        if (!Buffer.from(currentOtadata).equals(Buffer.from(otadataBefore))) return false;
+        if ((await transport.hashRegionSha256(target.offset, target.size)).toLowerCase() !== backup.manifest.sha256.toLowerCase()) return false;
+        if ((await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset)) !== bootloaderHash) return false;
+        return (await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1')).valid;
+      },
+      writeApplication: async (offset, bytes) => { writeStarted = true; await transport.installStageOnlyApplication(offset, 'ota_1', bytes); },
+      verifyHardwareMd5: (offset, md5, length) => transport.verifyApplicationFlash(offset, md5, length),
+      readbackSha256: shaReadback,
+      verifyProtected: async () => {
+        const checked = await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1');
+        const currentBootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset);
+        return currentBootloaderHash === bootloaderHash ? checked : { valid: false, mismatches: ['bootloader region changed'] };
+      },
+      readOtadata: () => transport.readOtadataSnapshot(),
+      resetNormal: async () => {
+        if (!(await transport.hardReset())) throw new Error('normal-mode reset signal was unavailable');
+        released = true;
+      },
+    }, {
+      activeSlot: 'ota_1', targetOffset: target.offset, targetLength: target.size,
+      firmwareBytes: selected.verified.data, expectedSha256: selected.verified.sha256,
+      expectedMd5: md5Hex(selected.verified.data), otadataBefore, confirm: async () => confirmed,
+    });
+    return { outcome: transaction.outcome, targetSlot: 'ota_0', activeSlot: 'ota_1', firmwareVersion: selected.entry.version,
+      secureBootSignatureVerified: true, signerSlot0Trusted: true,
+      firmwareSha256: selected.verified.sha256, actualSha256: transaction.actualSha256,
+      expectedMd5: transaction.expectedMd5, hardwareMd5Verified: transaction.hardwareMd5Verified, bytesRead: transaction.bytesRead,
+      targetRange: transaction.range, eraseRange: { start: eraseRange.start, end: eraseRange.end },
+      backupSha256: backup.manifest.sha256, otaMetadataUnchanged: true, activeApplicationUnchanged: true,
+      protectedRegionsUnchanged: true, automaticActivation: false };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith('STAGING ')) throw error;
+    if (writeStarted) throw new Error(`STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN: ${message}`);
+    throw new Error(`STAGING BLOCKED — PREFLIGHT FAILED: ${message}`);
+  } finally { await transport.disconnect(!released); }
 }
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */

@@ -35,7 +35,10 @@ reports `SPI_BOOT_CRYPT_CNT` (odd parity means flash encryption enabled),
 `ENABLE_SECURITY_DOWNLOAD`. Unknown or incompatible flash-encryption/ROM
 write conditions fail closed. Anti-rollback enforcement is not inferable from
 eFuses alone; the installed bootloader build configuration remains unknown, so
-the install preflight rejects it and the global gate remains blocked.
+the normal-install preflight rejects it and the global OTA-install gate remains
+blocked. The separate stage-only operation does not activate an image and
+therefore leaves the selected boot target unchanged; it still requires all
+live Secure Boot, signer, encryption, ROM-mode, backup and partition checks.
 
 ### Upstream comparison
 
@@ -64,8 +67,10 @@ against unknown rollback settings; Meshtastic is a different firmware family.
 No different compatible WeatherXM upgrade is currently listed. Do not write
 any of these as a test target.
 
-Before a future controlled installation, an operator must complete every item
-below and the maintainer must explicitly resolve the code's `BLOCKED` gate:
+Before normal OTA installation, the operator must resolve every item below and
+the maintainer must explicitly resolve the code's `BLOCKED` gate. For the
+separate non-activating first stage-only test, see
+[`wg1200-stage-only-hardware-test.md`](wg1200-stage-only-hardware-test.md).
 
 1. Build/use the reviewed candidate and record its manifest SHA-256; verify
    image RSA-PSS and signer digest against read-only device eFuse evidence.
@@ -80,18 +85,17 @@ below and the maintainer must explicitly resolve the code's `BLOCKED` gate:
    target inactive slot, preserved active slot, and failed-boot risk. Do not
    use `--force` or any erase/full-flash command as a security bypass.
 5. No current manifest entry is a suitable distinct WeatherXM upgrade, so
-   there is no valid install command to run today. If a compatible signed
-   candidate becomes available and every blocker is resolved, the guarded
-   interactive invocation is `wg1200 flash <approved-firmware-key> --port
-   /dev/ttyUSB0`. This single transaction writes only the inactive OTA
-   application partition and commits OTA metadata only after MD5/SHA-256,
-   protected-region, and metadata checks. Stop if any check fails.
+   there is no valid normal-install command today. The stage-only 0.8.34 test
+   overwrites inactive `ota_0` but keeps current `ota_1` selected and leaves
+   metadata untouched; its procedure is documented separately.
 6. Use `wg1200 monitor --boot --port /dev/ttyUSB0 --redact` to review boot
    output. Independently verify application health, Wi-Fi and MQTT before
    declaring service restored.
 
 These are preparation steps, not an executable authorization: with the
-current source gate, `flash` cannot write. Recovery branches for boot failure
+current source gate, normal `flash <firmware>` cannot write. Only the separately
+guarded stage-only operation is permitted after its mandatory checks and
+interactive confirmation. Recovery branches for boot failure
 are limited to read-only observation and vendor support; do not clear
 `otadata`, erase flash, or assume the older inactive image is recoverable.
 

@@ -174,6 +174,20 @@ describe('read-only safety validation', () => {
     expect(writeFlash).not.toHaveBeenCalled();
   });
 
+  it('stage-only writer accepts only ota_0 while ota_1 is active', async () => {
+    const transport = new Wg1200Transport();
+    const writeFlash = vi.fn(async (_options: any) => undefined);
+    (transport as any).loader = { writeFlash };
+    await expect(transport.installStageOnlyApplication(WG1200_CONSTANTS.APP_OTA_0.offset, 'ota_0', new Uint8Array([1])))
+      .rejects.toThrow(/only inactive ota_0 while ota_1 is active/);
+    await expect(transport.installStageOnlyApplication(WG1200_CONSTANTS.APP_OTA_1.offset, 'ota_1', new Uint8Array([1])))
+      .rejects.toThrow(/only inactive ota_0 while ota_1 is active/);
+    expect(writeFlash).not.toHaveBeenCalled();
+    await transport.installStageOnlyApplication(WG1200_CONSTANTS.APP_OTA_0.offset, 'ota_1', new Uint8Array([1]));
+    expect(writeFlash).toHaveBeenCalledTimes(1);
+    expect(writeFlash.mock.calls[0]?.[0]?.eraseAll).toBe(false);
+  });
+
   it('bounds four-byte padding and sector-rounded erases to the exact OTA slot', () => {
     expect(getApplicationEraseRange(WG1200_CONSTANTS.APP_OTA_0.offset, 1)).toEqual({ slot: 'ota_0', start: 0x420000, end: 0x421000 });
     expect(getApplicationEraseRange(WG1200_CONSTANTS.APP_OTA_0.offset, WG1200_CONSTANTS.APP_OTA_0.size))

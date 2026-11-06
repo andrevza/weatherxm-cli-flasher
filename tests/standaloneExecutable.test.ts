@@ -40,6 +40,9 @@ describe('standalone executable packaging', () => {
     expect(help).toContain('DEVICE COMMANDS');
     expect(help).toContain('check <firmware>');
     expect(help).toContain('monitor');
+    expect(help).toContain('backup inactive');
+    expect(help).toContain('--stage-only');
+    expect(help).toContain('--backup-manifest');
     expect(help).toContain('-v, --version');
     expect(help).not.toMatch(/\u001b\[/);
     const commandHelp = execFileSync(executable, ['check', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });

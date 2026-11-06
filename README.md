@@ -4,7 +4,7 @@ Independent command-line utility for inspecting, verifying and installing compat
 
 ## Status
 
-Commands include `info`, `verify`, `status`, `firmware list`, `security`, and `flash`. Standard device inspection enters the ESP32-S3 ROM loader and runs a RAM stub; `security` stays in the ROM loader and reads eFuse registers without uploading a stub or accessing flash. Firmware writing remains fail-closed while installed-bootloader selection/recovery and physical preservation validation remain unknown. `flash --dry-run` remains read-only.
+Commands include `info`, `verify`, `status`, `firmware list`, `security`, `backup inactive`, and `flash`. Standard device inspection enters the ESP32-S3 ROM loader and runs a RAM stub; `security` stays in the ROM loader and reads eFuse registers without uploading a stub or accessing flash. Normal OTA installation remains fail-closed. The distinct `flash weatherxm --stage-only` path can write only verified official WeatherXM 0.8.34 to `ota_0` while `ota_1` is active, and never modifies OTA metadata or activates the staged image. `backup inactive` streams the complete inactive OTA partition and creates a verified manifest. Both operations require live preflight; stage-only additionally requires that backup manifest and a deliberate interactive confirmation. `flash --dry-run` remains read-only.
 
 The official reference repository and exact behavior reviewed are documented in [docs/official-flasher-analysis.md](docs/official-flasher-analysis.md). The staged implementation plan is in [docs/implementation-plan.md](docs/implementation-plan.md). Safety rules are in [SAFETY.md](SAFETY.md).
 
@@ -220,6 +220,8 @@ Security-check JSON preserves the existing top-level `result`, `trust`, and `app
 Security JSON `keyBlocks[]` includes `readDiagnostic` for digest-purpose blocks. It reports the logical slot, physical eFuse block, register base offset, eight-word read count, and a fixed failure category/word offset when relevant. It never includes raw eFuse words. A successful signature check is separate from device key trust, and the digest remains unavailable until read-only hardware revalidation succeeds.
 
 Security JSON now also reports `flashEncryption` (`cryptCount`, odd-parity `enabled`, `disableManualEncryption`, and evidence `status`) plus `downloadMode.disableUsbOtgDownload`. These are read-only eFuse observations; unavailable data is `null`, and unknown flash-encryption or ROM write conditions fail closed. They do not override the global `BLOCKED` installation policy.
+
+`backup inactive --output <file>` writes the complete inactive OTA partition to a new file and creates `<file>.manifest.json`. The manifest includes backup SHA-256/length, chip and exact partition, app descriptor/signature inspection, independent second-pass device hash result, and build provenance. Existing output files are never overwritten. `flash weatherxm --stage-only --backup-manifest <path>` is restricted to the pinned 0.8.34 digest and `ota_0` while `ota_1` is active. Its JSON result distinguishes candidate and readback SHA-256, hardware MD5 verification, byte ranges, unchanged metadata/protected regions, and `automaticActivation: false`. This path never calls the OTA metadata writer; it does not establish the staged image boots or that the previous inactive image is restorable. See [the stage-only hardware test procedure](docs/wg1200-stage-only-hardware-test.md).
 
 ## Docker
 

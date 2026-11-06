@@ -758,6 +758,22 @@ export class Wg1200Transport {
     return fullBuffer;
   }
 
+  /** Reads a bounded flash range in 4 KiB chunks without allocating the whole range. */
+  public async *readRegionChunks(offset: number, size: number): AsyncGenerator<Uint8Array> {
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
+      throw new Error('Invalid flash read range');
+    }
+    let bytesRead = 0;
+    while (bytesRead < size) {
+      const requestSize = Math.min(4096, size - bytesRead);
+      const chunk = await this.readRegion(offset + bytesRead, requestSize);
+      if (chunk.byteLength !== requestSize) throw new Error(`Incomplete flash read at 0x${(offset + bytesRead).toString(16)}`);
+      bytesRead += chunk.byteLength;
+      yield chunk;
+      if (bytesRead < size) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   private async readChunkWithRetry(offset: number, size: number, retries: number): Promise<Uint8Array> {
     let lastError: any = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -784,7 +800,7 @@ export class Wg1200Transport {
     throw lastError;
   }
 
-  private async hashRegionSha256(offset: number, size: number): Promise<string> {
+  public async hashRegionSha256(offset: number, size: number): Promise<string> {
     if (!this.loader) throw new Error('Not connected');
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
       throw new Error(`Invalid protected flash range offset=${offset} size=${size}`);
@@ -887,6 +903,14 @@ export class Wg1200Transport {
         }
       },
     });
+  }
+
+  /** The dedicated stage-only writer is restricted to ota_0 while ota_1 is validated active. */
+  public async installStageOnlyApplication(slotOffset: number, activeSlot: 'ota_0' | 'ota_1', firmwareBytes: Uint8Array): Promise<void> {
+    if (activeSlot !== 'ota_1' || slotOffset !== WG1200_CONSTANTS.APP_OTA_0.offset) {
+      throw new Error('Stage-only writer accepts only inactive ota_0 while ota_1 is active');
+    }
+    await this.installApplication(slotOffset, firmwareBytes);
   }
 
   /**

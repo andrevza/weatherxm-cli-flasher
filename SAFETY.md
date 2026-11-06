@@ -6,12 +6,16 @@
 
 `monitor` and all `--monitor` handoffs are passive receive-only sessions. They do not instantiate `ESPLoader`, write serial bytes, or call `setSignals`. On macOS/Linux the monitor opens SerialPort with `hupcl:false`, which prevents the POSIX HUPCL behavior from dropping DTR on close. The `serialport` stream source applies its default DTR/RTS values only when `.set()` is called; monitor mode never calls it. The operating system or USB adapter may still alter modem-line state during initial open, so a reset cannot be ruled out for every adapter/driver. The CLI deliberately provides no `--reset` option. Early boot logs can be missed because inspection/flash releases and closes its serial owner before passive monitoring reopens the port.
 
-`flash` downloads and validates the selected image, inspects the device, presents identity/hash/inactive-slot/address for explicit confirmation, and re-inspects immediately before the first write. It uses the upstream bounded OTA write and activation functions. No hardware write tests are run.
+Normal `flash <firmware>` downloads and validates the selected image, inspects the device, presents identity/hash/inactive-slot/address for explicit confirmation, and re-inspects immediately before the first write. Its global firmware readiness gate remains blocked. The separate `flash weatherxm --stage-only --backup-manifest <path>` path is narrowly permitted for the pinned WeatherXM 0.8.34 artifact, only when active `ota_1` and inactive `ota_0` match live metadata and a fresh exact-partition backup validates. It writes only the candidate image length in `ota_0`, verifies hardware MD5 and SHA-256 readback, rechecks protected regions and full OTA metadata, then resets to normal boot without changing OTA selection. It requires interactive confirmation; `--yes`, `--force`, and `--recover` cannot authorize it. No physical write tests have been run.
+
+`backup inactive` streams only the selected inactive OTA application partition to a new file, compares a second complete device-read SHA-256 pass, and atomically publishes the file plus a manifest without overwriting existing paths. It does not export credential, NVS, NVS-key, or certificate partitions. A hash-verified backup does not establish that the image is restorable or bootable.
 
 ## Command effects
 
 - Read-only inspection: `info`, `verify`, `status`, `check`, and `firmware list` do not write or erase flash. Device inspection enters ROM loader mode and resets the gateway; `check` also downloads the selected image.
 - Installation: `flash <firmware>` can write the validated inactive OTA application slot and one OTA-selection sector after image checks, device checks, reinspection, and explicit confirmation. This modifies device firmware and may leave the gateway unusable if power or transport is interrupted.
+- Stage-only: `flash weatherxm --stage-only --backup-manifest <path>` can write only the pinned 0.8.34 application bytes to `ota_0` while `ota_1` is active. It does not commit OTA metadata or activate. Power loss can leave the old inactive app partially erased/written; no restoration guarantee is implied.
+- Inactive backup: `backup inactive --output <file>` reads the complete current inactive OTA partition and creates a manifest. The backup is a preservation artifact, not a tested recovery mechanism.
 - Recovery: `flash <firmware> --recover` opts into the narrowly bounded recovery flow for ambiguous OTA metadata. It still writes and is not a read-only diagnostic operation.
 - Erase: the CLI exposes no standalone erase command and must never issue a full-chip erase. Flash writes are bounded to the inactive OTA app and the selected OTA metadata sector.
 
@@ -33,6 +37,7 @@ Partition addresses come from WeatherXM WG1200 source, reviewed at commit `35b2e
 - Never overwrite `factory`, credentials, NVS, calibration, SPIFFS, partition table, or NVS key.
 - Write the selected firmware only to the validated inactive OTA app partition.
 - Change boot selection by writing exactly one inactive 4 KiB OTA metadata sector with the official sequence, CRC, and valid-state encoding; read it back before reboot.
+- For stage-only operations, do not call any OTA metadata writer and compare both metadata sectors byte-for-byte before and after.
 - Verify the firmware manifest digest before writing and compare on-chip flash MD5 after writing.
 - Snapshot and verify protected flash data around the write.
 - Require an explicit interactive confirmation, or an explicit `--yes` for automation, including device identity, firmware, target slot, and affected ranges.

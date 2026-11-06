@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, summarizeInspection } from './device.js';
+import { backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyFirmware, summarizeInspection } from './device.js';
 import { catalogRows, DEFAULT_MANIFEST_URL, fetchCatalog } from './catalog.js';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -13,7 +13,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; backupManifest?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -64,7 +64,7 @@ function parseArgs(argv: string[]): Args {
   let helpRequested = false;
   let manifestProvided = false;
   let bootLogProvided = false;
-  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
+  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, stageOnly: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--port' || arg === '-p') out.port = argv[++i];
@@ -76,6 +76,8 @@ function parseArgs(argv: string[]): Args {
     else if (arg === '--recover') out.recover = true;
     else if (arg === '--force') out.force = true;
     else if (arg === '--dry-run') out.dryRun = true;
+    else if (arg === '--stage-only') out.stageOnly = true;
+    else if (arg === '--backup-manifest') out.backupManifest = argv[++i];
     else if (arg === '--trace-serial') out.traceSerial = true;
     else if (arg === '--monitor') out.monitor = true;
     else if (arg === '--boot') out.boot = true;
@@ -97,15 +99,26 @@ function parseArgs(argv: string[]): Args {
   if (!helpRequested) {
     if (out.force && out.command !== 'flash') throw new Error('--force is supported only by flash');
     if (out.dryRun && out.command !== 'flash') throw new Error('--dry-run is supported only by flash');
+    if (out.stageOnly && out.command !== 'flash') throw new Error('--stage-only is supported only by flash');
+    if (out.backupManifest && out.command !== 'flash') throw new Error('--backup-manifest is supported only by flash --stage-only');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
     if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
     if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
     if (out.boot && out.command !== 'monitor') throw new Error('--boot is supported only by monitor');
-    if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
+    if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
     if (bootLogProvided && out.command !== 'flash') throw new Error('--boot-log-seconds is supported only by flash');
+    if (out.stageOnly && (!out.backupManifest || out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
+      throw new Error('--stage-only requires flash weatherxm --backup-manifest <path> and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
+    }
+    if (out.stageOnly && manifestProvided && out.manifest !== DEFAULT_MANIFEST_URL) throw new Error('--stage-only accepts only the pinned official WeatherXM firmware manifest');
+    if (out.backupManifest && !out.stageOnly) throw new Error('--backup-manifest requires --stage-only');
+    if (out.command === 'backup' && (out.subcommand !== 'inactive' || !out.outputFile || out.yes || out.force || out.recover || out.dryRun || out.stageOnly || out.monitor || out.timestamp || out.level || out.raw || out.noColor)) {
+      throw new Error('backup requires `backup inactive --port <path> --output <file>`; it never overwrites existing files');
+    }
+    if (out.outputFile && out.command !== 'backup' && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
     if (out.command === 'monitor' && out.json) throw new Error('--json is not supported by the continuous monitor command');
   }
   return out;
@@ -126,9 +139,10 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
+      backup: `USAGE\n  ${name} backup inactive --port <path> --output <file> [--baud <rate>] [--json] [--redact]\n\nStreams the exact inactive OTA partition to a new file and writes <file>.manifest.json. Existing files are never overwritten. Reads no credential partitions. A backup is not a proven restore path.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n\nLists validated firmware releases from the official HTTPS manifest.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
-      flash: `USAGE\n  ${name} flash <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--dry-run] [--force] [--recover] [--yes] [--monitor] [--boot-log-seconds <0..3600>] [--json] [--redact] [--trace-serial]\n\nWrites only the validated inactive OTA slot and selected OTA metadata sector after validation and confirmation. --dry-run is read-only. --force permits only an identical-build reinstall; it does not bypass identity, layout, integrity, OTA, boundary or confirmation checks. Downgrades remain blocked. Boot capture defaults to 15 seconds; zero disables it; --monitor captures continuously after release.`,
+      flash: `USAGE\n  ${name} flash <firmware> --port <path> [--stage-only --backup-manifest <path>] [other guarded options]\n\nNormal firmware installation remains blocked. The dedicated --stage-only path supports only official WeatherXM 0.8.34 into ota_0 while ota_1 is live, requires a verified inactive-slot backup manifest and an interactive confirmation, then verifies hardware MD5, streamed SHA-256, protected regions and unchanged OTA metadata. It never activates the staged image. --yes, --force, --recover, --dry-run and --monitor cannot be combined with --stage-only.`,
     };
     const detail = details[command];
     if (!detail) return process.stdout.write(`No command help is available for '${command}'. Run '${name} --help'.\n`);
@@ -141,14 +155,16 @@ function help(command?: string, plain = false) {
   output += commandRow('status', 'Show firmware and OTA boot state');
   output += commandRow('check <firmware>', 'Check available firmware; read-only');
   output += commandRow('monitor', 'Passively stream serial console output');
+  output += commandRow('backup inactive', 'Stream and verify the complete inactive OTA partition');
   output += commandRow('security', 'Read Secure Boot V2 and firmware trust evidence');
   output += `\n${heading('FIRMWARE COMMANDS')}\n`;
   output += commandRow('firmware list', 'List available firmware releases');
   output += commandRow('flash <firmware>', 'Install to the inactive OTA slot');
   output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --boot              Reset via RTS/EN and capture startup from boot\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
-  output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Firmware writing is blocked pending device trust and rollback evidence.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
+  output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Normal OTA installation is blocked; stage-only has fixed target and preflight.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
   output = output.replace('  -h, --help          Show help', '  -v, --version       Show application version; add --verbose for build details\n  -h, --help          Show help');
   output = output.replace('  --manifest <url>', '  --redact            Mask device and certificate identifiers in output\n  --manifest <url>');
+  output = output.replace('  --boot-log-seconds  ', '  --stage-only        Write official 0.8.34 to ota_0 without activation\n  --backup-manifest   Require a verified inactive-slot backup\n  --boot-log-seconds  ');
   process.stdout.write(output);
 }
 
@@ -250,6 +266,26 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.command === 'help') return help(args.helpTarget, args.json);
   if (args.command === 'monitor') { await runMonitor(args); return; }
+  if (args.command === 'backup') {
+    if (!args.port) throw new Error('backup requires --port, for example --port /dev/ttyUSB0');
+    if (!args.outputFile) throw new Error('backup inactive requires --output <file>');
+    try {
+      const result = await backupInactiveOta({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial, outputPath: args.outputFile });
+      const report = { outcome: 'BACKUP VERIFIED', backupFile: args.outputFile, manifestFile: result.manifestPath,
+        partition: result.manifest.partition, bytes: result.manifest.bytes, sha256: result.manifest.sha256,
+        independentReadbackVerified: result.manifest.independentReadbackVerified,
+        firmwareVersion: result.manifest.firmwareVersion, signatureVerification: result.manifest.signatureVerification,
+        restorationProven: false };
+      if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else process.stdout.write(`BACKUP VERIFIED\nFile: ${report.backupFile}\nManifest: ${report.manifestFile}\nPartition: ${report.partition.label} @ 0x${report.partition.offset.toString(16)} (${report.bytes} bytes)\nSHA-256: ${report.sha256}\nIndependent readback: ${report.independentReadbackVerified ? 'MATCH' : 'FAILED'}\nFirmware: ${report.firmwareVersion ?? 'UNKNOWN'}\nSignature: ${report.signatureVerification.status} — ${report.signatureVerification.explanation}\nRestore capability: NOT ESTABLISHED\n`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (args.json) process.stdout.write(`${JSON.stringify({ outcome: 'BACKUP FAILED', error: message, successfulBackup: false }, null, 2)}\n`);
+      else process.stderr.write(`BACKUP FAILED: ${message}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (args.command === 'firmware' && args.subcommand === 'list') {
     const manifest = await fetchCatalog(args.manifest);
     const rows = catalogRows(manifest);
@@ -287,6 +323,35 @@ async function main() {
   if (args.command === 'flash') {
     if (!args.subcommand) throw new Error('flash requires a firmware key; run `wg1200 firmware list`');
     if (!args.port) throw new Error('flash requires --port, for example --port /dev/ttyUSB0');
+    if (args.stageOnly) {
+      const confirmStage = async (summary: Parameters<Parameters<typeof stageOnlyFirmware>[0]['confirm']>[0]) => {
+        const reviewedDevice = args.redact ? '[REDACTED DEVICE ID]' : summary.deviceName;
+        const phrase = `STAGE ${reviewedDevice} ota_0 WeatherXM 0.8.34 ${summary.firmwareSha256}`;
+        process.stderr.write(`\nSTAGE-ONLY WRITE PLAN\nDevice: ${summary.deviceModel} ${summary.deviceName} via ${args.port}\nActive partition: ${summary.activeSlot}; firmware ${summary.activeFirmware ?? 'UNKNOWN'} (preserved)\nInactive partition: ${summary.targetSlot}; existing firmware ${summary.backupFirmwareVersion ?? 'UNKNOWN'} (will be overwritten)\nPartition bound: [0x${summary.targetOffset.toString(16)}, 0x${(summary.targetOffset + summary.targetLength).toString(16)})\nCandidate: WeatherXM ${summary.firmwareVersion}, ${summary.imageBytes} bytes\nCandidate SHA-256: ${summary.firmwareSha256}\nBackup: ${summary.backupFile}\nBackup SHA-256: ${summary.backupSha256}\nBackup image/signature: ${summary.backupFirmwareVersion ?? 'UNKNOWN'} / ${summary.backupSignatureStatus}; restore is not proven\nErase range: [0x${summary.eraseStart.toString(16)}, 0x${summary.eraseEnd.toString(16)})\nFlash encryption enabled: ${summary.flashEncryption}\nPreserved: active ota_1, bootloader, partition table, factory, credentials, NVS, calibration, SPIFFS\nOTA metadata: WILL NOT CHANGE\nAutomatic activation: WILL NOT OCCUR\nRisk: power loss or interrupted transfer may leave ota_0 partially erased or written; no recovery guarantee is implied.\nType exactly: ${phrase}\n`);
+        if (!stdin.isTTY || !stdout.isTTY) throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: use an interactive terminal; --yes is not allowed');
+        const rl = createInterface({ input: stdin, output: stdout });
+        try { return (await rl.question('Confirm stage-only write: ')) === phrase; }
+        finally { rl.close(); }
+      };
+      try {
+        const result = await stageOnlyFirmware({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
+          backupManifestPath: args.backupManifest!, confirm: confirmStage });
+        if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        else process.stdout.write(`${result.outcome}\nSecure Boot V2 signature: VERIFIED\nDevice digest slot 0: TRUSTED\nHardware MD5: VERIFIED (${result.expectedMd5})\nExpected SHA-256: ${result.firmwareSha256}\nReadback SHA-256: ${result.actualSha256}\nBytes verified: ${result.bytesRead}\nTarget range: [0x${result.targetRange.start.toString(16)}, 0x${result.targetRange.end.toString(16)})\nErase range: [0x${result.eraseRange.start.toString(16)}, 0x${result.eraseRange.end.toString(16)})\nOTA metadata unchanged: YES\nActive ota_1 unchanged: YES\nProtected regions unchanged: YES\nAutomatic activation: NO\n`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const outcome = message.startsWith('STAGING FAILED — PROTECTED') ? 'STAGING FAILED — PROTECTED REGION CHANGED'
+          : message.startsWith('STAGING FAILED — VERIFICATION') ? 'STAGING FAILED — VERIFICATION MISMATCH'
+          : message.startsWith('STAGING FAILED — TARGET') ? 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN'
+          : message.startsWith('STAGING BLOCKED — BACKUP') ? 'STAGING BLOCKED — BACKUP INVALID'
+          : message.startsWith('STAGING BLOCKED') ? 'STAGING BLOCKED — PREFLIGHT FAILED'
+          : 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN';
+        if (args.json) process.stdout.write(`${JSON.stringify({ outcome, error: message, otaMetadataModified: false }, null, 2)}\n`);
+        else process.stderr.write(`${outcome}: ${message}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
     const confirm = async (summary: Parameters<Parameters<typeof flashDevice>[0]['confirm']>[0]) => {
       const endOffset = summary.targetOffset + summary.bytes;
       process.stderr.write(`\n${args.dryRun ? 'Firmware dry-run review' : 'Firmware write review'}${summary.recovery ? ' (RECOVERY MODE)' : ''}\nDevice: ${summary.deviceName}\nActive slot: ${summary.activeSlot}\nFirmware: ${summary.firmwareLabel} (${summary.firmwareKey})\nImage descriptor: ${summary.comparison.selected.type} ${summary.comparison.selected.version}; build ${summary.comparison.selected.build}\nInstalled descriptor: ${summary.comparison.installed.type} ${summary.comparison.installed.version}; build ${summary.comparison.installed.build}\nComparison: ${summary.comparison.kind} — ${summary.comparison.message}\nSize: ${summary.bytes} bytes\nSHA-256: ${summary.sha256}\nTarget: ${summary.targetSlot}, byte range [0x${summary.targetOffset.toString(16)}, 0x${endOffset.toString(16)})\nFactory firmware, active slot, credentials, NVS, calibration, and other protected partitions are outside the write range.\n`);
