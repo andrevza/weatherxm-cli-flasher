@@ -438,6 +438,78 @@ export function verifySecureBootV2Image(data: Uint8Array): SecureBootImageEviden
     chipId: null, signedLength: null, blocks: [], errors: errors.length ? errors : ['no valid 64 KiB-aligned signature boundary found'] };
 }
 
+export interface EspImageBoundary {
+  status: 'valid-signature' | 'invalid-signature' | 'no-signature' | 'unsupported-image' | 'unreadable-boundary';
+  imageLength: number | null;
+  signedLength: number | null;
+  signatureBlockCount: number;
+  chipId: number | null;
+  appendedDigest: boolean | null;
+  imageEvidence: SecureBootImageEvidence | null;
+  trailingBytes: number | null;
+  trailingErased: boolean | null;
+  explanation: string;
+}
+
+/**
+ * Parses the ESP image footer and ESP32-S3 Secure Boot V2 boundary without
+ * trimming 0xff partition fill. Secure padding is determined from segment
+ * lengths, checksum, optional appended SHA-256, and the 64 KiB MMU page.
+ */
+export function parseEsp32S3ImageBoundary(data: Uint8Array): EspImageBoundary {
+  const unsupported = (explanation: string): EspImageBoundary => ({ status: 'unsupported-image', imageLength: null, signedLength: null,
+    signatureBlockCount: 0, chipId: null, appendedDigest: null, imageEvidence: null, trailingBytes: null, trailingErased: null, explanation });
+  if (data.byteLength < 24 || data[0] !== 0xe9) return unsupported('ESP image header is missing or malformed.');
+  const segmentCount = data[1];
+  const chipId = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(12, true);
+  if (!segmentCount || segmentCount > 16 || chipId !== 9 || (data[23] !== 0 && data[23] !== 1)) return unsupported('ESP image header has an unsupported segment count, chip ID, or hash flag.');
+  let cursor = 24;
+  let checksum = 0xef;
+  for (let i = 0; i < segmentCount; i++) {
+    if (cursor + 8 > data.byteLength) return { ...unsupported('ESP segment header is truncated.'), status: 'unreadable-boundary' };
+    const length = new DataView(data.buffer, data.byteOffset + cursor, 8).getUint32(4, true);
+    cursor += 8;
+    if (length === 0 || length > 0x1000000 || cursor + length > data.byteLength) return { ...unsupported(`ESP segment ${i} has a truncated or unsupported length.`), status: 'unreadable-boundary' };
+    for (const byte of data.subarray(cursor, cursor + length)) checksum ^= byte;
+    cursor += length;
+  }
+  const checksumOffset = cursor + (15 - (cursor % 16));
+  if (checksumOffset >= data.byteLength) return { ...unsupported('ESP checksum byte is outside the partition data.'), status: 'unreadable-boundary' };
+  if (data[checksumOffset] !== checksum) return unsupported('ESP segment checksum is invalid.');
+  let contentEnd = checksumOffset + 1;
+  const appendedDigest = data[23] === 1;
+  if (appendedDigest) {
+    if (contentEnd + 32 > data.byteLength) return { ...unsupported('ESP appended SHA-256 digest is truncated.'), status: 'unreadable-boundary' };
+    const calculated = sha256(data.subarray(0, contentEnd));
+    if (!timingSafeEqual(calculated, data.subarray(contentEnd, contentEnd + 32))) return unsupported('ESP appended SHA-256 digest is invalid.');
+    contentEnd += 32;
+  }
+  const signedLength = Math.ceil(contentEnd / WG1200_MMU_PAGE_SIZE) * WG1200_MMU_PAGE_SIZE;
+  if (signedLength + SIGNATURE_SECTOR_SIZE > data.byteLength || data[signedLength] !== 0xe7) {
+    return { status: 'no-signature', imageLength: contentEnd, signedLength: null, signatureBlockCount: 0, chipId,
+      appendedDigest, imageEvidence: null, trailingBytes: data.byteLength - contentEnd,
+      trailingErased: data.subarray(contentEnd).every((byte) => byte === 0xff),
+      explanation: 'ESP image structure and checksum are readable, but no Secure Boot V2 signature block starts at the derived MMU boundary.' };
+  }
+  if (data.subarray(contentEnd, signedLength).some((byte) => byte !== 0)) {
+    return { ...unsupported('Secure Boot V2 padding is not zero-filled to the derived MMU page boundary.'), status: 'invalid-signature' };
+  }
+  let signatureBlockCount = 0;
+  for (let i = 0; i < 3; i++) {
+    const start = signedLength + i * SIGNATURE_SECTOR_SIZE;
+    if (start + SIGNATURE_SECTOR_SIZE > data.byteLength || data[start] !== 0xe7) break;
+    signatureBlockCount++;
+  }
+  const imageLength = signedLength + signatureBlockCount * SIGNATURE_SECTOR_SIZE;
+  const imageEvidence = verifySecureBootV2Image(data.subarray(0, imageLength));
+  const valid = imageEvidence.imageFormatValid && imageEvidence.imageDigestValid && imageEvidence.signatureValid;
+  return { status: valid ? 'valid-signature' : 'invalid-signature', imageLength, signedLength, signatureBlockCount, chipId,
+    appendedDigest, imageEvidence, trailingBytes: data.byteLength - imageLength,
+    trailingErased: data.subarray(imageLength).every((byte) => byte === 0xff),
+    explanation: valid ? 'ESP image boundary, checksum, padding, digest, and Secure Boot V2 signature verified.'
+      : `Secure Boot V2 signature verification failed: ${imageEvidence.errors.join('; ')}` };
+}
+
 export function compareSecureBootTrust(image: SecureBootImageEvidence, device: SecureBootDeviceState): {
   result: 'TRUSTED' | 'UNTRUSTED' | 'REVOKED' | 'INCOMPATIBLE' | 'UNKNOWN';
   trustedKeyMatch: boolean | null;

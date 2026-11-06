@@ -51,7 +51,34 @@ alias wg1200="$PWD/weatherxm-flash-linux-arm64-stage-only"
 wg1200 --version --verbose
 ```
 
-## A. Read-only preflight
+## A. Download and compare backups
+
+Download the exact pinned release before connecting the gateway. The verified
+content-addressed cache defaults to `~/.cache/weatherxm-flash/firmware/`.
+Repeat with `--offline` to validate cache reuse without network access.
+
+```sh
+wg1200 firmware download weatherxm --version 0.8.34
+wg1200 firmware download weatherxm --version 0.8.34 --offline --json
+```
+
+Capture both OTA applications before staging. Choose output paths that do not
+already exist. Each backup is followed by an independent full-partition read
+and SHA-256 comparison.
+
+```sh
+wg1200 backup active --port /dev/ttyUSB0 --output "$HOME/wg1200-stage-backups/ota1-before-stage.bin" --json --redact
+wg1200 backup inactive --port /dev/ttyUSB0 --output "$HOME/wg1200-stage-backups/ota0-before-stage.bin" --json --redact
+wg1200 firmware compare --backup "$HOME/wg1200-stage-backups/ota1-before-stage.bin" --firmware weatherxm --offline --json
+wg1200 firmware compare --backup "$HOME/wg1200-stage-backups/ota0-before-stage.bin" --firmware weatherxm --offline --json
+```
+
+Comparison uses supported signed-image extents and reports trailing partition
+data separately. Unknown or unsupported boundaries remain inconclusive.
+Progress stays on stderr so JSON stdout remains valid. Inspect logs before
+sharing even when `--redact` is used.
+
+## B. Read-only preflight
 
 Run each command and review its complete output. Device inspection can reset
 the gateway while entering the ROM loader. These commands do not write flash.
@@ -76,7 +103,7 @@ identical active version is already installed; it is not stage authorization.
 security value, signer, candidate digest, or port differs from the values
 above or is unknown. Do not use `--force` or normal `flash` as a substitute.
 
-## B. Back up the whole inactive partition
+## C. Back up the whole inactive partition
 
 Choose a new output filename; the command refuses to overwrite either the
 backup or its manifest. Ensure the destination directory has enough space.
@@ -93,7 +120,7 @@ second complete device hash pass, inspects the app descriptor/signature when
 the signed image boundary can be identified, and atomically finalizes the
 backup and `$BACKUP.manifest.json`. It resets back to normal boot on exit.
 
-## C. Review the backup
+## D. Review the backup
 
 ```sh
 test "$(stat -c %s "$BACKUP")" -eq 4194304
@@ -109,7 +136,7 @@ confirmation repeats this limitation. The stage command independently checks
 manifest format, file digest and size, exact partition identity, and a fresh
 live `ota_0` hash before it will write.
 
-## D. Stage the verified firmware without activation
+## E. Stage the verified firmware without activation
 
 Run this in an interactive terminal. Do not add `--yes`, `--force`,
 `--recover`, `--dry-run`, or `--monitor`. The program prints device, active and
@@ -151,7 +178,7 @@ Other outcomes are `STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN`,
 run normal flash, modify OTA metadata, or assume the backup can restore the
 inactive image.
 
-## E. Confirm original firmware remains selected
+## F. Confirm original firmware remains selected
 
 The stage command itself resets into normal boot after successful verification.
 Capture the normal startup, then inspect boot selection and descriptors:

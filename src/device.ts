@@ -3,10 +3,8 @@ import { assertCompleteProtectedRegionSnapshots, type Wg1200Inspection, type Wg1
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { EXPECTED_WG1200_PARTITIONS, parsePartitionTableWithMetadata } from './upstream/flasher/partitions.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
-import { fetchAndVerifyFirmware } from './upstream/flasher/manifest.js';
 import { buildTransactionalOtadataSector, determineActiveBootSlot } from './upstream/flasher/otadata.js';
 import { md5Hex } from './upstream/flasher/hashing.js';
-import { fetchCatalog } from './catalog.js';
 import { analyzeBootLogs, captureBootLogs } from './upstream/flasher/serialLog.js';
 import { parseAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { isValidAppDescriptor } from './upstream/flasher/appDescriptor.js';
@@ -18,10 +16,12 @@ import { compareSecureBootTrust, verifySecureBootV2Image, type SecureBootDeviceS
 import { createInactiveBackup, validateInactiveBackup, runStageOnlyTransaction, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
 import { getApplicationEraseRange } from './upstream/flasher/writeGuard.js';
 import { DEFAULT_MANIFEST_URL } from './catalog.js';
+import { getOfficialFirmware, type FirmwareProgress } from './firmwareStore.js';
+import type { ProgressReporter } from './progress.js';
 
 export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
-export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; }
+export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; }
 export interface FlashConfirmation {
   deviceName: string; firmwareKey: string; firmwareLabel: string; activeSlot: string; targetSlot: string;
   targetOffset: number; bytes: number; sha256: string; recovery: boolean;
@@ -77,35 +77,59 @@ export function assertStageOnlySecurityEvidence(image: SecureBootImageEvidence, 
       device.downloadMode.securityDownloadEnabled !== false) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: ROM serial flash writing is restricted or unknown');
 }
 
+async function createOtaBackupWithTransport(transport: Wg1200Transport, outputPath: string, slot: 'ota_0' | 'ota_1',
+  chip: { model: string; revision: string | null }, progress?: ProgressReporter): Promise<InactiveBackupManifest> {
+  const partition = slot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  progress?.stage(`Reading ${slot}`, partition.size);
+  const manifest = await createInactiveBackup({ outputPath, label: slot, offset: partition.offset, length: partition.size, chip,
+    readChunks: transport.readRegionChunks(partition.offset, partition.size, (done, total) => progress?.bytes(done, total)),
+    hashLivePartition: () => {
+      progress?.stage(`Independently verifying ${slot}`, partition.size);
+      return transport.hashRegionSha256(partition.offset, partition.size, (done, total) => progress?.bytes(done, total));
+    },
+  });
+  progress?.finish('complete', 'backup and independent physical readback verified');
+  return manifest;
+}
+
 /** Stream a full inactive OTA partition backup to disk; never reads credential partitions. */
-export async function backupInactiveOta(options: DeviceOptions & { outputPath: string }): Promise<{ manifest: InactiveBackupManifest; manifestPath: string }> {
+export async function backupInactiveOta(options: DeviceOptions & { outputPath: string; selection?: 'active' | 'inactive' }): Promise<{ manifest: InactiveBackupManifest; manifestPath: string }> {
   const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport({ log: (message) => process.stderr.write(`[wg1200] ${message}\n`), error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`), debug: (message) => process.stderr.write(`${message}\n`) }, options.traceSerial);
   try {
+    options.progress?.stage('Connecting to ROM and initializing flash reader');
     const inspection = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete', 'ROM stub ready');
+    options.progress?.stage('Discovering partition layout and OTA selection');
     assertSafeInspection(inspection, await exactLayoutErrors(transport));
     if (inspection.otadata.isAmbiguous || !['ota_0', 'ota_1'].includes(inspection.otadata.activeSlot)) throw new Error('BACKUP FAILED: OTA selection is ambiguous; inactive partition cannot be established');
     const activeSlot = inspection.otadata.activeSlot as 'ota_0' | 'ota_1';
-    const targetSlot = inspection.otadata.targetSlot as 'ota_0' | 'ota_1';
-    if (targetSlot === activeSlot) throw new Error('BACKUP FAILED: selected partition is active; refusing to create an inactive-slot backup');
+    const inactiveSlot = inspection.otadata.targetSlot as 'ota_0' | 'ota_1';
+    const targetSlot = options.selection === 'active' ? activeSlot : inactiveSlot;
+    if (targetSlot === activeSlot && options.selection !== 'active') throw new Error('BACKUP FAILED: selected partition is active; refusing to create an inactive-slot backup');
     const partition = targetSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
-    if (inspection.otadata.targetOffset !== partition.offset || partition.size !== WG1200_CONSTANTS.MAX_APP_SIZE_BYTES) throw new Error('BACKUP FAILED: validated target does not match an exact WG1200 OTA partition');
+    if ((options.selection !== 'active' && inspection.otadata.targetOffset !== partition.offset) || partition.size !== WG1200_CONSTANTS.MAX_APP_SIZE_BYTES) throw new Error('BACKUP FAILED: validated target does not match an exact WG1200 OTA partition');
+    options.progress?.finish('complete');
+    options.progress?.stage('Reading chip model and revision');
     const security = await transport.readSecureBootConfiguration();
-    const manifest = await createInactiveBackup({
-      outputPath: options.outputPath, label: targetSlot, offset: partition.offset, length: partition.size,
-      chip: { model: security.chip.model, revision: security.chip.revision },
-      readChunks: transport.readRegionChunks(partition.offset, partition.size),
-      hashLivePartition: () => transport.hashRegionSha256(partition.offset, partition.size),
-    });
+    options.progress?.finish('complete');
+    const manifest = await createOtaBackupWithTransport(transport, options.outputPath, targetSlot,
+      { model: security.chip.model, revision: security.chip.revision }, options.progress);
     return { manifest, manifestPath: `${options.outputPath}.manifest.json` };
-  } finally { await transport.disconnect(); }
+  } finally { options.progress?.stage('Returning gateway to normal boot'); await transport.disconnect(); options.progress?.finish('complete'); }
 }
 
 /** First physical stage-only operation: writes only ota_0 and never commits OTA metadata. */
+export type StageOnlyBackupDecision =
+  | { choice: 'create'; outputPath: string }
+  | { choice: 'reuse'; manifestPath: string }
+  | { choice: 'decline' };
+
 export async function stageOnlyFirmware(options: DeviceOptions & {
-  backupManifestPath: string;
+  backupManifestPath?: string;
+  chooseBackup?: (details: { targetSlot: 'ota_0'; targetOffset: number; targetLength: number; existingFirmware: string | null }) => Promise<StageOnlyBackupDecision>;
   confirm: (summary: StageOnlySummary) => Promise<boolean>;
 }): Promise<{
   outcome: 'STAGED AND VERIFIED — NOT ACTIVATED'; targetSlot: 'ota_0'; activeSlot: 'ota_1';
@@ -115,7 +139,11 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   backupSha256: string; otaMetadataUnchanged: true; activeApplicationUnchanged: true;
   protectedRegionsUnchanged: true; automaticActivation: false;
 }> {
-  const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL);
+  options.progress?.stage('Retrieving and verifying official firmware', undefined, 'checking persistent cache and official manifest');
+  const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL, {
+    progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
+  });
+  options.progress?.finish('complete', selected.reused ? 'verified local cache reused' : 'downloaded and verified cache entry');
   if (selected.entry.version !== '0.8.34' || selected.entry.sha256.toLowerCase() !== STAGE_ONLY_WXM_0834_SHA256 ||
       selected.descriptor.firmwareType !== 'weatherxm' || selected.entry.category !== 'weatherxm') {
     throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: official WeatherXM 0.8.34 artifact identity does not match the approved digest');
@@ -129,7 +157,10 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   let released = false;
   let writeStarted = false;
   try {
+    options.progress?.stage('Connecting to ROM and initializing flash reader');
     const before = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete', 'ROM stub ready');
+    options.progress?.stage('Preflighting device and partition layout');
     assertSafeInspection(before, await exactLayoutErrors(transport));
     if (before.otadata.isAmbiguous || before.otadata.activeSlot !== 'ota_1' || before.otadata.targetSlot !== 'ota_0' ||
         before.otadata.targetOffset !== WG1200_CONSTANTS.APP_OTA_0.offset) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: live OTA state must select ota_1 with ota_0 inactive');
@@ -139,8 +170,24 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     const security = await transport.readSecureBootConfiguration();
     assertStageOnlySecurityEvidence(image, security);
     const target = WG1200_CONSTANTS.APP_OTA_0;
-    const backup = await validateInactiveBackup(options.backupManifestPath, { label: 'ota_0', offset: target.offset, length: target.size });
-    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size);
+    let backupManifestPath = options.backupManifestPath;
+    if (options.chooseBackup) {
+      const choice = await options.chooseBackup({ targetSlot: 'ota_0', targetOffset: target.offset, targetLength: target.size,
+        existingFirmware: before.inactiveFirmware?.version ?? null });
+      if (choice.choice === 'decline') throw new Error('STAGING BLOCKED — BACKUP REQUIRED: current stage-only policy does not permit proceeding without a verified target backup');
+      if (choice.choice === 'reuse') backupManifestPath = choice.manifestPath;
+      if (choice.choice === 'create') {
+        const created = await createOtaBackupWithTransport(transport, choice.outputPath, 'ota_0',
+          { model: security.chip.model, revision: security.chip.revision }, options.progress);
+        if (!created.independentReadbackVerified) throw new Error('STAGING BLOCKED — BACKUP INVALID: newly created backup failed independent readback');
+        backupManifestPath = `${choice.outputPath}.manifest.json`;
+      }
+    }
+    if (!backupManifestPath) throw new Error('STAGING BLOCKED — BACKUP REQUIRED: create a new backup or provide a verified backup manifest');
+    const backup = await validateInactiveBackup(backupManifestPath, { label: 'ota_0', offset: target.offset, length: target.size });
+    options.progress?.stage('Verifying backup freshness against live ota_0', target.size);
+    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size, (done, total) => options.progress?.bytes(done, total));
+    options.progress?.finish('complete');
     if (liveBackupHash.toLowerCase() !== backup.manifest.sha256.toLowerCase()) throw new Error('STAGING BLOCKED — BACKUP INVALID: live ota_0 no longer matches the verified backup');
 
     const otadataBefore = await transport.readOtadataSnapshot();
@@ -149,8 +196,14 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     if (metadataState.isAmbiguous || metadataState.activeSlot !== 'ota_1' || metadataState.targetSlot !== 'ota_0' || metadataState.targetOffset !== target.offset) {
       throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: raw OTA metadata does not confirm active ota_1 and inactive ota_0');
     }
-    const protectedSnapshots = await transport.snapshotProtectedRegions('ota_1');
-    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset);
+    options.progress?.stage('Hashing protected partitions and active ota_1');
+    const protectedSnapshots = await transport.snapshotProtectedRegions('ota_1', (name, done, total) => {
+      options.progress?.event({ stage: `Hashing protected ${name}`, completed: done, total });
+    });
+    options.progress?.finish('complete');
+    options.progress?.stage('Hashing bootloader and partition table', WG1200_CONSTANTS.PARTITION_TABLE.offset);
+    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => options.progress?.bytes(done, total));
+    options.progress?.finish('complete');
     const eraseRange = getApplicationEraseRange(target.offset, selected.verified.data.byteLength);
     const summary: StageOnlySummary = {
       deviceModel: security.chip.model, deviceName: before.deviceName ?? 'WeatherXM WG1200', activeSlot: 'ota_1', activeFirmware: before.currentFirmware?.version ?? null,
@@ -166,6 +219,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     const shaReadback = async (offset: number, length: number) => transport.hashRegionSha256(offset, length);
     const transaction = await runStageOnlyTransaction({
       revalidate: async () => {
+        options.progress?.stage('Revalidating device immediately before write');
         const fresh = await transport.inspect();
         assertSafeInspection(fresh, await exactLayoutErrors(transport));
         if (fresh.secureCert.sha256 !== before.secureCert.sha256 || fresh.currentFirmware?.appElfSha256 !== before.currentFirmware?.appElfSha256 ||
@@ -175,20 +229,53 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
         if (!Buffer.from(currentOtadata).equals(Buffer.from(otadataBefore))) return false;
         if ((await transport.hashRegionSha256(target.offset, target.size)).toLowerCase() !== backup.manifest.sha256.toLowerCase()) return false;
         if ((await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset)) !== bootloaderHash) return false;
-        return (await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1')).valid;
+        const valid = (await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1', (name, done, total) => {
+          options.progress?.event({ stage: `Rechecking ${name}`, completed: done, total });
+        })).valid;
+        options.progress?.finish('complete');
+        return valid;
       },
-      writeApplication: async (offset, bytes) => { writeStarted = true; await transport.installStageOnlyApplication(offset, 'ota_1', bytes); },
-      verifyHardwareMd5: (offset, md5, length) => transport.verifyApplicationFlash(offset, md5, length),
-      readbackSha256: shaReadback,
+      writeApplication: async (offset, bytes) => {
+        writeStarted = true;
+        options.progress?.stage('Erasing and writing ota_0', bytes.byteLength);
+        await transport.installStageOnlyApplication(offset, 'ota_1', bytes, (done, total) => options.progress?.bytes(done, total));
+        options.progress?.finish('complete');
+      },
+      verifyHardwareMd5: async (offset, md5, length) => {
+        options.progress?.stage('Verifying ESP32 hardware MD5');
+        const valid = await transport.verifyApplicationFlash(offset, md5, length);
+        options.progress?.finish(valid ? 'complete' : 'failed');
+        return valid;
+      },
+      readbackSha256: async (offset, length) => {
+        options.progress?.stage('Reading staged image for SHA-256', length);
+        const hash = await transport.hashRegionSha256(offset, length, (done, total) => options.progress?.bytes(done, total));
+        options.progress?.finish('complete');
+        return hash;
+      },
       verifyProtected: async () => {
-        const checked = await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1');
-        const currentBootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset);
+        options.progress?.stage('Verifying preserved partitions');
+        const checked = await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1', (name, done, total) => {
+          options.progress?.event({ stage: `Verifying preserved ${name}`, completed: done, total });
+        });
+        const currentBootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => {
+          options.progress?.event({ stage: 'Verifying bootloader and partition table', completed: done, total });
+        });
+        options.progress?.finish(checked.valid && currentBootloaderHash === bootloaderHash ? 'complete' : 'failed');
         return currentBootloaderHash === bootloaderHash ? checked : { valid: false, mismatches: ['bootloader region changed'] };
       },
-      readOtadata: () => transport.readOtadataSnapshot(),
+      readOtadata: async () => {
+        options.progress?.stage('Comparing OTA metadata byte-for-byte', WG1200_CONSTANTS.OTADATA.size);
+        const result = await transport.readOtadataSnapshot();
+        options.progress?.bytes(result.byteLength, WG1200_CONSTANTS.OTADATA.size);
+        options.progress?.finish('complete');
+        return result;
+      },
       resetNormal: async () => {
+        options.progress?.stage('Returning gateway to normal boot');
         if (!(await transport.hardReset())) throw new Error('normal-mode reset signal was unavailable');
         released = true;
+        options.progress?.finish('complete', 'normal boot reset signal sent');
       },
     }, {
       activeSlot: 'ota_1', targetOffset: target.offset, targetLength: target.size,
@@ -207,7 +294,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     if (message.startsWith('STAGING ')) throw error;
     if (writeStarted) throw new Error(`STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN: ${message}`);
     throw new Error(`STAGING BLOCKED — PREFLIGHT FAILED: ${message}`);
-  } finally { await transport.disconnect(!released); }
+  } finally { await transport.disconnect(!released); options.progress?.close(); }
 }
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
@@ -221,16 +308,23 @@ export async function readDeviceSecurity(options: DeviceOptions): Promise<Secure
     debug: (message) => process.stderr.write(`${message}\n`),
   }, options.traceSerial);
   try {
+    options.progress?.stage('Connecting to ROM for read-only eFuse inspection');
     await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_ROM, 'rom-read-only');
-    return await transport.readSecureBootConfiguration();
+    options.progress?.finish('complete', 'ROM connection established');
+    options.progress?.stage('Reading Secure Boot and flash-encryption eFuse state');
+    const result = await transport.readSecureBootConfiguration();
+    options.progress?.finish('complete');
+    return result;
   } finally {
+    options.progress?.stage('Returning gateway to normal boot');
     await transport.disconnect();
+    options.progress?.finish('complete');
   }
 }
 
 /** Verifies catalog/image authenticity and compares it with actual read-only device evidence. */
 export async function checkFirmwareSecurity(options: DeviceOptions & { firmwareKey: string; manifestUrl: string }): Promise<FirmwareSecurityCheckResult> {
-  const selected = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl);
+  const selected = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl, { progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory });
   const image = verifySecureBootV2Image(selected.verified.data);
   image.secureVersion = selected.descriptor.secureVersion;
   const device = await readDeviceSecurity(options);
@@ -285,26 +379,23 @@ export function firmwareSlotSummary(inspection: Wg1200Inspection) {
   };
 }
 
-export async function loadSelectedFirmware(firmwareKey: string, manifestUrl: string): Promise<SelectedFirmware> {
-  const manifest = await fetchCatalog(manifestUrl);
-  const entry = manifest.firmwares[firmwareKey];
-  if (!entry) throw new Error(`Firmware key '${firmwareKey}' is not in the validated manifest`);
-  const firmwareUrl = new URL(entry.file, manifestUrl);
-  if (firmwareUrl.origin !== new URL(manifestUrl).origin || firmwareUrl.protocol !== 'https:') {
-    throw new Error('Firmware URL is outside the HTTPS manifest origin');
-  }
-  const verified = await fetchAndVerifyFirmware({ ...entry, file: firmwareUrl.href });
-  const descriptor = parseAppDescriptor(verified.data);
-  if (!descriptor) throw new Error('Selected firmware image has no valid ESP application descriptor');
-  if (entry.category && descriptor.firmwareType !== entry.category) {
-    throw new Error(`Selected image firmware type '${descriptor.firmwareType}' does not match manifest category '${entry.category}'`);
-  }
-  return { entry, verified, descriptor };
+export async function loadSelectedFirmware(firmwareKey: string, manifestUrl: string, options: {
+  progress?: FirmwareProgress; version?: string; offline?: boolean; cacheDirectory?: string;
+} = {}): Promise<SelectedFirmware & { cachePath: string; reused: boolean }> {
+  const selected = await getOfficialFirmware({ key: firmwareKey, manifestUrl, ...options });
+  return { entry: selected.entry, verified: selected.verified, descriptor: selected.descriptor,
+    cachePath: selected.cachePath, reused: selected.reused };
 }
 
 export async function checkFirmware(options: DeviceOptions & { firmwareKey: string; manifestUrl: string }): Promise<FirmwareCheckResult> {
-  const selected = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl);
+  options.progress?.stage('Retrieving and verifying official firmware');
+  const selected = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl, {
+    progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
+  });
+  options.progress?.finish('complete', selected.reused ? 'verified local cache reused' : 'official image verified');
+  options.progress?.stage('Inspecting gateway and partition metadata');
   const inspection = await inspectDevice(options);
+  options.progress?.finish('complete');
   const comparison = compareFirmware(inspection.currentFirmware, selected.descriptor);
   const slots = firmwareSlotSummary(inspection);
   const installPolicy = firmwareInstallPolicy(comparison);
@@ -351,7 +442,7 @@ export function summarizeBootLog(lines: string[]) {
 }
 export interface OtaWriteOperations {
   readOtadataSnapshot(): Promise<Uint8Array>;
-  installApplication(offset: number, bytes: Uint8Array, onProgress?: (percent: number) => void): Promise<void>;
+  installApplication(offset: number, bytes: Uint8Array, onProgress?: (completed: number, total: number) => void): Promise<void>;
   verifyApplicationFlash(offset: number, expectedMd5: string, length: number): Promise<boolean>;
   verifyApplicationSha256(offset: number, expectedSha256: string, length: number): Promise<boolean>;
   writeOtaSelectSector(address: number, bytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void>;
@@ -364,7 +455,7 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
   preservedOtaSlot: 'ota_0' | 'ota_1'; recovery?: boolean;
   snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>;
   otadataBefore: Uint8Array;
-}, onProgress?: (percent: number) => void): Promise<{ flashVerified: true; otaMetadataVerified: true; protectedPartitionsVerified: true; deviceReleased: boolean }> {
+}, onProgress?: (completed: number, total: number) => void): Promise<{ flashVerified: true; otaMetadataVerified: true; protectedPartitionsVerified: true; deviceReleased: boolean }> {
   if (!Number.isSafeInteger(input.nextSeq) || input.nextSeq <= 0 || input.nextSeq >= 0xffffffff) {
     throw new Error('OTA sequence is outside the safely supported range; OTA activation was not attempted');
   }
@@ -506,7 +597,11 @@ export async function flashDevice(options: DeviceOptions & {
   confirm: (summary: FlashConfirmation) => Promise<boolean>;
   approveComparisonException?: (comparison: FirmwareComparison) => Promise<boolean>;
 }): Promise<{ deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; firmwareSlots?: ReturnType<typeof firmwareSlotSummary>['firmwareSlots']; ota?: ReturnType<typeof firmwareSlotSummary>['ota']; inactiveMatch?: boolean; bootSignature?: string; bootVersion?: string; secureBootVerified?: boolean; calibrationUpdated?: boolean; dryRun?: boolean; writeBlockedReason?: string; alreadyInstalled?: boolean; comparison: FirmwareComparison; flashVerified?: boolean; otaMetadataVerified?: boolean; protectedPartitionsVerified?: boolean; bootObserved?: boolean; expectedSlotObserved?: boolean | null; expectedFirmwareObserved?: boolean | null; applicationStarted?: boolean; applicationHealthy?: 'not-checked'; bootFailureObserved?: boolean; bootFailureLines?: string[]; bootLines?: string[] }> {
-  const { entry, verified, descriptor: selectedDescriptor } = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl);
+  options.progress?.stage('Retrieving and verifying official firmware');
+  const { entry, verified, descriptor: selectedDescriptor } = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl, {
+    progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
+  });
+  options.progress?.finish('complete', 'verified image loaded into an immutable memory snapshot before device access');
 
   const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
@@ -585,16 +680,20 @@ export async function flashDevice(options: DeviceOptions & {
     const preservedOtaSlot = fresh.otadata.targetSlot === 'ota_0' ? 'ota_1' : 'ota_0';
     const snapshots = await transport.snapshotProtectedRegions(preservedOtaSlot);
     let lastProgress = -5;
+    options.progress?.stage('Erasing and writing inactive OTA application', verified.data.byteLength);
     const transactionResult = await runOtaWriteTransaction(transport, {
       targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data, expectedSha256: verified.sha256,
       nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots, otadataBefore,
       preservedOtaSlot, recovery: options.recovery,
-    }, (percent) => {
+    }, (completedBytes, totalBytes) => {
+      const percent = totalBytes > 0 ? completedBytes / totalBytes * 100 : 0;
+      options.progress?.bytes(completedBytes, totalBytes);
       if (percent === 100 || percent >= lastProgress + 5) {
         lastProgress = percent;
         process.stderr.write(`[wg1200] App write progress: ${percent}%\n`);
       }
     });
+    options.progress?.finish('complete');
     firmwareReleased = transactionResult.deviceReleased;
     completed = { deviceName: summary.deviceName, firmwareKey: options.firmwareKey, targetSlot: summary.targetSlot, targetOffset: summary.targetOffset, sha256: verified.sha256, ...transactionResult };
   } finally {
@@ -603,9 +702,11 @@ export async function flashDevice(options: DeviceOptions & {
   if (!completed) throw new Error('Firmware write completed without a result');
   const bootSeconds = options.bootLogSeconds ?? 15;
   const bootPort = bootSeconds > 0 ? new NodeSerialPort(options.portPath, trace, undefined, true) : undefined;
+  options.progress?.stage('Capturing restart and normal boot output');
   const boot = bootPort
     ? await captureBootLogs(bootPort, bootSeconds * 1000, options.onBootLine, { slotOffset: completed.targetOffset, firmwareVersion: selectedDescriptor.version })
     : analyzeBootLogs([], { slotOffset: completed.targetOffset, firmwareVersion: selectedDescriptor.version });
+  options.progress?.finish('complete', boot.bootObserved ? 'boot output captured' : 'no boot output observed');
   if (!flashComparison) throw new Error('Firmware comparison was not completed');
   return {
     ...completed, bootSignature: boot.detectedSign, bootVersion: boot.bootVersion,

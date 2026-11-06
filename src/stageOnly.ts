@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { link, open, unlink, readFile } from 'node:fs/promises';
+import { link, open, unlink, readFile, mkdir } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { AppDescriptor } from './upstream/flasher/appDescriptor.js';
-import { verifySecureBootV2Image, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
+import { parseEsp32S3ImageBoundary, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
 
 export interface InactiveBackupManifest {
@@ -16,7 +16,10 @@ export interface InactiveBackupManifest {
   bytes: number;
   descriptor: AppDescriptor | null;
   firmwareVersion: string | null;
-  signatureVerification: { status: 'valid' | 'invalid' | 'not-verified'; imageLength: number | null; explanation: string };
+  signatureVerification: { status: 'valid' | 'invalid' | 'not-verified' | 'no-signature' | 'unsupported'; imageLength: number | null; explanation: string };
+  actualImageLength?: number | null;
+  actualImageSha256?: string | null;
+  signatureKeyDigests?: string[];
   independentReadbackVerified: boolean;
   tool: { version: string; gitCommit: string | null; sourceSha256: string | null };
 }
@@ -41,7 +44,7 @@ export async function validateInactiveBackup(manifestPath: string, expected: { l
       value.partition.label !== expected.label || value.partition.offset !== expected.offset || value.partition.length !== expected.length ||
       value.bytes !== expected.length || !/^[a-f0-9]{64}$/i.test(value.sha256 ?? '') ||
       value.independentReadbackVerified !== true || !value.backupFile || basename(value.backupFile) !== value.backupFile ||
-      !value.signatureVerification || !['valid', 'invalid', 'not-verified'].includes(value.signatureVerification.status) ||
+      !value.signatureVerification || !['valid', 'invalid', 'not-verified', 'no-signature', 'unsupported'].includes(value.signatureVerification.status) ||
       typeof value.chip.model !== 'string' || !value.chip.model.toLowerCase().includes('esp32-s3') ||
       !(typeof value.chip.revision === 'string' || value.chip.revision === null) ||
       !value.createdAt || !Number.isFinite(Date.parse(value.createdAt)) || !value.tool.version ||
@@ -67,31 +70,24 @@ async function readExactly(handle: Awaited<ReturnType<typeof open>>, buffer: Buf
   }
 }
 
-export async function inspectBackupImage(path: string, partitionLength: number): Promise<{ descriptor: AppDescriptor | null; signature: InactiveBackupManifest['signatureVerification'] }> {
+export async function inspectBackupImage(path: string, partitionLength: number): Promise<{ descriptor: AppDescriptor | null; signature: InactiveBackupManifest['signatureVerification']; actualImageLength?: number | null; actualImageSha256?: string | null; signatureKeyDigests?: string[] }> {
   const handle = await open(path, 'r');
   try {
     const descriptorBytes = Buffer.alloc(Math.min(4096, partitionLength));
     await readExactly(handle, descriptorBytes, 0);
     const { parseAppDescriptor } = await import('./upstream/flasher/appDescriptor.js');
     const descriptor = parseAppDescriptor(new Uint8Array(descriptorBytes));
-    for (let signedLength = 0x10000; signedLength + 4096 <= partitionLength; signedLength += 0x10000) {
-      const marker = Buffer.alloc(1);
-      await readExactly(handle, marker, signedLength);
-      if (marker[0] !== 0xe7) continue;
-      for (let blocks = 1; blocks <= 3; blocks++) {
-        const imageLength = signedLength + blocks * 4096;
-        if (imageLength > partitionLength) continue;
-        const bytes = Buffer.alloc(imageLength);
-        await readExactly(handle, bytes, 0);
-        const image = verifySecureBootV2Image(new Uint8Array(bytes));
-        if (image.imageFormatValid && image.signatureValid && descriptor) {
-          return { descriptor, signature: { status: 'valid', imageLength, explanation: 'ESP image structure and Secure Boot V2 RSA-PSS signature verified.' } };
-        }
-        return { descriptor, signature: { status: 'invalid', imageLength, explanation: image.errors.join('; ') || 'Image signature or descriptor validation failed.' } };
-      }
-    }
-    return { descriptor, signature: { status: 'not-verified', imageLength: null,
-      explanation: descriptor ? 'Application descriptor found, but no supported signed-image boundary was identified in the full partition backup.' : 'No recognizable ESP application descriptor or signed-image boundary was found.' } };
+    const bytes = new Uint8Array(await readFile(path));
+    const boundary = parseEsp32S3ImageBoundary(bytes);
+    const signatureStatus = boundary.status === 'valid-signature' ? 'valid'
+      : boundary.status === 'invalid-signature' ? 'invalid'
+        : boundary.status === 'no-signature' ? 'no-signature'
+          : boundary.status === 'unsupported-image' ? 'unsupported' : 'not-verified';
+    const imageLength = boundary.imageLength;
+    const actualImageSha256 = imageLength === null ? null : createHash('sha256').update(bytes.subarray(0, imageLength)).digest('hex');
+    const signatureKeyDigests = boundary.imageEvidence?.blocks.flatMap((block) => block.publicKeyHash ? [block.publicKeyHash] : []) ?? [];
+    return { descriptor, signature: { status: signatureStatus, imageLength, explanation: boundary.explanation },
+      actualImageLength: imageLength, actualImageSha256, signatureKeyDigests };
   } finally { await handle.close(); }
 }
 
@@ -101,6 +97,7 @@ export async function createInactiveBackup(input: {
   hashLivePartition: () => Promise<string>; inspect?: (path: string, length: number) => ReturnType<typeof inspectBackupImage>;
 }): Promise<InactiveBackupManifest> {
   const outputPath = resolve(input.outputPath);
+  await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
   const manifestPath = `${outputPath}.manifest.json`;
   const tempTag = `.tmp-${randomUUID()}`;
   const tempOutput = `${outputPath}${tempTag}`;
@@ -135,6 +132,8 @@ export async function createInactiveBackup(input: {
       partition: { label: input.label, offset: input.offset, length: input.length }, backupFile: basename(outputPath),
       sha256, bytes, descriptor: imageInfo.descriptor, firmwareVersion: imageInfo.descriptor?.version ?? null,
       signatureVerification: imageInfo.signature, independentReadbackVerified,
+      actualImageLength: imageInfo.actualImageLength ?? null, actualImageSha256: imageInfo.actualImageSha256 ?? null,
+      signatureKeyDigests: imageInfo.signatureKeyDigests ?? [],
       tool: { version: build.packageVersion, gitCommit: build.gitCommit, sourceSha256: build.sourceSha256 },
     };
     const manifestHandle = await open(tempManifest, 'wx', 0o600);
@@ -159,7 +158,7 @@ export interface StageOnlySummary {
   targetSlot: 'ota_0'; targetOffset: number; targetLength: number;
   firmwareVersion: string; firmwareSha256: string; imageBytes: number;
   backupFile: string; backupSha256: string; backupFirmwareVersion: string | null;
-  backupSignatureStatus: 'valid' | 'invalid' | 'not-verified';
+  backupSignatureStatus: 'valid' | 'invalid' | 'not-verified' | 'no-signature' | 'unsupported';
   eraseStart: number; eraseEnd: number; flashEncryption: boolean;
   metadataWillChange: false; autoActivation: false;
 }

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 import { backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyFirmware, summarizeInspection } from './device.js';
 import { catalogRows, DEFAULT_MANIFEST_URL, fetchCatalog } from './catalog.js';
+import { getOfficialFirmware } from './firmwareStore.js';
+import { compareBackupToFirmware, compareFirmwareFiles } from './firmwareCompare.js';
+import { ProgressReporter } from './progress.js';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import packageMetadata from '../package.json';
 import { createWriteStream } from 'node:fs';
 import { finished } from 'node:stream/promises';
@@ -13,7 +18,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; target?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; backupManifest?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; firmwareKey?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; backupManifest?: string; backupPath?: string; firmwareFile?: string; expectedSha256?: string; firmwareVersion?: string; offline: boolean; cacheDirectory?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -45,6 +50,7 @@ function operatingSystemLabel(platform: string): string {
 }
 
 function renderVersion(args: string[]): boolean {
+  if (args[0] === 'firmware' && args[1] === 'download' && args[2] && args.includes('--version')) return false;
   if (!args.includes('--version') && !args.includes('-v')) return false;
   const unsupported = args.filter((arg) => !['--version', '-v', '--verbose', '--json', '--redact'].includes(arg));
   if (unsupported.length) throw new Error(`Version options cannot be combined with commands or other options: ${unsupported.join(' ')}`);
@@ -64,7 +70,7 @@ function parseArgs(argv: string[]): Args {
   let helpRequested = false;
   let manifestProvided = false;
   let bootLogProvided = false;
-  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, stageOnly: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
+  const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, yes: false, recover: false, force: false, dryRun: false, stageOnly: false, offline: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--port' || arg === '-p') out.port = argv[++i];
@@ -78,6 +84,13 @@ function parseArgs(argv: string[]): Args {
     else if (arg === '--dry-run') out.dryRun = true;
     else if (arg === '--stage-only') out.stageOnly = true;
     else if (arg === '--backup-manifest') out.backupManifest = argv[++i];
+    else if (arg === '--backup') out.backupPath = argv[++i];
+    else if (arg === '--firmware') out.firmwareKey = argv[++i];
+    else if (arg === '--firmware-file') out.firmwareFile = argv[++i];
+    else if (arg === '--expected-sha256') out.expectedSha256 = argv[++i];
+    else if (arg === '--version' && argv[i + 1] && !argv[i + 1].startsWith('-')) out.firmwareVersion = argv[++i];
+    else if (arg === '--offline') out.offline = true;
+    else if (arg === '--cache-dir') out.cacheDirectory = argv[++i];
     else if (arg === '--trace-serial') out.traceSerial = true;
     else if (arg === '--monitor') out.monitor = true;
     else if (arg === '--boot') out.boot = true;
@@ -110,18 +123,34 @@ function parseArgs(argv: string[]): Args {
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
     if (bootLogProvided && out.command !== 'flash') throw new Error('--boot-log-seconds is supported only by flash');
-    if (out.stageOnly && (!out.backupManifest || out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
-      throw new Error('--stage-only requires flash weatherxm --backup-manifest <path> and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
+    if (out.stageOnly && (out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
+      throw new Error('--stage-only requires flash weatherxm and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
     }
     if (out.stageOnly && manifestProvided && out.manifest !== DEFAULT_MANIFEST_URL) throw new Error('--stage-only accepts only the pinned official WeatherXM firmware manifest');
     if (out.backupManifest && !out.stageOnly) throw new Error('--backup-manifest requires --stage-only');
-    if (out.command === 'backup' && (out.subcommand !== 'inactive' || !out.outputFile || out.yes || out.force || out.recover || out.dryRun || out.stageOnly || out.monitor || out.timestamp || out.level || out.raw || out.noColor)) {
-      throw new Error('backup requires `backup inactive --port <path> --output <file>`; it never overwrites existing files');
+    if (out.command === 'backup' && (!['inactive', 'active'].includes(out.subcommand ?? '') || !out.outputFile || out.yes || out.force || out.recover || out.dryRun || out.stageOnly || out.monitor || out.timestamp || out.level || out.raw || out.noColor)) {
+      throw new Error('backup requires `backup <active|inactive> --port <path> --output <file>`; it never overwrites existing files');
     }
+    if (out.firmwareVersion && !(out.command === 'firmware' && out.subcommand === 'download')) throw new Error('--version <version> is supported only by firmware download');
+    if (out.backupPath && !(out.command === 'firmware' && out.subcommand === 'compare')) throw new Error('--backup is supported only by firmware compare');
+    if (out.firmwareFile && !(out.command === 'firmware' && out.subcommand === 'compare')) throw new Error('--firmware-file is supported only by firmware compare');
+    if (out.firmwareKey && !(out.command === 'firmware' && out.subcommand === 'compare')) throw new Error('--firmware is supported only by firmware compare');
+    if (out.expectedSha256 && !(out.command === 'firmware' && out.subcommand === 'compare' && out.firmwareFile)) throw new Error('--expected-sha256 requires firmware compare --firmware-file');
+    if (out.offline && !(['firmware', 'flash', 'check'].includes(out.command))) throw new Error('--offline is supported only by firmware, check, and flash commands');
+    if (out.cacheDirectory && !(['firmware', 'flash', 'check'].includes(out.command))) throw new Error('--cache-dir is supported only by firmware, check, and flash commands');
+    if (out.command === 'firmware' && !['list', 'download', 'compare'].includes(out.subcommand ?? '')) throw new Error('firmware supports list, download, and compare');
+    if (out.command === 'firmware' && out.subcommand === 'download' && !['weatherxm', 'meshtastic'].includes(out.target ?? '')) throw new Error('firmware download requires weatherxm or meshtastic');
+    if (out.command === 'firmware' && out.subcommand === 'compare' && (!out.backupPath || (Boolean(out.firmwareKey) === Boolean(out.firmwareFile)))) throw new Error('firmware compare requires --backup and exactly one of --firmware <key> or --firmware-file <path>');
     if (out.outputFile && out.command !== 'backup' && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
     if (out.command === 'monitor' && out.json) throw new Error('--json is not supported by the continuous monitor command');
   }
   return out;
+}
+
+function createProgress(args: Args): ProgressReporter {
+  return new ProgressReporter({
+    write: (text) => process.stderr.write(text), tty: Boolean(process.stderr.isTTY), intervalMs: 5000,
+  });
 }
 
 function help(command?: string, plain = false) {
@@ -139,10 +168,10 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      backup: `USAGE\n  ${name} backup inactive --port <path> --output <file> [--baud <rate>] [--json] [--redact]\n\nStreams the exact inactive OTA partition to a new file and writes <file>.manifest.json. Existing files are never overwritten. Reads no credential partitions. A backup is not a proven restore path.`,
-      firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n\nLists validated firmware releases from the official HTTPS manifest.`,
+      backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact]\n\nStreams the complete selected OTA partition into a new file and writes <file>.manifest.json. Existing files are never overwritten. Does not read credential partitions. A backup is not a proven restore path.`,
+      firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
-      flash: `USAGE\n  ${name} flash <firmware> --port <path> [--stage-only --backup-manifest <path>] [other guarded options]\n\nNormal firmware installation remains blocked. The dedicated --stage-only path supports only official WeatherXM 0.8.34 into ota_0 while ota_1 is live, requires a verified inactive-slot backup manifest and an interactive confirmation, then verifies hardware MD5, streamed SHA-256, protected regions and unchanged OTA metadata. It never activates the staged image. --yes, --force, --recover, --dry-run and --monitor cannot be combined with --stage-only.`,
+      flash: `USAGE\n  ${name} flash <firmware> --port <path> [--stage-only] [--backup-manifest <path>] [other guarded options]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. It prompts to create or reuse a verified inactive-slot backup; declining blocks staging. It then requires a separate exact write confirmation and verifies hardware MD5, streamed SHA-256, protected regions and unchanged OTA metadata. It never activates the staged image. --yes, --force, --recover, --dry-run and --monitor cannot be combined with --stage-only.`,
     };
     const detail = details[command];
     if (!detail) return process.stdout.write(`No command help is available for '${command}'. Run '${name} --help'.\n`);
@@ -155,10 +184,12 @@ function help(command?: string, plain = false) {
   output += commandRow('status', 'Show firmware and OTA boot state');
   output += commandRow('check <firmware>', 'Check available firmware; read-only');
   output += commandRow('monitor', 'Passively stream serial console output');
-  output += commandRow('backup inactive', 'Stream and verify the complete inactive OTA partition');
+  output += commandRow('backup active|inactive', 'Stream and verify a complete OTA application partition');
   output += commandRow('security', 'Read Secure Boot V2 and firmware trust evidence');
   output += `\n${heading('FIRMWARE COMMANDS')}\n`;
   output += commandRow('firmware list', 'List available firmware releases');
+  output += commandRow('firmware download', 'Download and verify an official image into the local cache');
+  output += commandRow('firmware compare', 'Compare a backup with a verified firmware image offline');
   output += commandRow('flash <firmware>', 'Install to the inactive OTA slot');
   output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --boot              Reset via RTS/EN and capture startup from boot\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
   output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Normal OTA installation is blocked; stage-only has fixed target and preflight.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
@@ -269,8 +300,10 @@ async function main() {
   if (args.command === 'backup') {
     if (!args.port) throw new Error('backup requires --port, for example --port /dev/ttyUSB0');
     if (!args.outputFile) throw new Error('backup inactive requires --output <file>');
+    const progress = createProgress(args);
     try {
-      const result = await backupInactiveOta({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial, outputPath: args.outputFile });
+      const result = await backupInactiveOta({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
+        outputPath: args.outputFile, selection: args.subcommand as 'active' | 'inactive', progress });
       const report = { outcome: 'BACKUP VERIFIED', backupFile: args.outputFile, manifestFile: result.manifestPath,
         partition: result.manifest.partition, bytes: result.manifest.bytes, sha256: result.manifest.sha256,
         independentReadbackVerified: result.manifest.independentReadbackVerified,
@@ -279,18 +312,68 @@ async function main() {
       if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
       else process.stdout.write(`BACKUP VERIFIED\nFile: ${report.backupFile}\nManifest: ${report.manifestFile}\nPartition: ${report.partition.label} @ 0x${report.partition.offset.toString(16)} (${report.bytes} bytes)\nSHA-256: ${report.sha256}\nIndependent readback: ${report.independentReadbackVerified ? 'MATCH' : 'FAILED'}\nFirmware: ${report.firmwareVersion ?? 'UNKNOWN'}\nSignature: ${report.signatureVerification.status} — ${report.signatureVerification.explanation}\nRestore capability: NOT ESTABLISHED\n`);
     } catch (error) {
+      progress.finish('failed');
       const message = error instanceof Error ? error.message : String(error);
       if (args.json) process.stdout.write(`${JSON.stringify({ outcome: 'BACKUP FAILED', error: message, successfulBackup: false }, null, 2)}\n`);
       else process.stderr.write(`BACKUP FAILED: ${message}\n`);
       process.exitCode = 1;
     }
+    progress.close();
     return;
   }
   if (args.command === 'firmware' && args.subcommand === 'list') {
+    const progress = createProgress(args);
+    progress.stage('Retrieving and validating official firmware catalog');
     const manifest = await fetchCatalog(args.manifest);
+    progress.finish('complete');
     const rows = catalogRows(manifest);
     if (args.json) process.stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
     else for (const fw of rows) process.stdout.write(`${fw.key.padEnd(20)} ${fw.label}  ${fw.bytes} bytes  sha256:${fw.sha256}\n`);
+    return;
+  }
+  if (args.command === 'firmware' && args.subcommand === 'download') {
+    const progress = createProgress(args);
+    try {
+      const firmware = await getOfficialFirmware({ key: args.target!, manifestUrl: args.manifest, version: args.firmwareVersion,
+        offline: args.offline, cacheDirectory: args.cacheDirectory, progress: (event) => progress.event(event) });
+      progress.finish('complete', firmware.reused ? 'verified cache entry reused' : 'downloaded and cryptographically verified');
+      const result = { outcome: 'FIRMWARE VERIFIED', name: firmware.entry.name, key: args.target, version: firmware.entry.version,
+        expectedSize: firmware.entry.bytes, expectedSha256: firmware.entry.sha256, actualSha256: firmware.verified.sha256,
+        cachePath: firmware.cachePath, reused: firmware.reused, descriptor: firmware.descriptor,
+        imageFormatValid: firmware.signature.imageFormatValid, imageDigestValid: firmware.signature.imageDigestValid,
+        signatureVerified: firmware.signature.signatureValid, deviceSignerTrust: 'NOT CHECKED — requires read-only evidence from a specific gateway' };
+      if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      else process.stdout.write(`FIRMWARE VERIFIED\n${result.name} ${result.version}\nSize: ${result.expectedSize} bytes\nSHA-256: ${result.actualSha256}\nImage structure: ${result.imageFormatValid ? 'VALID' : 'INVALID'}\nSecure Boot V2 signature: ${result.signatureVerified ? 'VERIFIED OFFLINE' : 'NOT VERIFIED'}\nDevice signer trust: ${result.deviceSignerTrust}\nCache: ${result.cachePath}${result.reused ? ' (reused)' : ' (saved)'}\n`);
+    } catch (error) {
+      progress.finish('failed');
+      const report = { outcome: 'FIRMWARE DOWNLOAD FAILED', error: error instanceof Error ? error.message : String(error) };
+      if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else process.stderr.write(`${report.outcome}: ${report.error}\n`);
+      process.exitCode = 1;
+    } finally { progress.close(); }
+    return;
+  }
+  if (args.command === 'firmware' && args.subcommand === 'compare') {
+    const progress = createProgress(args);
+    try {
+      let report;
+      if (args.firmwareFile) report = await compareFirmwareFiles(args.backupPath!, args.firmwareFile, args.expectedSha256);
+      else {
+        const firmware = await getOfficialFirmware({ key: args.firmwareKey!, manifestUrl: args.manifest,
+          offline: args.offline, cacheDirectory: args.cacheDirectory, progress: (event) => progress.event(event) });
+        report = await compareBackupToFirmware(args.backupPath!, firmware, (stage) => progress.event({ stage, detail: 'processing image data' }));
+      }
+      progress.finish('complete');
+      if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else process.stdout.write(`${report.outcome}\nBackup image SHA-256: ${report.backup.imageSha256 ?? 'UNKNOWN'}\nFirmware image SHA-256: ${report.firmware.imageSha256 ?? 'UNKNOWN'}\nSame build identity: ${report.sameBuildIdentity ?? 'UNKNOWN'}\nSigning-key digest match: ${report.sameSigningKeyDigest ?? 'UNKNOWN'}\nBytes compared: ${report.exactBytesCompared}\nTrailing partition bytes: ${report.trailingPartitionBytes ?? 'UNKNOWN'}\n${report.explanation}\n`);
+      if (!['EXACT IMAGE MATCH', 'MATCHING BUILD — IMAGE DIFFERENCES', 'DIFFERENT FIRMWARE BUILD'].includes(report.outcome)) process.exitCode = 1;
+    } catch (error) {
+      progress.finish('failed');
+      const report = { outcome: 'COMPARISON INCOMPLETE', error: error instanceof Error ? error.message : String(error) };
+      if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else process.stderr.write(`${report.outcome}: ${report.error}\n`);
+      process.exitCode = 1;
+    } finally { progress.close(); }
     return;
   }
   if (args.command === 'security') {
@@ -298,22 +381,27 @@ async function main() {
     if (args.subcommand !== undefined && args.subcommand !== 'check') throw new Error('security supports only the optional `check <firmware>` subcommand');
     if (args.subcommand === 'check' && !args.target) throw new Error('security check requires a firmware key: weatherxm or meshtastic');
     if (args.subcommand !== 'check' && args.target) throw new Error('Unexpected extra argument after security command');
+    const progress = createProgress(args);
     if (args.subcommand === 'check') {
       const result = await checkFirmwareSecurity({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
-        firmwareKey: args.target!, manifestUrl: args.manifest });
+        firmwareKey: args.target!, manifestUrl: args.manifest, progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
       if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       else process.stdout.write(formatSecurityResult(result.device, result));
     } else {
-      const result = await readDeviceSecurity({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial });
+      const result = await readDeviceSecurity({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial, progress });
       if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       else process.stdout.write(formatSecurityResult(result));
     }
+    progress.close();
     return;
   }
   if (args.command === 'check') {
     if (!args.subcommand) throw new Error('check requires a firmware key: weatherxm or meshtastic');
     if (!args.port) throw new Error('check requires --port, for example --port /dev/ttyUSB0');
-    const result = await checkFirmware({ portPath: args.port, baudRate: args.baud, firmwareKey: args.subcommand, manifestUrl: args.manifest, traceSerial: args.traceSerial });
+    const progress = createProgress(args);
+    const result = await checkFirmware({ portPath: args.port, baudRate: args.baud, firmwareKey: args.subcommand, manifestUrl: args.manifest,
+      traceSerial: args.traceSerial, progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
+    progress.close();
     if (args.json) process.stdout.write(serializeFirmwareCheckResult(result));
     else process.stdout.write(formatCheckOutput(result));
     process.exitCode = checkExitCode(result);
@@ -324,6 +412,27 @@ async function main() {
     if (!args.subcommand) throw new Error('flash requires a firmware key; run `wg1200 firmware list`');
     if (!args.port) throw new Error('flash requires --port, for example --port /dev/ttyUSB0');
     if (args.stageOnly) {
+      const chooseBackup = async (details: { targetSlot: 'ota_0'; targetOffset: number; targetLength: number; existingFirmware: string | null }) => {
+        if (!stdin.isTTY || !stdout.isTTY) throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: backup choice requires an interactive terminal');
+        const defaultPath = join(homedir(), 'wg1200-stage-backups', `ota0-before-stage-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}.bin`);
+        process.stderr.write(`\nPRE-FLASH BACKUP DECISION\nTarget: ${details.targetSlot} @ 0x${details.targetOffset.toString(16)} (${details.targetLength} bytes)\nExisting firmware to be overwritten: ${details.existingFirmware ?? 'UNKNOWN'}\n1) Create a new full-partition backup (recommended)\n2) Use an existing verified backup${args.backupManifest ? `: ${args.backupManifest}` : ''}\n3) Decline backup (staging will stop; this command currently requires a verified backup)\n`);
+        const rl = createInterface({ input: stdin, output: stdout });
+        try {
+          const defaultChoice = args.backupManifest ? '2' : '1';
+          const selected = (await rl.question(`Choose 1, 2, or 3 [${defaultChoice}]: `)).trim() || defaultChoice;
+          if (selected === '3') return { choice: 'decline' as const };
+          if (selected === '1') {
+            const outputPath = (await rl.question(`New backup path [${defaultPath}]: `)).trim() || defaultPath;
+            return { choice: 'create' as const, outputPath };
+          }
+          if (selected === '2') {
+            const manifestPath = args.backupManifest || (await rl.question('Existing backup manifest path: ')).trim();
+            if (!manifestPath) return { choice: 'decline' as const };
+            return { choice: 'reuse' as const, manifestPath };
+          }
+          return { choice: 'decline' as const };
+        } finally { rl.close(); }
+      };
       const confirmStage = async (summary: Parameters<Parameters<typeof stageOnlyFirmware>[0]['confirm']>[0]) => {
         const reviewedDevice = args.redact ? '[REDACTED DEVICE ID]' : summary.deviceName;
         const phrase = `STAGE ${reviewedDevice} ota_0 WeatherXM 0.8.34 ${summary.firmwareSha256}`;
@@ -333,23 +442,28 @@ async function main() {
         try { return (await rl.question('Confirm stage-only write: ')) === phrase; }
         finally { rl.close(); }
       };
+      const progress = createProgress(args);
       try {
         const result = await stageOnlyFirmware({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
-          backupManifestPath: args.backupManifest!, confirm: confirmStage });
+          backupManifestPath: args.backupManifest, chooseBackup, confirm: confirmStage, progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
         if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         else process.stdout.write(`${result.outcome}\nSecure Boot V2 signature: VERIFIED\nDevice digest slot 0: TRUSTED\nHardware MD5: VERIFIED (${result.expectedMd5})\nExpected SHA-256: ${result.firmwareSha256}\nReadback SHA-256: ${result.actualSha256}\nBytes verified: ${result.bytesRead}\nTarget range: [0x${result.targetRange.start.toString(16)}, 0x${result.targetRange.end.toString(16)})\nErase range: [0x${result.eraseRange.start.toString(16)}, 0x${result.eraseRange.end.toString(16)})\nOTA metadata unchanged: YES\nActive ota_1 unchanged: YES\nProtected regions unchanged: YES\nAutomatic activation: NO\n`);
       } catch (error) {
+        progress.finish('failed');
         const message = error instanceof Error ? error.message : String(error);
         const outcome = message.startsWith('STAGING FAILED — PROTECTED') ? 'STAGING FAILED — PROTECTED REGION CHANGED'
           : message.startsWith('STAGING FAILED — VERIFICATION') ? 'STAGING FAILED — VERIFICATION MISMATCH'
           : message.startsWith('STAGING FAILED — TARGET') ? 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN'
+          : message.startsWith('STAGING BLOCKED — BACKUP REQUIRED') ? 'STAGING BLOCKED — BACKUP DECLINED OR REQUIRED'
           : message.startsWith('STAGING BLOCKED — BACKUP') ? 'STAGING BLOCKED — BACKUP INVALID'
+          : message.startsWith('STAGING BLOCKED — OPERATOR') ? 'STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED'
           : message.startsWith('STAGING BLOCKED') ? 'STAGING BLOCKED — PREFLIGHT FAILED'
           : 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN';
         if (args.json) process.stdout.write(`${JSON.stringify({ outcome, error: message, otaMetadataModified: false }, null, 2)}\n`);
         else process.stderr.write(`${outcome}: ${message}\n`);
         process.exitCode = 1;
       }
+      progress.close();
       return;
     }
     const confirm = async (summary: Parameters<Parameters<typeof flashDevice>[0]['confirm']>[0]) => {
@@ -377,7 +491,11 @@ async function main() {
         return (await rl.question(`This change needs separate approval. Type ${phrase} to continue: `)) === phrase;
       } finally { rl.close(); }
     };
-    const result = await flashDevice({ portPath: args.port, baudRate: args.baud, firmwareKey: args.subcommand, manifestUrl: args.manifest, recovery: args.recover, force: args.force, dryRun: args.dryRun, traceSerial: args.traceSerial, confirm, approveComparisonException, bootLogSeconds: args.monitor ? 0 : args.bootLogSeconds, onBootLine: (line) => process.stderr.write(`[boot] ${line}\n`) });
+    const progress = createProgress(args);
+    const result = await flashDevice({ portPath: args.port, baudRate: args.baud, firmwareKey: args.subcommand, manifestUrl: args.manifest,
+      recovery: args.recover, force: args.force, dryRun: args.dryRun, traceSerial: args.traceSerial, confirm, approveComparisonException,
+      bootLogSeconds: args.monitor ? 0 : args.bootLogSeconds, onBootLine: (line) => process.stderr.write(`[boot] ${line}\n`), progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
+    progress.close();
     if (result.alreadyInstalled) {
       if (args.json) process.stdout.write(`${JSON.stringify({ alreadyInstalled: true, flashModified: false, comparison: result.comparison }, null, 2)}\n`);
       else process.stdout.write(`${result.comparison.message} No flashing necessary.\n`);

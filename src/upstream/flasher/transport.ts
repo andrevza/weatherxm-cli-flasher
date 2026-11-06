@@ -759,7 +759,7 @@ export class Wg1200Transport {
   }
 
   /** Reads a bounded flash range in 4 KiB chunks without allocating the whole range. */
-  public async *readRegionChunks(offset: number, size: number): AsyncGenerator<Uint8Array> {
+  public async *readRegionChunks(offset: number, size: number, onProgress?: (completed: number, total: number) => void): AsyncGenerator<Uint8Array> {
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
       throw new Error('Invalid flash read range');
     }
@@ -769,6 +769,7 @@ export class Wg1200Transport {
       const chunk = await this.readRegion(offset + bytesRead, requestSize);
       if (chunk.byteLength !== requestSize) throw new Error(`Incomplete flash read at 0x${(offset + bytesRead).toString(16)}`);
       bytesRead += chunk.byteLength;
+      onProgress?.(bytesRead, size);
       yield chunk;
       if (bytesRead < size) await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -800,7 +801,7 @@ export class Wg1200Transport {
     throw lastError;
   }
 
-  public async hashRegionSha256(offset: number, size: number): Promise<string> {
+  public async hashRegionSha256(offset: number, size: number, onProgress?: (completed: number, total: number) => void): Promise<string> {
     if (!this.loader) throw new Error('Not connected');
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
       throw new Error(`Invalid protected flash range offset=${offset} size=${size}`);
@@ -816,6 +817,7 @@ export class Wg1200Transport {
       }
       hash.update(chunk);
       bytesRead += chunk.byteLength;
+      onProgress?.(bytesRead, size);
       if (bytesRead < size) await new Promise((resolve) => setTimeout(resolve, 25));
     }
     return hash.digest('hex');
@@ -824,14 +826,14 @@ export class Wg1200Transport {
   /**
    * Snapshots SHA-256 hashes of all protected regions before flashing.
    */
-  public async snapshotProtectedRegions(preservedOtaSlot: 'ota_0' | 'ota_1'): Promise<ProtectedRegionSnapshot[]> {
+  public async snapshotProtectedRegions(preservedOtaSlot: 'ota_0' | 'ota_1', onProgress?: (name: string, completed: number, total: number) => void): Promise<ProtectedRegionSnapshot[]> {
     const otaRegion = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
     const targets = [...PROTECTED_REGIONS.filter((region) => region.name !== 'otadata'),
       { name: 'preserved_ota', offset: otaRegion.offset, size: otaRegion.size }];
 
     const snapshots: ProtectedRegionSnapshot[] = [];
     for (const target of targets) {
-      const hash = await this.hashRegionSha256(target.offset, target.size);
+      const hash = await this.hashRegionSha256(target.offset, target.size, (completed, total) => onProgress?.(target.name, completed, total));
       snapshots.push({
         name: target.name,
         offset: target.offset,
@@ -847,13 +849,14 @@ export class Wg1200Transport {
    * Re-reads protected regions and verifies hashes match the pre-flash snapshot.
    */
   public async verifyProtectedRegions(
-    beforeSnapshots: ProtectedRegionSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1'
+    beforeSnapshots: ProtectedRegionSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1',
+    onProgress?: (name: string, completed: number, total: number) => void
   ): Promise<{ valid: boolean; mismatches: string[] }> {
     assertCompleteProtectedRegionSnapshots(beforeSnapshots, preservedOtaSlot);
     const mismatches: string[] = [];
 
     for (const snap of beforeSnapshots) {
-      const currentHash = await this.hashRegionSha256(snap.offset, snap.size);
+      const currentHash = await this.hashRegionSha256(snap.offset, snap.size, (completed, total) => onProgress?.(snap.name, completed, total));
       if (!compareHexHashes(snap.sha256, currentHash)) {
         mismatches.push(`Protected partition '${snap.name}' was modified`);
       }
@@ -872,7 +875,7 @@ export class Wg1200Transport {
   public async installApplication(
     slotOffset: number,
     firmwareBytes: Uint8Array,
-    onProgress?: (percent: number) => void
+    onProgress?: (completed: number, total: number) => void
   ): Promise<void> {
     if (!this.loader) throw new Error('Not connected');
 
@@ -897,20 +900,17 @@ export class Wg1200Transport {
       eraseAll: false, // Invariant: NEVER erase entire flash
       compress: true,
       reportProgress: (_fileIndex: number, written: number, total: number) => {
-        if (onProgress && total > 0) {
-          const pct = Math.round((written / total) * 100);
-          onProgress(pct);
-        }
+        if (onProgress && total > 0) onProgress(written, total);
       },
     });
   }
 
   /** The dedicated stage-only writer is restricted to ota_0 while ota_1 is validated active. */
-  public async installStageOnlyApplication(slotOffset: number, activeSlot: 'ota_0' | 'ota_1', firmwareBytes: Uint8Array): Promise<void> {
+  public async installStageOnlyApplication(slotOffset: number, activeSlot: 'ota_0' | 'ota_1', firmwareBytes: Uint8Array, onProgress?: (completed: number, total: number) => void): Promise<void> {
     if (activeSlot !== 'ota_1' || slotOffset !== WG1200_CONSTANTS.APP_OTA_0.offset) {
       throw new Error('Stage-only writer accepts only inactive ota_0 while ota_1 is active');
     }
-    await this.installApplication(slotOffset, firmwareBytes);
+    await this.installApplication(slotOffset, firmwareBytes, onProgress);
   }
 
   /**
