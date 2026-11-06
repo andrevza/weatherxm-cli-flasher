@@ -63,6 +63,11 @@ describe('standalone executable packaging', () => {
     expect(badInput.status).toBe(1);
     expect(badInput.stdout).toBe('');
     expect(badInput.stderr).toMatch(/requires --port/);
+    const jsonProgress = spawnSync(executable, ['firmware', 'download', 'weatherxm', '--offline', '--cache-dir', join(cleanDir, 'empty-cache'), '--json'],
+      { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
+    expect(jsonProgress.status).toBe(1);
+    expect(JSON.parse(jsonProgress.stdout)).toMatchObject({ outcome: 'FIRMWARE DOWNLOAD FAILED' });
+    expect(jsonProgress.stderr).not.toMatch(/[\r\u001b]/);
   });
 
   it.skipIf(!builtExecutable)('executes the embedded dual-slot status, check, and dry-run formatters', () => {
