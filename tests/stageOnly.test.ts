@@ -172,4 +172,16 @@ describe('inactive OTA backup artifacts', () => {
         signature: { status: 'not-verified' as const, imageLength: null, explanation: 'n/a' } }) })).rejects.toThrow(/cancelled/);
     expect(await readdir(dir)).toEqual([]);
   });
+
+  it('does not write a verified manifest when cancelled during independent readback', async () => {
+    const dir = await tempDir();
+    const output = join(dir, 'cancelled-readback.bin');
+    const controller = new AbortController();
+    async function* chunks() { yield bytes; }
+    await expect(createInactiveBackup({ outputPath: output, label: 'ota_0', offset: 0x420000, length: 8,
+      chip: { model: 'ESP32-S3', revision: null }, readChunks: chunks(), signal: controller.signal,
+      hashLivePartition: async () => { controller.abort(); return sha(bytes); },
+      inspect: async () => ({ descriptor: null, signature: { status: 'not-verified' as const, imageLength: null, explanation: 'n/a' } }) })).rejects.toThrow(/cancelled/);
+    expect(await readdir(dir)).toEqual([]);
+  });
 });

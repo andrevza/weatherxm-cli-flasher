@@ -126,8 +126,10 @@ export async function createInactiveBackup(input: {
     } finally { await handle.close(); }
     const sha256 = hash.digest('hex');
     const independentReadbackVerified = (await input.hashLivePartition()).toLowerCase() === sha256;
+    if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
     if (!independentReadbackVerified) throw new Error('backup file SHA-256 does not match independent second flash-read SHA-256');
     const imageInfo = await (input.inspect ?? inspectBackupImage)(tempOutput, input.length);
+    if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
     const build = getEmbeddedBuildInfo();
     const manifest: InactiveBackupManifest = {
       backupFormatVersion: 1, createdAt: new Date().toISOString(), chip: input.chip,
