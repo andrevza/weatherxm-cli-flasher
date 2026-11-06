@@ -40,7 +40,9 @@ describe('standalone executable packaging', () => {
     expect(help).toContain('DEVICE COMMANDS');
     expect(help).toContain('check <firmware>');
     expect(help).toContain('monitor');
-    expect(help).toContain('backup inactive');
+    expect(help).toContain('backup active|inactive');
+    expect(help).toContain('firmware download');
+    expect(help).toContain('firmware compare');
     expect(help).toContain('--stage-only');
     expect(help).toContain('--backup-manifest');
     expect(help).toContain('-v, --version');
