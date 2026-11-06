@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -159,5 +159,17 @@ describe('inactive OTA backup artifacts', () => {
       inspect: async () => { throw new Error('simulated unsupported image'); } })).rejects.toThrow(/simulated unsupported image/);
     await expect(readFile(output)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(`${output}.manifest.json`)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('removes temporary backup files when cancellation arrives during streaming', async () => {
+    const dir = await tempDir();
+    const output = join(dir, 'cancelled.bin');
+    const controller = new AbortController();
+    async function* chunks() { yield bytes.subarray(0, 4); controller.abort(); yield bytes.subarray(4); }
+    await expect(createInactiveBackup({ outputPath: output, label: 'ota_0', offset: 0x420000, length: 8,
+      chip: { model: 'ESP32-S3', revision: null }, readChunks: chunks(), signal: controller.signal,
+      hashLivePartition: async () => sha(bytes), inspect: async () => ({ descriptor: null,
+        signature: { status: 'not-verified' as const, imageLength: null, explanation: 'n/a' } }) })).rejects.toThrow(/cancelled/);
+    expect(await readdir(dir)).toEqual([]);
   });
 });

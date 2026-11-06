@@ -21,7 +21,7 @@ import type { ProgressReporter } from './progress.js';
 
 export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
-export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; }
+export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; signal?: AbortSignal; }
 export interface FlashConfirmation {
   deviceName: string; firmwareKey: string; firmwareLabel: string; activeSlot: string; targetSlot: string;
   targetOffset: number; bytes: number; sha256: string; recovery: boolean;
@@ -78,11 +78,12 @@ export function assertStageOnlySecurityEvidence(image: SecureBootImageEvidence, 
 }
 
 async function createOtaBackupWithTransport(transport: Wg1200Transport, outputPath: string, slot: 'ota_0' | 'ota_1',
-  chip: { model: string; revision: string | null }, progress?: ProgressReporter): Promise<InactiveBackupManifest> {
+  chip: { model: string; revision: string | null }, progress?: ProgressReporter, signal?: AbortSignal): Promise<InactiveBackupManifest> {
   const partition = slot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
   progress?.stage(`Reading ${slot}`, partition.size);
   const manifest = await createInactiveBackup({ outputPath, label: slot, offset: partition.offset, length: partition.size, chip,
-    readChunks: transport.readRegionChunks(partition.offset, partition.size, (done, total) => progress?.bytes(done, total)),
+    readChunks: transport.readRegionChunks(partition.offset, partition.size, (done, total) => progress?.bytes(done, total), signal),
+    signal,
     hashLivePartition: () => {
       progress?.stage(`Independently verifying ${slot}`, partition.size);
       return transport.hashRegionSha256(partition.offset, partition.size, (done, total) => progress?.bytes(done, total));
@@ -116,7 +117,7 @@ export async function backupInactiveOta(options: DeviceOptions & { outputPath: s
     const security = await transport.readSecureBootConfiguration();
     options.progress?.finish('complete');
     const manifest = await createOtaBackupWithTransport(transport, options.outputPath, targetSlot,
-      { model: security.chip.model, revision: security.chip.revision }, options.progress);
+      { model: security.chip.model, revision: security.chip.revision }, options.progress, options.signal);
     return { manifest, manifestPath: `${options.outputPath}.manifest.json` };
   } finally { options.progress?.stage('Returning gateway to normal boot'); await transport.disconnect(); options.progress?.finish('complete'); }
 }

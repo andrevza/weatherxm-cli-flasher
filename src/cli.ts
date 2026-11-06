@@ -301,9 +301,12 @@ async function main() {
     if (!args.port) throw new Error('backup requires --port, for example --port /dev/ttyUSB0');
     if (!args.outputFile) throw new Error('backup inactive requires --output <file>');
     const progress = createProgress(args);
+    const cancellation = new AbortController();
+    const onInterrupt = () => cancellation.abort();
+    process.once('SIGINT', onInterrupt);
     try {
       const result = await backupInactiveOta({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial,
-        outputPath: args.outputFile, selection: args.subcommand as 'active' | 'inactive', progress });
+        outputPath: args.outputFile, selection: args.subcommand as 'active' | 'inactive', progress, signal: cancellation.signal });
       const report = { outcome: 'BACKUP VERIFIED', backupFile: args.outputFile, manifestFile: result.manifestPath,
         partition: result.manifest.partition, bytes: result.manifest.bytes, sha256: result.manifest.sha256,
         independentReadbackVerified: result.manifest.independentReadbackVerified,
@@ -312,12 +315,13 @@ async function main() {
       if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
       else process.stdout.write(`BACKUP VERIFIED\nFile: ${report.backupFile}\nManifest: ${report.manifestFile}\nPartition: ${report.partition.label} @ 0x${report.partition.offset.toString(16)} (${report.bytes} bytes)\nSHA-256: ${report.sha256}\nIndependent readback: ${report.independentReadbackVerified ? 'MATCH' : 'FAILED'}\nFirmware: ${report.firmwareVersion ?? 'UNKNOWN'}\nSignature: ${report.signatureVerification.status} — ${report.signatureVerification.explanation}\nRestore capability: NOT ESTABLISHED\n`);
     } catch (error) {
-      progress.finish('failed');
+      progress.finish(cancellation.signal.aborted ? 'cancelled' : 'failed');
       const message = error instanceof Error ? error.message : String(error);
       if (args.json) process.stdout.write(`${JSON.stringify({ outcome: 'BACKUP FAILED', error: message, successfulBackup: false }, null, 2)}\n`);
       else process.stderr.write(`BACKUP FAILED: ${message}\n`);
       process.exitCode = 1;
     }
+    process.removeListener('SIGINT', onInterrupt);
     progress.close();
     return;
   }

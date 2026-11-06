@@ -759,14 +759,16 @@ export class Wg1200Transport {
   }
 
   /** Reads a bounded flash range in 4 KiB chunks without allocating the whole range. */
-  public async *readRegionChunks(offset: number, size: number, onProgress?: (completed: number, total: number) => void): AsyncGenerator<Uint8Array> {
+  public async *readRegionChunks(offset: number, size: number, onProgress?: (completed: number, total: number) => void, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
       throw new Error('Invalid flash read range');
     }
     let bytesRead = 0;
     while (bytesRead < size) {
+      if (signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
       const requestSize = Math.min(4096, size - bytesRead);
       const chunk = await this.readRegion(offset + bytesRead, requestSize);
+      if (signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
       if (chunk.byteLength !== requestSize) throw new Error(`Incomplete flash read at 0x${(offset + bytesRead).toString(16)}`);
       bytesRead += chunk.byteLength;
       onProgress?.(bytesRead, size);

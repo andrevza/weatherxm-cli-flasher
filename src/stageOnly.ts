@@ -94,7 +94,7 @@ export async function inspectBackupImage(path: string, partitionLength: number):
 export async function createInactiveBackup(input: {
   outputPath: string; label: 'ota_0' | 'ota_1'; offset: number; length: number;
   chip: { model: string; revision: string | null }; readChunks: AsyncIterable<Uint8Array>;
-  hashLivePartition: () => Promise<string>; inspect?: (path: string, length: number) => ReturnType<typeof inspectBackupImage>;
+  hashLivePartition: () => Promise<string>; signal?: AbortSignal; inspect?: (path: string, length: number) => ReturnType<typeof inspectBackupImage>;
 }): Promise<InactiveBackupManifest> {
   const outputPath = resolve(input.outputPath);
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
@@ -110,6 +110,7 @@ export async function createInactiveBackup(input: {
     let bytes = 0;
     try {
       for await (const chunk of input.readChunks) {
+        if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
         hash.update(chunk);
         bytes += chunk.byteLength;
         let cursor = 0;
@@ -119,6 +120,7 @@ export async function createInactiveBackup(input: {
           cursor += result.bytesWritten;
         }
       }
+      if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
       if (bytes !== input.length) throw new Error(`backup read length ${bytes} does not match partition length ${input.length}`);
       await handle.sync();
     } finally { await handle.close(); }
