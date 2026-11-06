@@ -380,6 +380,11 @@ export interface TerminalLogger {
   debug?: (msg: string) => void;
 }
 
+export interface TransportDisconnectResult {
+  normalBootResetSucceeded: boolean | null;
+  serialPortReleased: boolean;
+}
+
 export class Wg1200Transport {
   private loader: ESPLoader | null = null;
   private transport: Transport | null = null;
@@ -446,7 +451,6 @@ export class Wg1200Transport {
       this.logger.log(inspectHardware === 'rom-read-only' ? 'ROM loader ready for security register reads.' : inspectHardware ? 'Stub running. Inspecting hardware…' : 'ROM loader ready for security register reads.');
       if (inspectHardware === true) return await this.inspect();
     } catch (err: any) {
-      await this.disconnect(false);
       throw new Error(`Failed to initialize WG1200 serial connection: ${err.message ?? err}`);
     }
   }
@@ -803,7 +807,7 @@ export class Wg1200Transport {
     throw lastError;
   }
 
-  public async hashRegionSha256(offset: number, size: number, onProgress?: (completed: number, total: number) => void): Promise<string> {
+  public async hashRegionSha256(offset: number, size: number, onProgress?: (completed: number, total: number) => void, signal?: AbortSignal): Promise<string> {
     if (!this.loader) throw new Error('Not connected');
     if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
       throw new Error(`Invalid protected flash range offset=${offset} size=${size}`);
@@ -812,6 +816,7 @@ export class Wg1200Transport {
     const chunkSize = 4096;
     let bytesRead = 0;
     while (bytesRead < size) {
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
       const requestSize = Math.min(chunkSize, size - bytesRead);
       const chunk = await this.readChunkWithRetry(offset + bytesRead, requestSize, 2);
       if (chunk.byteLength !== requestSize) {
@@ -820,6 +825,7 @@ export class Wg1200Transport {
       hash.update(chunk);
       bytesRead += chunk.byteLength;
       onProgress?.(bytesRead, size);
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
       if (bytesRead < size) await new Promise((resolve) => setTimeout(resolve, 25));
     }
     return hash.digest('hex');
@@ -828,14 +834,14 @@ export class Wg1200Transport {
   /**
    * Snapshots SHA-256 hashes of all protected regions before flashing.
    */
-  public async snapshotProtectedRegions(preservedOtaSlot: 'ota_0' | 'ota_1', onProgress?: (name: string, completed: number, total: number) => void): Promise<ProtectedRegionSnapshot[]> {
+  public async snapshotProtectedRegions(preservedOtaSlot: 'ota_0' | 'ota_1', onProgress?: (name: string, completed: number, total: number) => void, signal?: AbortSignal): Promise<ProtectedRegionSnapshot[]> {
     const otaRegion = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
     const targets = [...PROTECTED_REGIONS.filter((region) => region.name !== 'otadata'),
       { name: 'preserved_ota', offset: otaRegion.offset, size: otaRegion.size }];
 
     const snapshots: ProtectedRegionSnapshot[] = [];
     for (const target of targets) {
-      const hash = await this.hashRegionSha256(target.offset, target.size, (completed, total) => onProgress?.(target.name, completed, total));
+      const hash = await this.hashRegionSha256(target.offset, target.size, (completed, total) => onProgress?.(target.name, completed, total), signal);
       snapshots.push({
         name: target.name,
         offset: target.offset,
@@ -852,13 +858,13 @@ export class Wg1200Transport {
    */
   public async verifyProtectedRegions(
     beforeSnapshots: ProtectedRegionSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1',
-    onProgress?: (name: string, completed: number, total: number) => void
+    onProgress?: (name: string, completed: number, total: number) => void, signal?: AbortSignal
   ): Promise<{ valid: boolean; mismatches: string[] }> {
     assertCompleteProtectedRegionSnapshots(beforeSnapshots, preservedOtaSlot);
     const mismatches: string[] = [];
 
     for (const snap of beforeSnapshots) {
-      const currentHash = await this.hashRegionSha256(snap.offset, snap.size, (completed, total) => onProgress?.(snap.name, completed, total));
+      const currentHash = await this.hashRegionSha256(snap.offset, snap.size, (completed, total) => onProgress?.(snap.name, completed, total), signal);
       if (!compareHexHashes(snap.sha256, currentHash)) {
         mismatches.push(`Protected partition '${snap.name}' was modified`);
       }
@@ -1251,27 +1257,32 @@ export class Wg1200Transport {
    * @param releaseReset If true (default), pulses and releases hardware reset (RTS=false, DTR=false)
    *                     so the ESP32-S3 boots out of ROM bootloader/stub into user firmware.
    */
-  public async disconnect(releaseReset: boolean = true): Promise<void> {
+  public async disconnect(releaseReset: boolean = true): Promise<TransportDisconnectResult> {
+    let normalBootResetSucceeded: boolean | null = null;
+    let serialPortReleased = true;
     if (this.transport || this.port) {
-      if (releaseReset && this.transport) {
+      if (releaseReset) {
         try {
           this.logger.log('Releasing USB reset and rebooting device into firmware…');
-          await this.hardReset();
+          normalBootResetSucceeded = await this.hardReset();
         } catch (e) {
           this.logger.error(`Error releasing reset: ${e}`);
+          normalBootResetSucceeded = false;
         }
       }
       if (this.transport) {
         try {
           await this.transport.disconnect();
         } catch (e) {
-          // ignore
+          serialPortReleased = false;
+          this.logger.error(`Could not release serial transport: ${e instanceof Error ? e.message : String(e)}`);
         }
         this.transport = null;
       }
     }
     this.loader = null;
     this.port = null;
+    return { normalBootResetSucceeded, serialPortReleased };
   }
 }
 

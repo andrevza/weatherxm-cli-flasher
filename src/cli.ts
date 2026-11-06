@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyFirmware, summarizeInspection } from './device.js';
+import { backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyConfirmationPhrase, StageOnlyOperationError, stageOnlyFirmware, summarizeInspection } from './device.js';
 import { catalogRows, DEFAULT_MANIFEST_URL, fetchCatalog } from './catalog.js';
 import { getOfficialFirmware } from './firmwareStore.js';
 import { compareBackupToFirmware, compareFirmwareFiles } from './firmwareCompare.js';
@@ -15,6 +15,7 @@ import { analyzeBootLogs } from './upstream/flasher/serialLog.js';
 import { monitorSerial, type MonitorLevel, writeMonitorOutput } from './monitor.js';
 import { formatCheckOutput, formatDryRunOutput, formatStatusOutput, standalonePresentationFixture } from './presentation.js';
 import { redactOutput, standaloneRedactionFixture } from './redaction.js';
+import { bindAbortOnSigint } from './interrupt.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
@@ -433,14 +434,14 @@ async function main() {
         const rl = createInterface({ input: stdin, output: stdout });
         try {
           const defaultChoice = args.backupManifest ? '2' : '1';
-          const selected = (await rl.question(`Choose 1, 2, or 3 [${defaultChoice}]: `)).trim() || defaultChoice;
+          const selected = (await rl.question(`Choose 1, 2, or 3 [${defaultChoice}]: `, { signal: stageAbort.signal })).trim() || defaultChoice;
           if (selected === '3') return { choice: 'decline' as const };
           if (selected === '1') {
-            const outputPath = (await rl.question(`New backup path [${defaultPath}]: `)).trim() || defaultPath;
+            const outputPath = (await rl.question(`New backup path [${defaultPath}]: `, { signal: stageAbort.signal })).trim() || defaultPath;
             return { choice: 'create' as const, outputPath };
           }
           if (selected === '2') {
-            const manifestPath = args.backupManifest || (await rl.question('Existing backup manifest path: ')).trim();
+            const manifestPath = args.backupManifest || (await rl.question('Existing backup manifest path: ', { signal: stageAbort.signal })).trim();
             if (!manifestPath) return { choice: 'decline' as const };
             return { choice: 'reuse' as const, manifestPath };
           }
@@ -448,23 +449,46 @@ async function main() {
         } finally { rl.close(); }
       };
       const confirmStage = async (summary: Parameters<Parameters<typeof stageOnlyFirmware>[0]['confirm']>[0]) => {
-        const reviewedDevice = args.redact ? '[REDACTED DEVICE ID]' : summary.deviceName;
-        const phrase = `STAGE ${reviewedDevice} ota_0 WeatherXM 0.8.34 ${summary.firmwareSha256}`;
+        const phrase = stageOnlyConfirmationPhrase(summary);
         progress.finish('complete', 'preflight complete; waiting for explicit write confirmation');
         progress.log(`\nSTAGE-ONLY WRITE PLAN\nDevice: ${summary.deviceModel} ${summary.deviceName} via ${args.port}\nActive partition: ${summary.activeSlot}; firmware ${summary.activeFirmware ?? 'UNKNOWN'} (preserved)\nInactive partition: ${summary.targetSlot}; existing firmware ${summary.backupFirmwareVersion ?? 'UNKNOWN'} (will be overwritten)\nPartition bound: [0x${summary.targetOffset.toString(16)}, 0x${(summary.targetOffset + summary.targetLength).toString(16)})\nCandidate: WeatherXM ${summary.firmwareVersion}, ${summary.imageBytes} bytes\nCandidate SHA-256: ${summary.firmwareSha256}\nBackup: ${summary.backupFile}\nBackup SHA-256: ${summary.backupSha256}\nBackup image/signature: ${summary.backupFirmwareVersion ?? 'UNKNOWN'} / ${summary.backupSignatureStatus}; restore is not proven\nErase range: [0x${summary.eraseStart.toString(16)}, 0x${summary.eraseEnd.toString(16)})\nFlash encryption enabled: ${summary.flashEncryption}\nPreserved: active ota_1, bootloader, partition table, factory, credentials, NVS, calibration, SPIFFS\nOTA metadata: WILL NOT CHANGE\nAutomatic activation: WILL NOT OCCUR\nRisk: power loss or interrupted transfer may leave ota_0 partially erased or written; no recovery guarantee is implied.\nType exactly: ${phrase}`);
         if (!stdin.isTTY || !stdout.isTTY) throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: use an interactive terminal; --yes is not allowed');
         const rl = createInterface({ input: stdin, output: stdout });
-        try { return (await rl.question('Confirm stage-only write: ')) === phrase; }
+        try { return (await rl.question('Confirm stage-only write: ', { signal: stageAbort.signal })) === phrase; }
         finally { rl.close(); }
       };
+      const stageAbort = new AbortController();
+      const removeStageInterrupt = bindAbortOnSigint(process, stageAbort);
       try {
         const result = await stageOnlyFirmware({ portPath: args.port, baudRate: args.baud, traceSerial: args.traceSerial, verbose: args.verbose,
-          backupManifestPath: args.backupManifest, chooseBackup, confirm: confirmStage, progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
+          backupManifestPath: args.backupManifest, chooseBackup, confirm: confirmStage, progress, offline: args.offline, cacheDirectory: args.cacheDirectory, signal: stageAbort.signal });
         if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
         else process.stdout.write(`${result.outcome}\nSecure Boot V2 signature: VERIFIED\nDevice digest slot 0: TRUSTED\nHardware MD5: VERIFIED (${result.expectedMd5})\nExpected SHA-256: ${result.firmwareSha256}\nReadback SHA-256: ${result.actualSha256}\nBytes verified: ${result.bytesRead}\nTarget range: [0x${result.targetRange.start.toString(16)}, 0x${result.targetRange.end.toString(16)})\nErase range: [0x${result.eraseRange.start.toString(16)}, 0x${result.eraseRange.end.toString(16)})\nOTA metadata unchanged: YES\nActive ota_1 unchanged: YES\nProtected regions unchanged: YES\nAutomatic activation: NO\n`);
       } catch (error) {
         progress.finish('failed');
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof StageOnlyOperationError) {
+          const cancelled = error.kind === 'operator_cancelled';
+          const noWrite = !error.writeInitiated;
+          const outcome = cancelled ? 'STAGING CANCELLED — NO FLASH MODIFICATIONS'
+            : error.kind === 'device_reset_failed' ? 'STAGING FAILED — DEVICE RESET FAILED; POWER-CYCLE REQUIRED'
+            : error.kind === 'post_write_verification_failed' ? 'STAGING FAILED — POST-WRITE VERIFICATION FAILED'
+            : error.writeInitiated ? 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN'
+            : error.kind === 'operator_declined' ? 'STAGING DECLINED — NO FLASH MODIFICATIONS'
+            : 'STAGING BLOCKED — PREFLIGHT FAILED';
+          const report = { outcome, error: message, writeInitiated: error.writeInitiated,
+            ...(noWrite ? { noFlashModifications: true } : {}), normalBootResetSucceeded: error.normalBootResetSucceeded,
+            serialPortReleased: error.serialPortReleased };
+          const resetReport = error.normalBootResetSucceeded === true ? 'Returning gateway to normal boot... DONE'
+            : error.normalBootResetSucceeded === false ? 'WARNING: normal boot reset failed; power-cycle the gateway before further use.'
+            : 'No ROM connection was opened; reset was not required.';
+          const portReport = error.serialPortReleased === true ? 'Serial port released.'
+            : error.serialPortReleased === false ? 'WARNING: serial port release failed.' : 'Serial port was not opened.';
+          if (!args.json) process.stderr.write(`${cancelled ? 'Stage-only operation cancelled.' : error.kind === 'operator_declined' ? 'Stage-only operation declined.' : 'Stage-only preflight failed.'}\n${noWrite ? 'No flash erase or write initiated.' : 'A flash erase/write may have started; target contents require read-only verification.'}\n${resetReport}\n${portReport}\n\n${outcome}\n`);
+          else process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+          process.exitCode = 1;
+          return;
+        }
         const outcome = message.startsWith('STAGING FAILED — PROTECTED') ? 'STAGING FAILED — PROTECTED REGION CHANGED'
           : message.startsWith('STAGING FAILED — VERIFICATION') ? 'STAGING FAILED — VERIFICATION MISMATCH'
           : message.startsWith('STAGING FAILED — TARGET') ? 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN'
@@ -474,9 +498,9 @@ async function main() {
           : message.startsWith('STAGING BLOCKED') ? 'STAGING BLOCKED — PREFLIGHT FAILED'
           : 'STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN';
         if (args.json) process.stdout.write(`${JSON.stringify({ outcome, error: message, otaMetadataModified: false }, null, 2)}\n`);
-        else process.stderr.write(`${outcome}: ${message}\n`);
+        else process.stderr.write(`${message.startsWith(outcome) ? message : `${outcome}: ${message}`}\n`);
         process.exitCode = 1;
-      }
+      } finally { removeStageInterrupt(); }
       progress.close();
       return;
     }

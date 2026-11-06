@@ -23,9 +23,31 @@ export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af9
 
 export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; verbose?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; signal?: AbortSignal; }
 
+export class StageOnlyOperationError extends Error {
+  constructor(message: string, public kind: 'operator_cancelled' | 'operator_declined' | 'preflight_blocked' | 'transport_error' | 'firmware_verification_failed' | 'physical_write_failed' | 'post_write_verification_failed' | 'device_reset_failed',
+    readonly writeInitiated: boolean, public normalBootResetSucceeded: boolean | null = null, public serialPortReleased: boolean | null = null) { super(message); this.name = 'StageOnlyOperationError'; }
+}
+export function stageOnlyConfirmationPhrase(summary: Pick<StageOnlySummary, 'targetSlot' | 'firmwareVersion' | 'firmwareSha256'>): string {
+  return `STAGE ${summary.targetSlot} WeatherXM ${summary.firmwareVersion} ${summary.firmwareSha256}`;
+}
+export async function cleanupStageOnlyConnection(operations: { hardReset(): Promise<boolean>; disconnect(releaseReset: boolean): Promise<{ serialPortReleased: boolean }> }, alreadyReset = false): Promise<{ normalBootResetSucceeded: boolean | null; serialPortReleased: boolean }> {
+  const normalBootResetSucceeded = alreadyReset ? null : await operations.hardReset();
+  const { serialPortReleased } = await operations.disconnect(false);
+  return { normalBootResetSucceeded, serialPortReleased };
+}
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) { const error = new Error('Operation cancelled with Ctrl+C'); error.name = 'AbortError'; throw error; }
+}
+
 function diagnostic(progress: ProgressReporter | undefined, message: string): void {
   if (progress) progress.log(message);
   else process.stderr.write(`${message.replaceAll('\r', '')}\n`);
+}
+async function disconnectAndReport(transport: { disconnect(releaseReset?: boolean): Promise<{ normalBootResetSucceeded: boolean | null; serialPortReleased: boolean }> }, progress?: ProgressReporter, releaseReset = true): Promise<void> {
+  const result = await transport.disconnect(releaseReset);
+  if (result.normalBootResetSucceeded === false) progress?.log('WARNING: normal-boot reset request failed; power-cycle the gateway before further use.');
+  else if (result.normalBootResetSucceeded === true) progress?.finish('complete', 'normal boot reset signal sent');
+  if (!result.serialPortReleased) progress?.log('WARNING: serial port release failed.');
 }
 
 function transportLogger(options: DeviceOptions) {
@@ -133,7 +155,7 @@ export async function backupInactiveOta(options: DeviceOptions & { outputPath: s
     const manifest = await createOtaBackupWithTransport(transport, options.outputPath, targetSlot,
       { model: security.chip.model, revision: security.chip.revision }, options.progress, options.signal);
     return { manifest, manifestPath: `${options.outputPath}.manifest.json` };
-  } finally { options.progress?.stage('Returning gateway to normal boot'); await transport.disconnect(); options.progress?.finish('complete'); }
+  } finally { options.progress?.stage('Returning gateway to normal boot'); await disconnectAndReport(transport, options.progress); }
 }
 
 /** First physical stage-only operation: writes only ota_0 and never commits OTA metadata. */
@@ -159,6 +181,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
   });
   options.progress?.finish('complete', selected.reused ? 'verified local cache reused' : 'downloaded and verified cache entry');
+  if (options.signal?.aborted) throw new StageOnlyOperationError('Operation cancelled with Ctrl+C', 'operator_cancelled', false, null, null);
   if (selected.entry.version !== '0.8.34' || selected.entry.sha256.toLowerCase() !== STAGE_ONLY_WXM_0834_SHA256 ||
       selected.descriptor.firmwareType !== 'weatherxm' || selected.entry.category !== 'weatherxm') {
     throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: official WeatherXM 0.8.34 artifact identity does not match the approved digest');
@@ -171,9 +194,13 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   let released = false;
   let writeStarted = false;
+  let resetAttempted = false;
+  let operationError: StageOnlyOperationError | undefined;
   try {
+    throwIfAborted(options.signal);
     options.progress?.stage('Connecting to ROM and initializing flash reader');
     const before = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    throwIfAborted(options.signal);
     options.progress?.finish('complete', 'ROM stub ready');
     options.progress?.stage('Preflighting device and partition layout');
     assertSafeInspection(before, await exactLayoutErrors(transport));
@@ -183,25 +210,29 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: active ota_1 firmware is not the confirmed WeatherXM 0.8.34-g86b609b build');
     }
     const security = await transport.readSecureBootConfiguration();
+    throwIfAborted(options.signal);
     assertStageOnlySecurityEvidence(image, security);
     const target = WG1200_CONSTANTS.APP_OTA_0;
     let backupManifestPath = options.backupManifestPath;
     if (options.chooseBackup) {
       const choice = await options.chooseBackup({ targetSlot: 'ota_0', targetOffset: target.offset, targetLength: target.size,
         existingFirmware: before.inactiveFirmware?.version ?? null });
+      throwIfAborted(options.signal);
       if (choice.choice === 'decline') throw new Error('STAGING BLOCKED — BACKUP REQUIRED: current stage-only policy does not permit proceeding without a verified target backup');
       if (choice.choice === 'reuse') backupManifestPath = choice.manifestPath;
       if (choice.choice === 'create') {
         const created = await createOtaBackupWithTransport(transport, choice.outputPath, 'ota_0',
-          { model: security.chip.model, revision: security.chip.revision }, options.progress);
+          { model: security.chip.model, revision: security.chip.revision }, options.progress, options.signal);
         if (!created.independentReadbackVerified) throw new Error('STAGING BLOCKED — BACKUP INVALID: newly created backup failed independent readback');
         backupManifestPath = `${choice.outputPath}.manifest.json`;
       }
     }
     if (!backupManifestPath) throw new Error('STAGING BLOCKED — BACKUP REQUIRED: create a new backup or provide a verified backup manifest');
     const backup = await validateInactiveBackup(backupManifestPath, { label: 'ota_0', offset: target.offset, length: target.size });
+    throwIfAborted(options.signal);
     options.progress?.stage('Verifying backup freshness against live ota_0', target.size);
-    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size, (done, total) => options.progress?.bytes(done, total));
+    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size, (done, total) => options.progress?.bytes(done, total), options.signal);
+    throwIfAborted(options.signal);
     options.progress?.finish('complete');
     if (liveBackupHash.toLowerCase() !== backup.manifest.sha256.toLowerCase()) throw new Error('STAGING BLOCKED — BACKUP INVALID: live ota_0 no longer matches the verified backup');
 
@@ -214,10 +245,11 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     options.progress?.stage('Hashing protected partitions and active ota_1');
     const protectedSnapshots = await transport.snapshotProtectedRegions('ota_1', (name, done, total) => {
       options.progress?.event({ stage: `Hashing protected ${name}`, completed: done, total });
-    });
+    }, options.signal);
     options.progress?.finish('complete');
     options.progress?.stage('Hashing bootloader and partition table', WG1200_CONSTANTS.PARTITION_TABLE.offset);
-    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => options.progress?.bytes(done, total));
+    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => options.progress?.bytes(done, total), options.signal);
+    throwIfAborted(options.signal);
     options.progress?.finish('complete');
     const eraseRange = getApplicationEraseRange(target.offset, selected.verified.data.byteLength);
     const summary: StageOnlySummary = {
@@ -231,6 +263,8 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       metadataWillChange: false, autoActivation: false,
     };
     const confirmed = await options.confirm(summary);
+    throwIfAborted(options.signal);
+    if (!confirmed) throw new Error('STAGING BLOCKED — OPERATOR DECLINED: confirmation was not accepted; no write was started');
     const shaReadback = async (offset: number, length: number) => transport.hashRegionSha256(offset, length);
     const transaction = await runStageOnlyTransaction({
       revalidate: async () => {
@@ -287,6 +321,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
         return result;
       },
       resetNormal: async () => {
+        resetAttempted = true;
         options.progress?.stage('Returning gateway to normal boot');
         if (!(await transport.hardReset())) throw new Error('normal-mode reset signal was unavailable');
         released = true;
@@ -306,10 +341,37 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       protectedRegionsUnchanged: true, automaticActivation: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (message.startsWith('STAGING ')) throw error;
-    if (writeStarted) throw new Error(`STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN: ${message}`);
-    throw new Error(`STAGING BLOCKED — PREFLIGHT FAILED: ${message}`);
-  } finally { await transport.disconnect(!released); options.progress?.close(); }
+    const kind = error instanceof Error && error.name === 'AbortError' ? 'operator_cancelled'
+      : message.includes('OPERATOR DECLINED') ? 'operator_declined'
+      : /signature|signer|Secure Boot V2|digest slot/i.test(message) ? 'firmware_verification_failed'
+      : writeStarted && /VERIFICATION|PROTECTED REGION|normal-boot reset/i.test(message) ? 'post_write_verification_failed'
+      : writeStarted ? 'physical_write_failed'
+      : /serial connection|serial transport|ROM loader|transport/i.test(message) ? 'transport_error' : 'preflight_blocked';
+    const clean = message.replace(/^STAGING (?:BLOCKED|FAILED) — [^:]+:\s*/, '');
+    operationError = new StageOnlyOperationError(clean, kind, writeStarted);
+  } finally {
+    let cleanup: { normalBootResetSucceeded: boolean | null; serialPortReleased: boolean };
+    try {
+      if (!resetAttempted) {
+        resetAttempted = true;
+        options.progress?.stage('Returning gateway to normal boot');
+        released = await transport.hardReset();
+        if (released) options.progress?.finish('complete', 'normal boot reset signal sent');
+        else options.progress?.log('WARNING: normal-boot reset request failed; power-cycle the gateway before further use.');
+      }
+      cleanup = await cleanupStageOnlyConnection(transport, true);
+    } catch (cleanupError) {
+      cleanup = { normalBootResetSucceeded: released, serialPortReleased: false };
+      options.progress?.log(`WARNING: gateway cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}; power-cycle the gateway before further use.`);
+    }
+    if (operationError) {
+      operationError.normalBootResetSucceeded = released;
+      operationError.serialPortReleased = cleanup.serialPortReleased;
+      if (!released) operationError.kind = 'device_reset_failed';
+    }
+    options.progress?.close();
+  }
+  throw operationError ?? new Error('Stage-only operation ended without a result');
 }
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
@@ -328,8 +390,7 @@ export async function readDeviceSecurity(options: DeviceOptions): Promise<Secure
     return result;
   } finally {
     options.progress?.stage('Returning gateway to normal boot');
-    await transport.disconnect();
-    options.progress?.finish('complete');
+    await disconnectAndReport(transport, options.progress);
   }
 }
 
@@ -598,7 +659,7 @@ export async function inspectDevice(options: DeviceOptions): Promise<Wg1200Inspe
     options.progress?.finish('failed');
     throw error;
   } finally {
-    await transport.disconnect();
+    await disconnectAndReport(transport, options.progress);
   }
 }
 
@@ -701,7 +762,7 @@ export async function flashDevice(options: DeviceOptions & {
     firmwareReleased = transactionResult.deviceReleased;
     completed = { deviceName: summary.deviceName, firmwareKey: options.firmwareKey, targetSlot: summary.targetSlot, targetOffset: summary.targetOffset, sha256: verified.sha256, ...transactionResult };
   } finally {
-    await transport.disconnect(!firmwareReleased);
+    await disconnectAndReport(transport, options.progress, !firmwareReleased);
   }
   if (!completed) throw new Error('Firmware write completed without a result');
   const bootSeconds = options.bootLogSeconds ?? 15;
