@@ -1,5 +1,100 @@
 # WG1200 recovery readiness
 
+## Final flash-path decision (6 November 2026)
+
+**BLOCKED — installed bootloader recovery and anti-rollback configuration are
+not established.** The unconditional `FIRMWARE_SECURITY_BLOCKED` policy remains
+in force. No physical write was attempted. Current read-only boot evidence
+shows one successful boot from `ota_1`; it does not validate fallback, power
+loss, rollback, or restoration. The inactive `ota_0` application would be
+overwritten by the normal OTA transaction and is not backed up by this CLI.
+The running `ota_1` application is preserved by the transaction, but its
+independent flash integrity and a tested recovery procedure are not established.
+
+### Final transaction review
+
+The source transaction now performs: strict device/layout and OTA inspection;
+manifest SHA-256 and descriptor checks; a hard readiness gate; Secure Boot V2
+image signature and device signer trust checks; read-only flash-encryption and
+ROM download eFuse checks; pre-write protected-region and preserved-slot SHA-256
+snapshots; exact OTA metadata reread; one guarded inactive-slot write; on-chip
+MD5 plus independent streamed SHA-256 readback of the target image; protected
+region and preserved-slot SHA-256 rechecks; then a one-sector OTA metadata
+commit with CRC/sequence/state readback and unchanged peer verification. Any
+pre-commit failure stops without OTA activation. Application image structure
+is validated before writing, and the same signed bytes are independently
+readback-hashed after writing. Post-reset logs remain observations: app
+health, Wi-Fi and MQTT are not proven by this CLI, and it reports failed or
+missing expected slot/version evidence rather than treating a flash write as a
+successful boot.
+
+The added eFuse report reads only existing ESP32-S3 eFuse read registers. It
+reports `SPI_BOOT_CRYPT_CNT` (odd parity means flash encryption enabled),
+`DIS_DOWNLOAD_MANUAL_ENCRYPT`, `DIS_DOWNLOAD_MODE`,
+`DIS_USB_SERIAL_JTAG_DOWNLOAD_MODE`, `DIS_USB_OTG_DOWNLOAD_MODE`, and
+`ENABLE_SECURITY_DOWNLOAD`. Unknown or incompatible flash-encryption/ROM
+write conditions fail closed. Anti-rollback enforcement is not inferable from
+eFuses alone; the installed bootloader build configuration remains unknown, so
+the install preflight rejects it and the global gate remains blocked.
+
+### Upstream comparison
+
+Reviewed WeatherXM web-flasher revision
+`35b2ecc4ccb31799ecd720609786362a99b3e33a` uses
+`flasherController.ts::flashFirmware`: manifest SHA-256 image validation,
+`transport.ts::installApplication` (guarded OTA slot with `eraseAll:false`),
+`verifyApplicationFlash` (ESP hardware MD5), then
+`writeOtaSelectSector` (one-sector CRC/sequence/state verification). Its
+`snapshotProtectedRegions` covers four regions; protected-region comparison
+occurs after the OTA metadata commit, and read hiccups are notices. It does not
+perform target SHA-256 readback or local RSA-PSS/device-key trust validation.
+It resets and captures logs, but boot analysis is informational. This CLI
+checks protected data before commit, additionally protects the preserved OTA
+slot, now performs target SHA-256 readback, and validates candidate signer
+against device eFuse digest before any application write could occur. Those
+improvements do not substitute for physical recovery evidence.
+
+### Candidate and operator checklist
+
+The official manifest read on 6 November 2026 lists WeatherXM 0.8.34
+(`bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb`), the
+exact active version, legacy WeatherXM 0.6.2, and Meshtastic 2.8.1 variants.
+The identical image is not a meaningful first-write test; 0.6.2 is a downgrade
+against unknown rollback settings; Meshtastic is a different firmware family.
+No different compatible WeatherXM upgrade is currently listed. Do not write
+any of these as a test target.
+
+Before a future controlled installation, an operator must complete every item
+below and the maintainer must explicitly resolve the code's `BLOCKED` gate:
+
+1. Build/use the reviewed candidate and record its manifest SHA-256; verify
+   image RSA-PSS and signer digest against read-only device eFuse evidence.
+2. On the Pi, run `wg1200 security --port /dev/ttyUSB0 --json --redact` and
+   `wg1200 info --port /dev/ttyUSB0 --json --redact`; confirm Secure Boot,
+   flash-encryption, ROM download availability, active/inactive slots, and
+   exact device identity. The current anti-rollback check must also be resolved.
+3. Preserve and independently validate a recovery artifact for the current
+   active `ota_1` image; confirm physical ROM access and a tested recovery
+   procedure. The CLI does not create or restore that artifact.
+4. Review an explicit confirmation naming gateway, exact firmware and SHA-256,
+   target inactive slot, preserved active slot, and failed-boot risk. Do not
+   use `--force` or any erase/full-flash command as a security bypass.
+5. No current manifest entry is a suitable distinct WeatherXM upgrade, so
+   there is no valid install command to run today. If a compatible signed
+   candidate becomes available and every blocker is resolved, the guarded
+   interactive invocation is `wg1200 flash <approved-firmware-key> --port
+   /dev/ttyUSB0`. This single transaction writes only the inactive OTA
+   application partition and commits OTA metadata only after MD5/SHA-256,
+   protected-region, and metadata checks. Stop if any check fails.
+6. Use `wg1200 monitor --boot --port /dev/ttyUSB0 --redact` to review boot
+   output. Independently verify application health, Wi-Fi and MQTT before
+   declaring service restored.
+
+These are preparation steps, not an executable authorization: with the
+current source gate, `flash` cannot write. Recovery branches for boot failure
+are limited to read-only observation and vendor support; do not clear
+`otadata`, erase flash, or assume the older inactive image is recoverable.
+
 ## Bootloader identification research (5 November 2026)
 
 ### Supplied continuous boot capture evidence

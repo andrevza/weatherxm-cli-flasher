@@ -12,9 +12,19 @@ The reference checkout is the independent repository `https://github.com/Weather
 4. **Choose the inactive OTA slot.** `determineActiveBootSlot()` parses two 4 KiB OTA sectors, sequence, state, and ESP-IDF CRC32; the larger valid sequence determines active slot (`(seq - 1) % 2`). Target is the other OTA slot, and target metadata sector is the opposite metadata sector. Fully erased metadata selects factory as active and `ota_0` as target; invalid non-erased data is marked ambiguous and enters recovery UI (`otadata.ts`). The controller uses the partition-table-resolved target offset.
 5. **Snapshot critical regions.** `snapshotProtectedRegions()` reads and SHA-256 snapshots the partition table, secure certificate, NVS, and NVS key. It does not snapshot `phy_init` or SPIFFS. OTA metadata is intentionally modified later.
 6. **Write application.** `installApplication()` calls `assertAllowedApplicationWrite()`, which only allows a range wholly contained within `ota_0` (`0x420000..0x81FFFF`) or `ota_1` (`0x820000..0xC1FFFF`), no more than 4 MiB, and rejects intersection with every protected range. Factory `0x020000..0x41FFFF` is forbidden for normal installs. `ESPLoader.writeFlash()` is called with a single image, `flashSize: '16MB'`, DIO, 80 MHz, compression enabled, and `eraseAll: false` (`writeGuard.ts`, `transport.ts`).
-7. **Verify image on chip.** The expected MD5 is calculated from downloaded firmware and compared with ESP32 `flashMd5sum(targetOffset, imageLength)` (`flasherController.ts`, `transport.ts`).
+7. **Verify image on chip.** The expected MD5 is calculated from downloaded firmware and compared with ESP32 `flashMd5sum(targetOffset, imageLength)` (`flasherController.ts`, `transport.ts`). The upstream flow has no independent target-region SHA-256 readback.
 8. **Activate transactionally.** `buildTransactionalOtadataSector()` creates one 4096-byte sector filled with `0xFF`, sequence at byte 0, `ESP_OTA_IMG_VALID` (2) at byte 24, and CRC32 at byte 28. `writeOtaSelectSector()` only permits address `0x13000` or `0x14000`, writes exactly 4096 bytes with `eraseAll: false`, then reads it back and validates CRC/sequence/state. The other metadata sector is left untouched (`otadata.ts`, `writeGuard.ts`, `transport.ts`).
-9. **Check preservation and reboot.** Controller re-reads the four snapshotted regions and compares SHA-256. A mismatch fails the operation; a serial read hiccup is logged as notice after the application MD5 and OTA pointer were verified. It toggles RTS/DTR to reset into normal mode, disconnects, reopens serial at 115200, and captures/sanitizes boot logs for 12 seconds (`hardReset()`, `disconnect()`, `captureBootLogs()`). Boot-log signature detection is informational, not a hard verification of successful OTA boot.
+9. **Check preservation and reboot.** Controller re-reads the four snapshotted regions and compares SHA-256 after OTA metadata has already been committed. A mismatch fails the operation after activation; a serial read hiccup is logged as notice. It toggles RTS/DTR to reset into normal mode, disconnects, reopens serial at 115200, and captures/sanitizes boot logs for 12 seconds (`hardReset()`, `disconnect()`, `captureBootLogs()`). Boot-log signature detection is informational, not a hard verification of successful OTA boot.
+
+The current CLI adds independent target-region SHA-256 readback and checks its
+protected-region and preserved OTA-slot snapshots before committing the
+alternate metadata sector. It also verifies the signed candidate image and
+compares the signer digest with read-only device eFuse evidence in the
+pre-install path. Flash encryption/ROM download restrictions are now surfaced
+from read-only eFuse fields. The installed bootloader's anti-rollback and
+recovery behavior remain unknown; the unconditional firmware-write gate is
+still `BLOCKED`, so none of these transaction improvements have been exercised
+on physical hardware.
 
 ## Comparison with the supplied successful device log
 

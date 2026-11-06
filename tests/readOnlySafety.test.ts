@@ -44,6 +44,7 @@ const OTA_BEFORE = (() => {
   bytes.set(buildOtadataSector(1, ESP_OTA_IMG_VALID), 0);
   return bytes;
 })();
+function sha256(bytes: Uint8Array) { return createHash('sha256').update(bytes).digest('hex'); }
 
 function protectedSnapshots(preservedOtaSlot: 'ota_0' | 'ota_1' = 'ota_0') {
   const ota = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
@@ -280,6 +281,7 @@ describe('read-only safety validation', () => {
       readOtadataSnapshot: vi.fn(async () => OTA_BEFORE),
       installApplication: vi.fn(async () => { calls.push('write-app'); }),
       verifyApplicationFlash: vi.fn(async () => { calls.push('verify-app'); return false; }),
+      verifyApplicationSha256: vi.fn(async () => true),
       writeOtaSelectSector: vi.fn(async () => { calls.push('select-ota'); }),
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => { calls.push('reset'); }),
@@ -289,11 +291,50 @@ describe('read-only safety validation', () => {
     expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
   });
 
+  it('stops before verification and activation when the application write is interrupted or disconnected', async () => {
+    const installApplication = vi.fn(async () => { throw new Error('serial disconnected during write'); });
+    const mock = {
+      readOtadataSnapshot: vi.fn(async () => OTA_BEFORE), installApplication,
+      verifyApplicationFlash: vi.fn(async () => true), verifyApplicationSha256: vi.fn(async () => true),
+      writeOtaSelectSector: vi.fn(async () => undefined),
+      verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
+      hardReset: vi.fn(async () => undefined),
+    };
+    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset,
+      firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: protectedSnapshots(),
+      otadataBefore: OTA_BEFORE, preservedOtaSlot: 'ota_0' })).rejects.toThrow(/serial disconnected during write/);
+    expect(installApplication).toHaveBeenCalledTimes(1);
+    expect(mock.verifyApplicationFlash).not.toHaveBeenCalled();
+    expect(mock.verifyApplicationSha256).not.toHaveBeenCalled();
+    expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
+    expect(mock.hardReset).not.toHaveBeenCalled();
+  });
+
+  it('keeps OTA selection untouched when independent application SHA-256 readback fails', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const calls: string[] = [];
+    const mock = {
+      readOtadataSnapshot: vi.fn(async () => OTA_BEFORE),
+      installApplication: vi.fn(async () => { calls.push('write-app'); }),
+      verifyApplicationFlash: vi.fn(async () => { calls.push('verify-md5'); return true; }),
+      verifyApplicationSha256: vi.fn(async () => { calls.push('verify-sha256'); return false; }),
+      verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
+      writeOtaSelectSector: vi.fn(async () => { calls.push('select-ota'); }),
+      hardReset: vi.fn(async () => { calls.push('reset'); }),
+    };
+    await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: bytes,
+      expectedSha256: sha256(bytes), nextSeq: 2, targetSector: 1, snapshots: protectedSnapshots(), otadataBefore: OTA_BEFORE,
+      preservedOtaSlot: 'ota_0' })).rejects.toThrow(/SHA-256 readback mismatch/);
+    expect(calls).toEqual(['write-app', 'verify-md5', 'verify-sha256']);
+    expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
+    expect(mock.hardReset).not.toHaveBeenCalled();
+  });
+
   it('rechecks the complete OTA selection immediately before writing and rejects stale or active-slot targets', async () => {
     const installApplication = vi.fn(async () => undefined);
     const mock = {
       readOtadataSnapshot: vi.fn(async () => OTA_BEFORE), installApplication,
-      verifyApplicationFlash: vi.fn(async () => true), writeOtaSelectSector: vi.fn(async () => undefined),
+      verifyApplicationFlash: vi.fn(async () => true), verifyApplicationSha256: vi.fn(async () => true), writeOtaSelectSector: vi.fn(async () => undefined),
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })), hardReset: vi.fn(async () => undefined),
     };
     const changed = new Uint8Array(OTA_BEFORE); changed[0] ^= 1;
@@ -313,7 +354,7 @@ describe('read-only safety validation', () => {
     writeOtaSelectSector.mockRejectedValueOnce(new Error('metadata readback failed'));
     const base = {
       readOtadataSnapshot: vi.fn(async () => OTA_BEFORE),
-      installApplication: vi.fn(async () => undefined), verifyApplicationFlash: vi.fn(async () => true),
+      installApplication: vi.fn(async () => undefined), verifyApplicationFlash: vi.fn(async () => true), verifyApplicationSha256: vi.fn(async () => true),
       writeOtaSelectSector,
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => undefined),
@@ -335,12 +376,13 @@ describe('read-only safety validation', () => {
       readOtadataSnapshot: vi.fn(async () => OTA_BEFORE),
       installApplication: vi.fn(async () => { calls.push('erase-write'); }),
       verifyApplicationFlash: vi.fn(async () => { calls.push('image-verify'); return true; }),
+      verifyApplicationSha256: vi.fn(async () => { calls.push('sha-verify'); return true; }),
       verifyProtectedRegions: vi.fn(async () => { calls.push('protected-verify'); return { valid: false, mismatches: ['spiffs changed'] }; }),
       writeOtaSelectSector: vi.fn(async () => { calls.push('ota-commit'); }),
       hardReset: vi.fn(async () => { calls.push('reset'); }),
     };
     await expect(runOtaWriteTransaction(mock, { targetOffset: WG1200_CONSTANTS.APP_OTA_1.offset, firmwareBytes: new Uint8Array([1]), nextSeq: 2, targetSector: 1, snapshots: protectedSnapshots(), otadataBefore: OTA_BEFORE, preservedOtaSlot: 'ota_0' })).rejects.toThrow(/spiffs changed/);
-    expect(calls).toEqual(['erase-write', 'image-verify', 'protected-verify']);
+    expect(calls).toEqual(['erase-write', 'image-verify', 'sha-verify', 'protected-verify']);
     expect(mock.writeOtaSelectSector).not.toHaveBeenCalled();
     expect(mock.hardReset).not.toHaveBeenCalled();
   });
@@ -350,6 +392,7 @@ describe('read-only safety validation', () => {
       readOtadataSnapshot: vi.fn(async () => OTA_BEFORE),
       installApplication: vi.fn(async () => undefined),
       verifyApplicationFlash: vi.fn(async () => true),
+      verifyApplicationSha256: vi.fn(async () => true),
       writeOtaSelectSector: vi.fn(async () => undefined),
       verifyProtectedRegions: vi.fn(async () => ({ valid: true, mismatches: [] })),
       hardReset: vi.fn(async () => true),

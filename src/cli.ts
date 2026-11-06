@@ -163,7 +163,10 @@ function formatSecurityResult(device: import('./upstream/flasher/secureBoot.js')
     `Secure version  ${device.secureVersion.value ?? 'UNKNOWN'} (${device.secureVersion.status})`,
     `Anti-rollback   ${device.antiRollbackEnforcement.state.toUpperCase()} — ${device.antiRollbackEnforcement.explanation}`,
     `Download mode   ${device.downloadMode.status === 'verified'
-      ? `disableAll=${device.downloadMode.disableAllDownload}, disableUsbSerialJtag=${device.downloadMode.disableUsbSerialJtagDownload}, secureDownload=${device.downloadMode.securityDownloadEnabled}`
+      ? `disableAll=${device.downloadMode.disableAllDownload}, disableUsbSerialJtag=${device.downloadMode.disableUsbSerialJtagDownload}, disableUsbOtg=${device.downloadMode.disableUsbOtgDownload}, secureDownload=${device.downloadMode.securityDownloadEnabled}`
+      : 'UNKNOWN'}`,
+    `Flash encryption ${device.flashEncryption.status === 'verified'
+      ? `enabled=${device.flashEncryption.enabled}, SPI_BOOT_CRYPT_CNT=${device.flashEncryption.cryptCount}, manualEncryptDisabled=${device.flashEncryption.disableManualEncryption}`
       : 'UNKNOWN'}`,
     `Evidence        ${device.evidence.toUpperCase()}`,
     '',

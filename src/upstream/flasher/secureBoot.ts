@@ -46,7 +46,14 @@ export interface SecureBootDeviceState {
   downloadMode: {
     disableAllDownload: boolean | null;
     disableUsbSerialJtagDownload: boolean | null;
+    disableUsbOtgDownload: boolean | null;
     securityDownloadEnabled: boolean | null;
+    status: EvidenceStatus;
+  };
+  flashEncryption: {
+    cryptCount: number | null;
+    enabled: boolean | null;
+    disableManualEncryption: boolean | null;
     status: EvidenceStatus;
   };
   evidence: EvidenceStatus;
@@ -200,10 +207,18 @@ export async function readEsp32S3SecureBootState(
     ? {
         disableAllDownload: readBits(words, 128, 1) === 1,
         disableUsbSerialJtagDownload: readBits(words, 132, 1) === 1,
+        disableUsbOtgDownload: readBits(words, 159, 1) === 1,
         securityDownloadEnabled: readBits(words, 133, 1) === 1,
         status: 'verified' as const,
       }
-    : { disableAllDownload: null, disableUsbSerialJtagDownload: null, securityDownloadEnabled: null, status: 'unavailable' as const };
+    : { disableAllDownload: null, disableUsbSerialJtagDownload: null, disableUsbOtgDownload: null, securityDownloadEnabled: null, status: 'unavailable' as const };
+  const flashCryptCount = block0Status === 'verified' ? readBits(words, 82, 3) : null;
+  const flashEncryption = {
+    cryptCount: flashCryptCount,
+    enabled: flashCryptCount === null ? null : ((flashCryptCount & 1) + ((flashCryptCount >> 1) & 1) + ((flashCryptCount >> 2) & 1)) % 2 === 1,
+    disableManualEncryption: block0Status === 'verified' ? readBits(words, 52, 1) === 1 : null,
+    status: block0Status,
+  } as const;
 
   const secureBootV2: SecureBootDeviceState['secureBootV2'] = {
     state: secureBootEnabled === null ? 'unknown' : secureBootEnabled ? 'enabled' : 'disabled',
@@ -225,6 +240,7 @@ export async function readEsp32S3SecureBootState(
       explanation: 'The security-version eFuse floor is readable, but eFuses do not attest whether the installed bootloader was built with CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK.',
     },
     downloadMode,
+    flashEncryption,
     evidence,
   };
 }

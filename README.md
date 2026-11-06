@@ -219,6 +219,8 @@ Security-check JSON preserves the existing top-level `result`, `trust`, and `app
 
 Security JSON `keyBlocks[]` includes `readDiagnostic` for digest-purpose blocks. It reports the logical slot, physical eFuse block, register base offset, eight-word read count, and a fixed failure category/word offset when relevant. It never includes raw eFuse words. A successful signature check is separate from device key trust, and the digest remains unavailable until read-only hardware revalidation succeeds.
 
+Security JSON now also reports `flashEncryption` (`cryptCount`, odd-parity `enabled`, `disableManualEncryption`, and evidence `status`) plus `downloadMode.disableUsbOtgDownload`. These are read-only eFuse observations; unavailable data is `null`, and unknown flash-encryption or ROM write conditions fail closed. They do not override the global `BLOCKED` installation policy.
+
 ## Docker
 
 The image supports the host architecture, including Linux ARM64 systems such as Raspberry Pi. Pass the serial device through explicitly:

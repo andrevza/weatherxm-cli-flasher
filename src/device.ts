@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { assertCompleteProtectedRegionSnapshots, type Wg1200Inspection, type Wg1200Transport } from './upstream/flasher/transport.js';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { EXPECTED_WG1200_PARTITIONS, parsePartitionTableWithMetadata } from './upstream/flasher/partitions.js';
@@ -31,6 +32,26 @@ export interface FirmwareSecurityCheckResult {
   applicationBootAndRollbackEstablished: false;
   installation: { readiness: 'BLOCKED'; reason: string };
   explanation: string;
+}
+
+export function assertInstallSecurityEvidence(image: SecureBootImageEvidence, device: SecureBootDeviceState): void {
+  if (!image.imageFormatValid || !image.imageDigestValid || !image.signatureValid) {
+    throw new Error('Firmware Secure Boot V2 signature verification failed; application write was not attempted');
+  }
+  if (device.secureBootV2.state !== 'enabled' || device.secureBootV2.status !== 'verified') {
+    throw new Error('Device Secure Boot V2 state is not verified enabled; application write was not attempted');
+  }
+  const trust = compareSecureBootTrust(image, device);
+  if (trust.result !== 'TRUSTED') throw new Error(`Firmware signer trust is ${trust.result}; application write was not attempted`);
+  if (device.flashEncryption.status !== 'verified' || device.flashEncryption.enabled !== false) {
+    throw new Error('Flash encryption is enabled or unknown; this writer cannot establish compatible encrypted-flash handling');
+  }
+  if (device.downloadMode.status !== 'verified' || device.downloadMode.disableAllDownload !== false || device.downloadMode.securityDownloadEnabled !== false) {
+    throw new Error('ROM flash-writing availability is restricted or unknown; application write was not attempted');
+  }
+  if (device.antiRollbackEnforcement.state !== 'disabled') {
+    throw new Error('Installed bootloader anti-rollback configuration is not established; application write was not attempted');
+  }
 }
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
@@ -176,13 +197,14 @@ export interface OtaWriteOperations {
   readOtadataSnapshot(): Promise<Uint8Array>;
   installApplication(offset: number, bytes: Uint8Array, onProgress?: (percent: number) => void): Promise<void>;
   verifyApplicationFlash(offset: number, expectedMd5: string, length: number): Promise<boolean>;
+  verifyApplicationSha256(offset: number, expectedSha256: string, length: number): Promise<boolean>;
   writeOtaSelectSector(address: number, bytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void>;
   verifyProtectedRegions(snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>, preservedOtaSlot: 'ota_0' | 'ota_1'): Promise<{ valid: boolean; mismatches: string[] }>;
   hardReset(): Promise<void | boolean>;
 }
 
 export async function runOtaWriteTransaction(transport: OtaWriteOperations, input: {
-  targetOffset: number; firmwareBytes: Uint8Array; nextSeq: number; targetSector: 0 | 1;
+  targetOffset: number; firmwareBytes: Uint8Array; expectedSha256?: string; nextSeq: number; targetSector: 0 | 1;
   preservedOtaSlot: 'ota_0' | 'ota_1'; recovery?: boolean;
   snapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>>;
   otadataBefore: Uint8Array;
@@ -209,6 +231,11 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
   const expectedMd5 = md5Hex(input.firmwareBytes);
   if (!(await transport.verifyApplicationFlash(input.targetOffset, expectedMd5, input.firmwareBytes.byteLength))) {
     throw new Error('On-chip flash MD5 mismatch; OTA activation was not attempted');
+  }
+  const expectedSha256 = createHash('sha256').update(input.firmwareBytes).digest('hex');
+  if (input.expectedSha256 !== undefined && input.expectedSha256 !== expectedSha256) throw new Error('Selected firmware SHA-256 does not match the transaction bytes; OTA activation was not attempted');
+  if (!(await transport.verifyApplicationSha256(input.targetOffset, expectedSha256, input.firmwareBytes.byteLength))) {
+    throw new Error('Application flash SHA-256 readback mismatch; OTA activation was not attempted');
   }
   // Do not make the new slot bootable until all protected-region checks pass.
   const protectedResult = await transport.verifyProtectedRegions(input.snapshots, input.preservedOtaSlot);
@@ -366,6 +393,9 @@ export async function flashDevice(options: DeviceOptions & {
         sha256: verified.sha256, alreadyInstalled: true, comparison };
     }
     assertFirmwareSecurityReady();
+    const candidateImage = verifySecureBootV2Image(verified.data);
+    candidateImage.secureVersion = selectedDescriptor.secureVersion;
+    assertInstallSecurityEvidence(candidateImage, await transport.readSecureBootConfiguration());
     if (installPolicy.approvalRequired) {
       if (!options.approveComparisonException || !(await options.approveComparisonException(comparison))) {
         throw new Error(`${comparison.message} Explicit interactive approval is required; --yes cannot approve this change.`);
@@ -400,7 +430,7 @@ export async function flashDevice(options: DeviceOptions & {
     const snapshots = await transport.snapshotProtectedRegions(preservedOtaSlot);
     let lastProgress = -5;
     const transactionResult = await runOtaWriteTransaction(transport, {
-      targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data,
+      targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data, expectedSha256: verified.sha256,
       nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots, otadataBefore,
       preservedOtaSlot, recovery: options.recovery,
     }, (percent) => {

@@ -903,6 +903,14 @@ export class Wg1200Transport {
     return compareHexHashes(chipMd5, expectedMd5);
   }
 
+  /** Independently streams the written application back from flash and checks its SHA-256. */
+  public async verifyApplicationSha256(slotOffset: number, expectedSha256: string, length: number): Promise<boolean> {
+    getApplicationEraseRange(slotOffset, length);
+    if (!/^[0-9a-f]{64}$/i.test(expectedSha256)) throw new Error('Invalid expected application SHA-256');
+    const actual = await this.hashRegionSha256(slotOffset, length);
+    return compareHexHashes(actual, expectedSha256);
+  }
+
   public async readOtadataSnapshot(): Promise<Uint8Array> {
     return this.readRegion(WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size);
   }

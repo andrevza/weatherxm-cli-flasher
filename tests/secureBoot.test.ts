@@ -1,5 +1,6 @@
 import { createHash, generateKeyPairSync, sign, constants } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { assertInstallSecurityEvidence } from '../src/device.js';
 import { compareSecureBootTrust, ESP32S3_EFUSE, readEsp32S3SecureBootState, verifySecureBootV2Image } from '../src/upstream/flasher/secureBoot.js';
 
 function sha(data: Uint8Array) { return new Uint8Array(createHash('sha256').update(data).digest()); }
@@ -137,6 +138,32 @@ describe('ESP32-S3 Secure Boot V2 read-only evidence', () => {
       expect(compareSecureBootTrust(image, trusted).securityVersionStatus).toBe('meets-floor');
       return makeState({ revoke: true }).then((revoked) => expect(compareSecureBootTrust(image, revoked).result).toBe('REVOKED'));
     }).then(() => makeState({ purpose: 0 }).then((wrong) => expect(compareSecureBootTrust(image, wrong).result).toBe('UNTRUSTED')));
+  });
+
+  it('reports flash-encryption and all ROM download restriction eFuses as read-only evidence', async () => {
+    const reads: number[] = [];
+    const read = deviceRegisters();
+    const state = await readEsp32S3SecureBootState(async (address) => {
+      reads.push(address);
+      if (address === ESP32S3_EFUSE.block0 + 8) return (read(address) | (1 << 18)) >>> 0; // SPI_BOOT_CRYPT_CNT=1 (odd parity)
+      if (address === ESP32S3_EFUSE.block0 + 4) return (read(address) | (1 << 20)) >>> 0; // DIS_DOWNLOAD_MANUAL_ENCRYPT
+      if (address === ESP32S3_EFUSE.block0 + 16) return (read(address) | (1 << 0) | (1 << 4) | (1 << 5) | (1 << 31)) >>> 0; // download restrictions
+      return read(address);
+    }, { model: 'ESP32-S3', revision: null });
+    expect(state.flashEncryption).toEqual({ cryptCount: 1, enabled: true, disableManualEncryption: true, status: 'verified' });
+    expect(state.downloadMode).toEqual({ disableAllDownload: true, disableUsbSerialJtagDownload: true, disableUsbOtgDownload: true, securityDownloadEnabled: true, status: 'verified' });
+    expect(reads.slice(0, 6)).toEqual(Array.from({ length: 6 }, (_, i) => ESP32S3_EFUSE.block0 + i * 4));
+  });
+
+  it('fails closed when anti-rollback configuration is not established for installation', async () => {
+    const { data, digest } = fixture();
+    const image = verifySecureBootV2Image(data);
+    image.secureVersion = 2;
+    const state = await readEsp32S3SecureBootState(async (address) => deviceRegisters({ digest })(address), { model: 'ESP32-S3', revision: null });
+    expect(image.signatureValid).toBe(true);
+    expect(() => assertInstallSecurityEvidence(image, state)).toThrow(/anti-rollback configuration is not established/);
+    const invalid = { ...image, signatureValid: false };
+    expect(() => assertInstallSecurityEvidence(invalid, state)).toThrow(/signature verification failed/);
   });
 
   it('keeps unknown security-version evidence unknown and reports a below-floor candidate as incompatible', async () => {
