@@ -18,6 +18,11 @@ describe('progress accounting and rendering', () => {
     expect(rendered).not.toContain('ETA');
   });
 
+  it('reports a stall for known-length operations without declaring failure', () => {
+    const snapshot = progressSnapshot({ stage: 'Reading ota_1', completed: 50, total: 100 }, 0, 0, 20_000, 10);
+    expect(formatProgressLine(snapshot)).toContain('no byte progress for 00:20; operation remains active');
+  });
+
   it('reports actual byte updates and terminal completion to the configured stream', () => {
     let now = 0;
     const output: string[] = [];

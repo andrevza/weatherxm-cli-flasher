@@ -52,11 +52,12 @@ export function formatProgressLine(snapshot: ProgressSnapshot, tty = false): str
   }
   const done = formatBytes(snapshot.completed!);
   const total = formatBytes(snapshot.total!);
-  if (!tty) return `${snapshot.stage}: ${snapshot.percent.toFixed(1)}% (${done} / ${total}); speed ${speed}; elapsed ${elapsed}; ETA ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}`;
+  const stalled = snapshot.idleMs >= 15_000 ? `; no byte progress for ${formatDuration(snapshot.idleMs)}; operation remains active` : '';
+  if (!tty) return `${snapshot.stage}: ${snapshot.percent.toFixed(1)}% (${done} / ${total}); speed ${speed}; elapsed ${elapsed}; ETA ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}${stalled}`;
   const width = 20;
   const filled = Math.max(0, Math.min(width, Math.floor(snapshot.percent / 100 * width)));
   const bar = `${'█'.repeat(filled)}${'░'.repeat(width - filled)}`;
-  return `${snapshot.stage}\n[${bar}] ${snapshot.percent.toFixed(1)}%\nCompleted: ${done} / ${total}\nSpeed: ${speed}\nElapsed: ${elapsed}\nETA: ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}`;
+  return `${snapshot.stage}\n[${bar}] ${snapshot.percent.toFixed(1)}%\nCompleted: ${done} / ${total}\nSpeed: ${speed}\nElapsed: ${elapsed}\nETA: ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}${stalled}`;
 }
 
 /** A rate-limited stderr reporter. Byte counters must come from completed I/O. */
