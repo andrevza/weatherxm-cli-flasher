@@ -24,7 +24,7 @@ export function progressSnapshot(event: ProgressEvent, startedAt: number, lastPr
   const completed = known ? Math.max(0, Math.min(event.completed!, event.total!)) : undefined;
   const total = known ? event.total : undefined;
   const percent = known ? (completed! / total!) * 100 : null;
-  const etaMs = known && speedBytesPerSecond && speedBytesPerSecond > 0
+  const etaMs = known && speedBytesPerSecond && speedBytesPerSecond > 0 && elapsedMs >= 1000
     ? Math.max(0, (total! - completed!) / speedBytesPerSecond * 1000) : null;
   return { ...event, completed, total, elapsedMs, idleMs, speedBytesPerSecond, etaMs, percent };
 }
@@ -43,39 +43,91 @@ export function formatDuration(ms: number): string {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-export function formatProgressLine(snapshot: ProgressSnapshot, tty = false): string {
+export function formatProgressLine(snapshot: ProgressSnapshot, tty = false, width = 100): string {
   const elapsed = formatDuration(snapshot.elapsedMs);
-  const speed = snapshot.speedBytesPerSecond === null ? 'unknown' : `${formatBytes(snapshot.speedBytesPerSecond)}/s`;
   if (snapshot.percent === null) {
-    const stalled = snapshot.idleMs >= 15_000 ? `; no byte progress for ${formatDuration(snapshot.idleMs)}` : '';
-    return `${snapshot.stage}: ${snapshot.detail ?? 'active'}; elapsed ${elapsed}; speed ${speed}${stalled}`;
+    if (snapshot.state === 'complete') return `${snapshot.stage} DONE (${(snapshot.elapsedMs / 1000).toFixed(1)}s)`;
+    if (snapshot.state === 'failed' || snapshot.state === 'cancelled') return `${snapshot.stage} ${snapshot.state.toUpperCase()} (${(snapshot.elapsedMs / 1000).toFixed(1)}s)`;
+    const waiting = snapshot.elapsedMs >= 5000 ? ` (still working; ${elapsed} elapsed)` : '';
+    return `${snapshot.stage}...${waiting}`;
   }
-  const done = formatBytes(snapshot.completed!);
-  const total = formatBytes(snapshot.total!);
-  const stalled = snapshot.idleMs >= 15_000 ? `; no byte progress for ${formatDuration(snapshot.idleMs)}; operation remains active` : '';
-  if (!tty) return `${snapshot.stage}: ${snapshot.percent.toFixed(1)}% (${done} / ${total}); speed ${speed}; elapsed ${elapsed}; ETA ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}${stalled}`;
-  const width = 20;
-  const filled = Math.max(0, Math.min(width, Math.floor(snapshot.percent / 100 * width)));
-  const bar = `${'█'.repeat(filled)}${'░'.repeat(width - filled)}`;
-  return `${snapshot.stage}\n[${bar}] ${snapshot.percent.toFixed(1)}%\nCompleted: ${done} / ${total}\nSpeed: ${speed}\nElapsed: ${elapsed}\nETA: ${snapshot.etaMs === null ? 'calculating' : formatDuration(snapshot.etaMs)}${stalled}`;
+
+  const percent = snapshot.state === 'running' ? Math.min(99.9, snapshot.percent) : snapshot.percent;
+  const detail = `${formatBytes(snapshot.completed!)} / ${formatBytes(snapshot.total!)}`;
+  const speed = snapshot.speedBytesPerSecond === null ? '' : ` | ${formatBytes(snapshot.speedBytesPerSecond)}/s`;
+  const eta = snapshot.etaMs === null ? '' : ` | ETA ${formatDuration(snapshot.etaMs)}`;
+  const elapsedText = snapshot.elapsedMs >= 1000 ? ` | ${elapsed} elapsed` : '';
+  const stalled = snapshot.idleMs >= 15_000 && snapshot.state === 'running'
+    ? ` | no byte progress for ${formatDuration(snapshot.idleMs)}; still active` : '';
+  const stateText = snapshot.state && snapshot.state !== 'running' ? ` — ${snapshot.state.toUpperCase()}` : '';
+  if (!tty) return `${snapshot.stage}: ${percent.toFixed(1)}% | ${detail}${speed}${elapsedText}${eta}${stalled}${stateText}`;
+  const barWidth = Math.max(4, Math.min(20, width - 42));
+  const filled = Math.max(0, Math.min(barWidth, Math.floor(percent / 100 * barWidth)));
+  const bar = `${'█'.repeat(filled)}${'░'.repeat(barWidth - filled)}`;
+  const line = `${snapshot.stage} [${bar}] ${percent.toFixed(1)}% | ${detail}${speed}${eta}${stalled}${stateText}`;
+  return line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`;
 }
 
-/** A rate-limited stderr reporter. Byte counters must come from completed I/O. */
+/** Serializes diagnostics and progress on stderr without changing process streams. */
+export class OutputCoordinator {
+  private activeTtyLine = false;
+  private lastProgress = '';
+
+  constructor(private readonly options: { write: (text: string) => void; tty: boolean; width?: () => number }) {}
+
+  progress(text: string): void {
+    this.lastProgress = text;
+    if (!this.options.tty) { this.options.write(`${text}\n`); return; }
+    this.options.write(`\r\u001b[2K${text}`);
+    this.activeTtyLine = true;
+  }
+
+  finishProgress(text: string): void {
+    this.lastProgress = '';
+    if (this.options.tty && this.activeTtyLine) this.options.write('\r\u001b[2K');
+    this.activeTtyLine = false;
+    const width = Math.max(20, this.options.width?.() ?? 100);
+    const finalText = this.options.tty && text.length > width ? `${text.slice(0, width - 1)}…` : text;
+    this.options.write(`${finalText}\n`);
+  }
+
+  log(message: string): void {
+    const resume = this.options.tty && this.activeTtyLine;
+    if (resume) this.options.write('\r\u001b[2K');
+    this.activeTtyLine = false;
+    const clean = String(message).replaceAll('\r', '').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+    const lines = clean.split('\n');
+    for (const line of lines) if (line.length) this.options.write(`${line}\n`);
+    if (resume && this.lastProgress) {
+      const width = Math.max(20, this.options.width?.() ?? 100);
+      const restored = this.lastProgress.length <= width ? this.lastProgress : `${this.lastProgress.slice(0, width - 1)}…`;
+      this.options.write(`\r${restored}`);
+      this.activeTtyLine = true;
+    }
+  }
+}
+
+/** Progress reports use only completed bytes and share the diagnostic output coordinator. */
 export class ProgressReporter {
   private current: ProgressEvent | null = null;
   private startedAt = 0;
   private lastProgressAt = 0;
   private lastSampleAt = 0;
   private lastSampleBytes = 0;
-  private speed = 0;
+  private speed: number | null = null;
   private lastRenderAt = 0;
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly options: {
-    write: (text: string) => void; tty: boolean; now?: () => number; intervalMs?: number;
+    write?: (text: string) => void; coordinator?: OutputCoordinator; tty: boolean; now?: () => number;
+    intervalMs?: number; width?: () => number;
   }) {}
 
   private now(): number { return (this.options.now ?? (() => performance.now()))(); }
+  log(message: string): void {
+    if (this.options.coordinator) this.options.coordinator.log(message);
+    else this.options.write?.(`${message.replaceAll('\r', '')}\n`);
+  }
 
   event(event: ProgressEvent): void {
     if (!this.current || this.current.stage !== event.stage) this.stage(event.stage, event.total, event.detail);
@@ -84,14 +136,13 @@ export class ProgressReporter {
   }
 
   stage(stage: string, total?: number, detail = 'active'): void {
-    this.finishCurrent('complete', false);
+    this.finishCurrent('complete', true);
     const now = this.now();
     this.current = { stage, total, completed: total === undefined ? undefined : 0, state: 'running', detail };
     this.startedAt = this.lastProgressAt = this.lastSampleAt = now;
     this.lastSampleBytes = 0;
-    this.speed = 0;
+    this.speed = null;
     this.lastRenderAt = 0;
-    this.render(now, true);
     this.timer = setInterval(() => this.render(this.now(), true), this.options.intervalMs ?? 1000);
     this.timer.unref?.();
   }
@@ -107,12 +158,14 @@ export class ProgressReporter {
     const now = this.now();
     const previous = this.current.completed ?? 0;
     const actual = Math.max(previous, completed);
-    const interval = Math.max(1, now - this.lastSampleAt);
-    const instant = Math.max(0, actual - this.lastSampleBytes) * 1000 / interval;
-    this.speed = this.speed === 0 ? instant : this.speed * 0.7 + instant * 0.3;
+    const interval = now - this.lastSampleAt;
+    if (actual > this.lastSampleBytes && interval >= 250) {
+      const instant = (actual - this.lastSampleBytes) * 1000 / interval;
+      this.speed = this.speed === null ? instant : this.speed * 0.7 + instant * 0.3;
+      this.lastSampleAt = now;
+      this.lastSampleBytes = actual;
+    }
     if (actual > previous) this.lastProgressAt = now;
-    this.lastSampleAt = now;
-    this.lastSampleBytes = actual;
     this.current = { ...this.current, completed: actual, total: total ?? this.current.total };
     this.render(now, false);
   }
@@ -129,23 +182,38 @@ export class ProgressReporter {
     if (!this.current) return;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    const now = this.now();
     const event = { ...this.current, state };
-    this.current = null;
+    if (state === 'complete' && event.total !== undefined) event.completed = event.total;
     if (render) {
-      const now = this.now();
-      const snapshot = progressSnapshot(event, this.startedAt, this.lastProgressAt, now, this.speed || null);
-      this.options.write(`${formatProgressLine(snapshot, false)} — ${state.toUpperCase()}${this.options.tty ? '\n' : ''}`);
+      const snapshot = progressSnapshot(event, this.startedAt, this.lastProgressAt, now, this.speed);
+      const short = snapshot.elapsedMs < 500;
+      const text = short
+        ? `${event.stage} ${state === 'complete' ? `DONE (${(snapshot.elapsedMs / 1000).toFixed(1)}s)` : state.toUpperCase()}`
+        : formatProgressLine(snapshot, this.options.tty, this.options.width?.() ?? 100);
+      this.emitFinal(text);
     }
+    this.current = null;
   }
 
   private render(now: number, heartbeat: boolean): void {
     if (!this.current) return;
     const interval = this.options.intervalMs ?? 1000;
-    if (!heartbeat && now - this.lastRenderAt < Math.min(interval, 250)) return;
-    const snapshot = progressSnapshot(this.current, this.startedAt, this.lastProgressAt, now, this.speed || null);
-    const text = formatProgressLine(snapshot, this.options.tty);
-    if (this.options.tty) this.options.write(`\r${text.replaceAll('\n', ' | ')}`);
-    else if (heartbeat || now - this.lastRenderAt >= interval) this.options.write(`${text}\n`);
+    const minimumUpdateInterval = this.options.tty ? 250 : interval;
+    if (!heartbeat && now - this.lastRenderAt < minimumUpdateInterval) return;
+    if (now - this.startedAt < 500) return;
+    const snapshot = progressSnapshot(this.current, this.startedAt, this.lastProgressAt, now, this.speed);
+    const text = formatProgressLine(snapshot, this.options.tty, this.options.width?.() ?? 100);
+    this.emitProgress(text);
     this.lastRenderAt = now;
+  }
+
+  private emitProgress(text: string): void {
+    if (this.options.coordinator) this.options.coordinator.progress(text);
+    else this.options.write?.(`${text}\n`);
+  }
+  private emitFinal(text: string): void {
+    if (this.options.coordinator) this.options.coordinator.finishProgress(text);
+    else this.options.write?.(`${text}\n`);
   }
 }

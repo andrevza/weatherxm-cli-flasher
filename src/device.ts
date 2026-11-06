@@ -21,7 +21,21 @@ import type { ProgressReporter } from './progress.js';
 
 export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
-export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; signal?: AbortSignal; }
+export interface DeviceOptions { portPath: string; baudRate?: number; traceSerial?: boolean; verbose?: boolean; progress?: ProgressReporter; offline?: boolean; cacheDirectory?: string; signal?: AbortSignal; }
+
+function diagnostic(progress: ProgressReporter | undefined, message: string): void {
+  if (progress) progress.log(message);
+  else process.stderr.write(`${message.replaceAll('\r', '')}\n`);
+}
+
+function transportLogger(options: DeviceOptions) {
+  const verbose = Boolean(options.verbose || options.traceSerial);
+  return {
+    log: (message: string) => { if (verbose) diagnostic(options.progress, `[wg1200] ${message}`); },
+    error: (message: string) => diagnostic(options.progress, `[wg1200] ERROR ${message}`),
+    debug: (message: string) => { if (verbose) diagnostic(options.progress, message); },
+  };
+}
 export interface FlashConfirmation {
   deviceName: string; firmwareKey: string; firmwareLabel: string; activeSlot: string; targetSlot: string;
   targetOffset: number; bytes: number; sha256: string; recovery: boolean;
@@ -95,10 +109,10 @@ async function createOtaBackupWithTransport(transport: Wg1200Transport, outputPa
 
 /** Stream a full inactive OTA partition backup to disk; never reads credential partitions. */
 export async function backupInactiveOta(options: DeviceOptions & { outputPath: string; selection?: 'active' | 'inactive' }): Promise<{ manifest: InactiveBackupManifest; manifestPath: string }> {
-  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
-  const transport = new Wg1200Transport({ log: (message) => process.stderr.write(`[wg1200] ${message}\n`), error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`), debug: (message) => process.stderr.write(`${message}\n`) }, options.traceSerial);
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
     options.progress?.stage('Connecting to ROM and initializing flash reader');
     const inspection = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
@@ -151,10 +165,10 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   }
   const image = verifySecureBootV2Image(selected.verified.data);
   image.secureVersion = selected.descriptor.secureVersion;
-  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
-  const transport = new Wg1200Transport({ log: (message) => process.stderr.write(`[wg1200] ${message}\n`), error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`), debug: (message) => process.stderr.write(`${message}\n`) }, options.traceSerial);
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   let released = false;
   let writeStarted = false;
   try {
@@ -300,14 +314,10 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
 export async function readDeviceSecurity(options: DeviceOptions): Promise<SecureBootDeviceState> {
-  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
-  const transport = new Wg1200Transport({
-    log: (message) => process.stderr.write(`[wg1200] ${message}\n`),
-    error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`),
-    debug: (message) => process.stderr.write(`${message}\n`),
-  }, options.traceSerial);
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
     options.progress?.stage('Connecting to ROM for read-only eFuse inspection');
     await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_ROM, 'rom-read-only');
@@ -574,18 +584,19 @@ function validateRawPartitionTable(bytes: Uint8Array): string[] {
 
 /** Read-only inspection adapter. This class intentionally exposes no write operations. */
 export async function inspectDevice(options: DeviceOptions): Promise<Wg1200Inspection> {
-  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
-  const transport = new Wg1200Transport({
-    log: (message) => process.stderr.write(`[wg1200] ${message}\n`),
-    error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`),
-    debug: (message) => process.stderr.write(`${message}\n`),
-  }, options.traceSerial);
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
+    options.progress?.stage('Connecting to ROM and reading device metadata');
     const result = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete');
     assertSafeInspection(result, await exactLayoutErrors(transport));
     return result;
+  } catch (error) {
+    options.progress?.finish('failed');
+    throw error;
   } finally {
     await transport.disconnect();
   }
@@ -604,19 +615,17 @@ export async function flashDevice(options: DeviceOptions & {
   });
   options.progress?.finish('complete', 'verified image loaded into an immutable memory snapshot before device access');
 
-  const trace = options.traceSerial ? (message: string) => process.stderr.write(`[serial] ${message}\n`) : undefined;
+  const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
   const port = new NodeSerialPort(options.portPath, trace);
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
-  const transport = new Wg1200Transport({
-    log: (message) => process.stderr.write(`[wg1200] ${message}\n`),
-    error: (message) => process.stderr.write(`[wg1200] ERROR ${message}\n`),
-    debug: (message) => process.stderr.write(`${message}\n`),
-  }, options.traceSerial);
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   let completed: { deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; flashVerified: boolean; otaMetadataVerified: boolean; protectedPartitionsVerified: boolean } | undefined;
   let flashComparison: FirmwareComparison | undefined;
   let firmwareReleased = false;
   try {
+    options.progress?.stage('Connecting to ROM and inspecting live partitions');
     const before = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete');
     assertSafeInspection(before, await exactLayoutErrors(transport));
     if (before.otadata.isAmbiguous && !options.recovery) {
       throw new Error(`OTA state is ambiguous: ${before.otadata.description}. Use --recover to authorize the official targeted recovery flow.`);
@@ -680,19 +689,13 @@ export async function flashDevice(options: DeviceOptions & {
     }
     const preservedOtaSlot = fresh.otadata.targetSlot === 'ota_0' ? 'ota_1' : 'ota_0';
     const snapshots = await transport.snapshotProtectedRegions(preservedOtaSlot);
-    let lastProgress = -5;
     options.progress?.stage('Erasing and writing inactive OTA application', verified.data.byteLength);
     const transactionResult = await runOtaWriteTransaction(transport, {
       targetOffset: fresh.otadata.targetOffset, firmwareBytes: verified.data, expectedSha256: verified.sha256,
       nextSeq: fresh.otadata.nextSeq, targetSector: fresh.otadata.targetSector, snapshots, otadataBefore,
       preservedOtaSlot, recovery: options.recovery,
     }, (completedBytes, totalBytes) => {
-      const percent = totalBytes > 0 ? completedBytes / totalBytes * 100 : 0;
       options.progress?.bytes(completedBytes, totalBytes);
-      if (percent === 100 || percent >= lastProgress + 5) {
-        lastProgress = percent;
-        process.stderr.write(`[wg1200] App write progress: ${percent}%\n`);
-      }
     });
     options.progress?.finish('complete');
     firmwareReleased = transactionResult.deviceReleased;

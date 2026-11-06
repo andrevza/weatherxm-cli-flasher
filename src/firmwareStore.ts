@@ -204,7 +204,7 @@ export async function getOfficialFirmware(input: {
       const downloaded = await downloadToTemporaryFile(url.href, temp, entry.bytes, input.progress, fetcher);
       if (downloaded.sha256.toLowerCase() !== entry.sha256.toLowerCase()) throw new Error(`Firmware SHA-256 mismatch: expected ${entry.sha256}, received ${downloaded.sha256}`);
       const data = new Uint8Array(await readFile(temp));
-      input.progress?.({ stage: 'Validating firmware image and signature', completed: data.length, total: data.length });
+      input.progress?.({ stage: 'Validating firmware image and signature', detail: 'checking image structure and Secure Boot V2 signature' });
       const signature = validateImage(entry, data);
       const descriptor = parseAppDescriptor(data)!;
       const metadata: CacheMetadata = { formatVersion: 1, manifestUrl: input.manifestUrl, downloadedAt: new Date().toISOString(), entry };

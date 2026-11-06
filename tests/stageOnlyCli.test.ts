@@ -41,5 +41,15 @@ describe('stage-only CLI guards', () => {
     expect(versionFlag.status).toBe(0);
     const badVersion = run('firmware', 'download', 'weatherxm', '--version');
     expect(badVersion.status).not.toBe(0);
+    const verboseHelp = run('--help', '--verbose');
+    expect(verboseHelp.status).toBe(0);
+    expect(verboseHelp.stdout).toContain('--verbose           Show coordinated ROM and transport diagnostics');
+  });
+
+  it('keeps JSON stdout parseable while progress and diagnostics stay on redirected stderr', () => {
+    const result = run('firmware', 'download', 'weatherxm', '--offline', '--cache-dir', '/tmp/wg1200-empty-json-cache', '--json');
+    expect(result.status).not.toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'FIRMWARE DOWNLOAD FAILED' });
+    expect(result.stderr).not.toMatch(/[\r\u001b]/);
   });
 });

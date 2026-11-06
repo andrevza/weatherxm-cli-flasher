@@ -53,6 +53,13 @@ wg1200 --version --verbose
 
 ## A. Download and compare backups
 
+The default terminal view shows operation stages and measured byte progress.
+Use `--verbose` to include detailed ROM/esptool/transport logs; diagnostic
+messages are coordinated with the active progress line. In redirected or JSON
+mode output uses complete stderr lines without terminal cursor sequences.
+Status-only operations report elapsed time and do not show transfer speed or
+ETA.
+
 Download the exact pinned release before connecting the gateway. The verified
 content-addressed cache defaults to `~/.cache/weatherxm-flash/firmware/`.
 Repeat with `--offline` to validate cache reuse without network access.

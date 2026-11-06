@@ -45,6 +45,7 @@ describe('standalone executable packaging', () => {
     expect(help).toContain('firmware compare');
     expect(help).toContain('--stage-only');
     expect(help).toContain('--backup-manifest');
+    expect(help).toContain('--verbose');
     expect(help).toContain('-v, --version');
     expect(help).not.toMatch(/\u001b\[/);
     const commandHelp = execFileSync(executable, ['check', '--help'], { cwd: cleanDir, encoding: 'utf8', env, timeout: 15_000 });
