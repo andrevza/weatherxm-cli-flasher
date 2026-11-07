@@ -31,8 +31,8 @@ The release checks run for this source revision reported 272 passing source test
 | Executable SHA-256 | In the companion `dist/SHA256SUMS-v0.1.0-rc.1` file |
 | Embedded source SHA-256 | In the candidate's `--version --verbose --json` output |
 | Source tests | 272 passed, 57 skipped; 21 files passed, one file skipped |
-| Standalone-backed tests | Recorded in final delivery after execution against this candidate |
-| ARM64/16 KB/native binding | Recorded in final delivery after artifact validation |
+| Standalone-backed tests | 329 passed, 0 skipped; all 22 test files passed |
+| ARM64/16 KB/native binding | Linux AArch64 ELF verified; all 5 executable and both native-addon PT_LOAD segments are 64 KB aligned; embedded SerialPort binding smoke test passed |
 | Public release or push | None |
 
 `SHA256SUMS` is generated from the verified candidate executable. Do not treat this local RC as published or install it over a known-good binary without reviewing its checksum and provenance.
