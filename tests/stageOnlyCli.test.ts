@@ -22,7 +22,7 @@ describe('stage-only CLI guards', () => {
   it('exposes Thorough diagnosis only for an exact OTA slot and rejects write-related options', () => {
     const usage = run('flash', '--help');
     expect(usage.status).toBe(0);
-    expect(usage.stdout).toContain('flash diagnose --target <ota_0|ota_1>');
+    expect(usage.stdout).toContain('wg1200 flash diagnose');
     const wrongTarget = run('flash', 'diagnose', '--target', 'factory', '--port', '/dev/null');
     expect(wrongTarget.status).not.toBe(0);
     expect(wrongTarget.stderr).toContain('flash diagnose requires --target ota_0|ota_1 and is read-only');
@@ -72,7 +72,7 @@ describe('stage-only CLI guards', () => {
     const acceptedMode = run('flash', 'weatherxm', '--stage-only', '--verify-mode', 'thorough');
     expect(acceptedMode.status).not.toBe(0);
     expect(acceptedMode.stderr).toContain('flash requires --port');
-    expect(run('flash', '--help').stdout).toContain('--verify-mode fast|thorough');
+    expect(run('flash', 'weatherxm', '--help').stdout).toContain('--verify-mode <mode>');
   });
 
   it('does not accept a non-official manifest for the stage-only artifact', () => {
@@ -103,7 +103,7 @@ describe('stage-only CLI guards', () => {
     expect(badVersion.status).not.toBe(0);
     const verboseHelp = run('--help', '--verbose');
     expect(verboseHelp.status).toBe(0);
-    expect(verboseHelp.stdout).toContain('--verbose           Show coordinated ROM and transport diagnostics');
+    expect(verboseHelp.stdout).toContain('--verbose           Show detailed operation diagnostics');
   });
 
   it('exposes OTA activation only with an explicit device-bound backup manifest', () => {
@@ -115,7 +115,7 @@ describe('stage-only CLI guards', () => {
     expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('--metadata-backup-manifest');
     const arbitrary = run('ota', 'activate', '--target', '0x13000', '--port', '/dev/null', '--dry-run');
     expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('activate --target');
-    expect(run('ota', '--help').stdout).toContain('A transaction-specific interactive confirmation is required');
+    expect(run('ota', '--help').stdout).toContain('OTA COMMANDS');
     const restore = run('ota', 'restore', '--port', '/dev/null');
     expect(restore.status).not.toBe(0); expect(restore.stderr).toContain('--metadata-backup-manifest');
     expect(run('ota', '--help').stdout).toContain('ota restore');

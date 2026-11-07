@@ -22,6 +22,7 @@ import type { VerificationMode } from './verification.js';
 import { ConfirmationCancelledError, retryExactConfirmation } from './verification.js';
 import { confirmWithSuspendedProgress } from './operatorConfirmation.js';
 import { activateOtaSlot, backupOtaMetadata, dryRunOtaActivation, readOtaStatus, restoreOtaMetadata } from './otaDevice.js';
+import { renderHelp } from './help.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
@@ -122,7 +123,7 @@ function parseArgs(argv: string[]): Args {
     else positional.push(arg);
   }
   out.command = helpRequested ? 'help' : positional[0] || 'help';
-  if (helpRequested) out.helpTarget = positional[0];
+  if (helpRequested) out.helpTarget = positional.slice(0, 2).join(' ') || undefined;
   out.subcommand = positional[1];
   out.target = optionTarget ?? positional[2];
   if (!Number.isInteger(out.baud) || out.baud < 1200 || out.baud > 2000000) throw new Error('Baud rate must be an integer from 1200 to 2000000');
@@ -187,54 +188,15 @@ function createProgress(args: Args): ProgressReporter {
   return reporter;
 }
 
-function help(command?: string, plain = false) {
-  const tty = !plain && Boolean(stdout.isTTY) && !process.env.NO_COLOR && process.env.TERM !== 'dumb';
-  const paint = (code: string, value: string) => tty ? `\u001b[${code}m${value}\u001b[0m` : value;
-  const heading = (value: string) => paint('1;36', value);
-  const commandRow = (name: string, description: string) => stdout.columns && stdout.columns < 58
-    ? `  ${paint('1', name)}\n      ${description}\n`
-    : `  ${paint('1', name.padEnd(28))}${description}\n`;
-  const name = 'wg1200';
-  if (command) {
-    const details: Record<string, string> = {
-      info: `USAGE\n  ${name} info --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows device identity, chip, flash layout and firmware descriptors. Enters ROM loader and resets the gateway. --monitor reopens a passive serial reader after inspection.`,
-      verify: `USAGE\n  ${name} verify --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nValidates WG1200 identity, exact partition layout, partition-table MD5, credentials and OTA metadata. Read-only; resets the gateway.`,
-      status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
-      check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
-      monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--verify-mode fast|thorough] [--boot-capture-seconds <15|30|60>] [--boot-log-output <file>] [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--boot-capture-seconds <15|30|60>] [--boot-log-output <file>] [--json] [--redact]\n\nActivation defaults to Fast: it authenticates the pinned official source image, then compares its exact image-length MD5 with both the target and selected recovery slot. Thorough additionally reads both full OTA partitions and verifies physical image SHA-256 and signatures. Unknown host signer trust is qualified only when the verified selected recovery slot and current device-bound metadata backup match; explicit invalid, revoked, untrusted, or incompatible results block. A transaction-specific interactive confirmation is required before writing one 4 KiB metadata sector. After commit, a live 15-second normal-boot capture reports Secure Boot V2, loaded offset and application version/startup independently; --boot-capture-seconds accepts longer captures, and --boot-log-output saves the captured lines. Emergency restore verifies a historic device-bound backup and recovery app, then writes one new VALID selection record while preserving its peer sector. Create a fresh metadata backup before each activation.`,
-      backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
-      firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
-      security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
-      flash: `USAGE\n  ${name} flash weatherxm --port <path> --stage-only [--verify-mode fast|thorough] [--backup-manifest <path>]\n  ${name} flash diagnose --target <ota_0|ota_1> --port <path> [--offline] [--json]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. Fast is the default: it verifies the target with device-side MD5 and audits preserved regions with MD5. Thorough adds full target SHA-256 readback and full protected-region SHA-256 checks. Both modes retain mandatory source SHA-256, Secure Boot V2 trust, backup validation and unchanged OTA metadata checks. A failed target check blocks activation, audits unchanged regions where possible, and never retries or rewrites automatically. flash diagnose is read-only: it repeats on-chip MD5, reads the selected signed image bytes, compares SHA-256 and reports differing byte offsets/sectors without writing. Confirmation permits five exact-phrase attempts with retry or cancel; no write begins without the complete phrase.`,
-    };
-    const detail = details[command];
-    if (!detail) return process.stdout.write(`No command help is available for '${command}'. Run '${name} --help'.\n`);
-    return process.stdout.write(`${heading(`WeatherXM WG1200 Flasher v${packageMetadata.version}`)}\n\n${detail}\n`);
-  }
-  let output = `${heading(`WeatherXM WG1200 Flasher                          v${packageMetadata.version}`)}\nSafe firmware management for WeatherXM gateways\n\n`;
-  output += `${heading('USAGE')}\n  ${name} <command> [options]\n\n${heading('DEVICE COMMANDS')}\n`;
-  output += commandRow('info', 'Show device and hardware information');
-  output += commandRow('verify', 'Validate device identity and partitions');
-  output += commandRow('status', 'Show firmware and OTA boot state');
-  output += commandRow('ota status|backup|activate', 'Fast OTA status by default; thorough image verification is optional; activation is blocked and dry-run only');
-  output += commandRow('check <firmware>', 'Check available firmware; read-only');
-  output += commandRow('monitor', 'Passively stream serial console output');
-  output += commandRow('backup active|inactive', 'Stream and verify a complete OTA application partition');
-  output += commandRow('backup partition <name>', 'Save and verify a sensitive full partition dump');
-  output += commandRow('security', 'Read Secure Boot V2 and firmware trust evidence');
-  output += `\n${heading('FIRMWARE COMMANDS')}\n`;
-  output += commandRow('firmware list', 'List available firmware releases');
-  output += commandRow('firmware download', 'Download and verify an official image into the local cache');
-  output += commandRow('firmware compare', 'Compare a backup with a verified firmware image offline');
-  output += commandRow('flash <firmware>', 'Install to the inactive OTA slot');
-  output += `\n${heading('MONITOR OPTIONS (monitor or --monitor)')}\n  --monitor           Continue passive monitoring after an operation\n  --boot              Reset via RTS/EN and capture startup from boot\n  --timestamp         Prefix received messages with host time\n  --level <severity>  Filter: error, warn, info, debug, verbose\n  --output <file>     Append received messages to a file\n  --raw               Print sanitized received lines without decoration\n  --no-color          Disable monitor colors\n\n`;
-  output += `\n${heading('DEVICE OPTIONS (info, verify, status, check, flash, security)')}\n  --port <path>       Serial device path\n  --baud <rate>       Baud rate (default: 115200)\n  --trace-serial      Enable redacted serial diagnostics\n\n${heading('OUTPUT AND CATALOG OPTIONS')}\n  --json              Machine-readable output where supported\n  --manifest <url>    HTTPS manifest (list, check, flash, security check)\n  -h, --help          Show help\n\n${heading('FLASH OPTIONS')}\n  --dry-run           Validate and compare without writing\n  --verify-mode       Stage-only backup freshness: fast (default) or thorough\n  --force             Reinstall only an identical firmware build\n  --recover           Authorize targeted ambiguous-OTA recovery\n  --yes               Confirm the reviewed write (not version exceptions)\n  --boot-log-seconds  Boot capture duration (default: 15; 0 disables)\n\n${heading('EXAMPLES')}\n  ${name} info --port /dev/cu.usbserial-13210\n  ${name} monitor --port /dev/cu.usbserial-13210\n  ${name} check weatherxm --port /dev/cu.usbserial-13210 --monitor\n  ${name} security --port /dev/cu.usbserial-13210 --json\n  ${name} security check weatherxm --port /dev/cu.usbserial-13210\n  ${name} flash weatherxm --port /dev/cu.usbserial-13210 --dry-run\n\n${heading('SAFETY')}\n  Normal OTA installation is blocked; stage-only has fixed target and preflight.\n  Security commands read device eFuses and never program them.\n  Device inspection enters the ROM loader and resets the gateway.\n\nRun '${name} <command> --help' for command details.\n`;
-  output = output.replace('  -h, --help          Show help', '  -v, --version       Show application version; add --verbose for build details\n  -h, --help          Show help');
-  output = output.replace('  --manifest <url>', '  --redact            Mask device and certificate identifiers in output\n  --verbose           Show coordinated ROM and transport diagnostics\n  --manifest <url>');
-  output = output.replace('  --boot-log-seconds  ', '  --stage-only        Write official 0.8.34 to ota_0 without activation\n  --backup-manifest   Require a verified inactive-slot backup\n  --boot-log-seconds  ');
+function help(topic?: string, plain = false) {
+  const output = renderHelp(topic, packageMetadata.version, {
+    color: !plain && Boolean(stdout.isTTY) && !process.env.NO_COLOR && process.env.TERM !== 'dumb',
+    width: stdout.columns || 80,
+  });
   process.stdout.write(output);
+  if (output.includes('\nUnknown help topic:')) process.exitCode = 2;
 }
+
 
 function formatSecurityResult(device: import('./upstream/flasher/secureBoot.js').SecureBootDeviceState,
   candidate?: import('./device.js').FirmwareSecurityCheckResult): string {
@@ -332,7 +294,7 @@ async function main() {
     return;
   }
   const args = parseArgs(process.argv.slice(2));
-  if (args.command === 'help') return help(args.helpTarget, args.json);
+  if (args.command === 'help') return help(args.helpTarget, args.json || args.noColor);
   if (args.command === 'monitor') { await runMonitor(args); return; }
   if (args.command === 'ota') {
     if (!args.port) throw new Error(`ota ${args.subcommand} requires --port, for example --port /dev/ttyUSB0`);
