@@ -294,7 +294,7 @@ export function compareImageBytes(expected: Uint8Array, actual: Uint8Array, sect
 }
 
 export class StageOnlyVerificationFailure extends Error {
-  constructor(message: string, readonly targetVerification: { expectedMd5: string; actualMd5: string | null; result: 'MISMATCH' | 'UNVERIFIED' },
+  constructor(message: string, readonly targetVerification: { expectedMd5: string; actualMd5: string | null; result: 'MATCH' | 'MISMATCH' | 'UNVERIFIED' },
     readonly integrityAudit: IntegrityAuditEntry[]) { super(message); this.name = 'StageOnlyVerificationFailure'; }
 }
 
@@ -355,7 +355,7 @@ export async function runStageOnlyTransaction(operations: StageOnlyOperations, i
     catch {
       const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, actualMd5);
       throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: SHA-256 readback failed',
-        { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, audit);
+        { expectedMd5: input.expectedMd5, actualMd5, result: 'UNVERIFIED' }, audit);
     }
     if (actualSha256.toLowerCase() !== input.expectedSha256.toLowerCase()) {
       const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, actualMd5);
@@ -373,18 +373,18 @@ export async function runStageOnlyTransaction(operations: StageOnlyOperations, i
   const unverified = integrityAudit.filter((entry) => entry.status === 'UNVERIFIED');
   if (changed.length || unverified.length) throw new StageOnlyVerificationFailure(
     changed.length ? `STAGING FAILED — PROTECTED REGION CHANGED: ${changed.map((x) => x.name).join(', ')}` : 'STAGING FAILED — PROTECTED REGION UNVERIFIED',
-    { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, integrityAudit);
+    { expectedMd5: input.expectedMd5, actualMd5, result: 'MATCH' }, integrityAudit);
   let otadataAfter: Uint8Array;
   try { otadataAfter = await operations.readOtadata(); }
   catch {
     integrityAudit = integrityAudit.map((entry) => entry.name === 'otadata' ? { ...entry, status: 'UNVERIFIED' as const, actualDigest: null } : entry);
     throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata readback failed',
-      { expectedMd5: input.expectedMd5, actualMd5, result: 'UNVERIFIED' }, integrityAudit);
+      { expectedMd5: input.expectedMd5, actualMd5, result: 'MATCH' }, integrityAudit);
   }
   if (!Buffer.from(otadataAfter).equals(Buffer.from(input.otadataBefore))) {
     integrityAudit = integrityAudit.map((entry) => entry.name === 'otadata' ? { ...entry, status: 'CHANGED' as const } : entry);
     throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata changed during stage-only operation',
-      { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, integrityAudit);
+      { expectedMd5: input.expectedMd5, actualMd5, result: 'MATCH' }, integrityAudit);
   }
   try { await operations.resetNormal(); }
   catch { throw new Error('STAGING FAILED — VERIFICATION MISMATCH: normal-boot reset could not be confirmed'); }
