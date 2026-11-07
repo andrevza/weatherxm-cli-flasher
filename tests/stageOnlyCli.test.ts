@@ -126,7 +126,7 @@ describe('stage-only CLI guards', () => {
   });
 
   it('accepts configurable OTA boot capture durations but enforces the 15-second minimum', () => {
-    const common = ['ota', 'activate', '--target', 'ota_0', '--metadata-backup-manifest', '/tmp/backup.json', '--port', '/dev/null', '--dry-run', '--offline'];
+    const common = ['ota', 'activate', '--target', 'ota_0', '--metadata-backup-manifest', '/tmp/backup.json', '--port', '/dev/null', '--dry-run', '--offline', '--cache-dir', `/tmp/wg1200-empty-activation-cache-${process.pid}`];
     const tooShort = run(...common, '--boot-capture-seconds', '14');
     expect(tooShort.status).not.toBe(0);
     expect(tooShort.stderr).toContain('boot capture must be at least 15 seconds');
