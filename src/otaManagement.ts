@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
 import { link, mkdir, open, readFile, unlink } from 'node:fs/promises';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
-import { buildTransactionalOtadataSector, calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_NEW, ESP_OTA_IMG_PENDING_VERIFY, ESP_OTA_IMG_UNDEFINED, ESP_OTA_IMG_VALID } from './upstream/flasher/otadata.js';
+import { buildOtadataSector, buildTransactionalOtadataSector, calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_NEW, ESP_OTA_IMG_PENDING_VERIFY, ESP_OTA_IMG_UNDEFINED, ESP_OTA_IMG_VALID } from './upstream/flasher/otadata.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
 import type { ProgressReporter } from './progress.js';
 
@@ -216,7 +216,7 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
 /** Shared one-sector commit path. Its injected transport keeps all write tests deterministic and hardware-free. */
 export async function commitOtaActivationTransaction(input: {
   before: Uint8Array; plan: OtaActivationPlan;
-  transport: { readOtadataSnapshot(): Promise<Uint8Array>; writeOtaSelectSector(address: number, bytes: Uint8Array, sequence: number, before: Uint8Array): Promise<void> };
+  transport: { readOtadataSnapshot(): Promise<Uint8Array>; writeOtaSelectSector(address: number, bytes: Uint8Array, sequence: number, before: Uint8Array, signal?: AbortSignal): Promise<void> };
   confirm(): Promise<boolean>; signal?: AbortSignal; onConfirmationAccepted?: () => void; onWriteStart?: () => void;
 }): Promise<{ metadata: OtaMetadataAnalysis; address: number; sequence: number; bytesWritten: 4096 }> {
   if (input.plan.blockers.length) throw new Error(`Activation blocked: ${input.plan.blockers.join(' ')}`);
@@ -232,10 +232,11 @@ export async function commitOtaActivationTransaction(input: {
   if (live.byteLength !== input.before.byteLength || !live.every((byte, index) => byte === input.before[index])) {
     throw new Error('OTA metadata changed after confirmation; refusing activation');
   }
+  if (input.signal?.aborted) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
   const sectorIndex = address === WG1200_CONSTANTS.OTADATA.offset ? 0 : address === WG1200_CONSTANTS.OTADATA.offset + 4096 ? 1 : -1;
   if (sectorIndex < 0) throw new Error('Activation address is outside the two OTA metadata sectors');
   const payload = buildTransactionalOtadataSector(sequence, sectorIndex as 0 | 1);
-  const write = input.transport.writeOtaSelectSector(address, payload.sectorData, sequence, input.before);
+  const write = input.transport.writeOtaSelectSector(address, payload.sectorData, sequence, input.before, input.signal);
   input.onWriteStart?.();
   await write;
   const metadata = analyzeOtaMetadata(await input.transport.readOtadataSnapshot(), { factoryPresent: true });
@@ -243,6 +244,30 @@ export async function commitOtaActivationTransaction(input: {
     throw new Error('Metadata readback did not select the requested OTA slot and sequence');
   }
   return { metadata, address, sequence, bytesWritten: 4096 };
+}
+
+/** Revalidates recovery metadata and cancellation immediately before its single-sector write. */
+export async function commitOtaRecoveryTransaction(input: {
+  before: Uint8Array; address: number | null; sequence: number | null;
+  transport: { readOtadataSnapshot(): Promise<Uint8Array>; writeOtaRecoverySector(address: number, bytes: Uint8Array, sequence: number, before: Uint8Array, signal?: AbortSignal): Promise<void> };
+  confirm(): Promise<boolean>; signal?: AbortSignal; onWriteStart?: () => void;
+}): Promise<{ address: number; sequence: number }> {
+  const { address, sequence } = input;
+  if (address === null || sequence === null || ![WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.offset + 4096].includes(address)) {
+    throw new Error('OTA recovery plan has an invalid metadata-sector address or sequence');
+  }
+  if (!(await input.confirm())) throw new Error('Emergency OTA recovery cancelled before metadata write; flash is unchanged');
+  if (input.signal?.aborted) throw new Error('Emergency OTA recovery cancelled before metadata write; flash is unchanged');
+  const live = await input.transport.readOtadataSnapshot();
+  if (live.byteLength !== input.before.byteLength || !live.every((byte, index) => byte === input.before[index])) {
+    throw new Error('OTA metadata changed after recovery confirmation; refusing write');
+  }
+  if (input.signal?.aborted) throw new Error('Emergency OTA recovery cancelled before metadata write; flash is unchanged');
+  const sectorIndex = address === WG1200_CONSTANTS.OTADATA.offset ? 0 : 1;
+  const payload = buildOtadataSector(sequence);
+  input.onWriteStart?.();
+  await input.transport.writeOtaRecoverySector(address, payload, sequence, input.before, input.signal);
+  return { address, sequence };
 }
 
 export async function validateOtaMetadataBackup(manifestPath: string, expected: {

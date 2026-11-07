@@ -1,5 +1,17 @@
 # WG1200 recovery readiness
 
+## Update after the reported OTA slot round trip (7 November 2026)
+
+This assessment's conclusion below is dated 5 November 2026 and predates the
+maintainer-reported physical `ota_1 → ota_0 → ota_1` activation cycle now
+recorded in [`hardware-validation.md`](hardware-validation.md). That result
+updates the evidence for the tested metadata-selection and boot sequence on
+the reported gateway. It does not establish rollback after app failure,
+power-loss behavior, recovery of a damaged bootloader, or a general physical
+firmware-installation path. The ordinary installer remains hard-blocked, and
+the exact installed bootloader/configuration and anti-rollback behavior remain
+unknown. The release candidate itself has not been physically run.
+
 ## Final flash-path decision (6 November 2026)
 
 **BLOCKED — installed bootloader recovery and anti-rollback configuration are

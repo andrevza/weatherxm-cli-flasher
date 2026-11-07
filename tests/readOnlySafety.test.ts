@@ -289,6 +289,24 @@ describe('read-only safety validation', () => {
     expect(writeFlash.mock.calls[0]?.[0]?.eraseAll).toBe(false);
   });
 
+  it('restores only one planned OTA metadata sector and verifies exact readback plus peer preservation', async () => {
+    const transport = new Wg1200Transport();
+    const writeFlash = vi.fn(async (_options: any) => undefined);
+    (transport as any).loader = { writeFlash };
+    const after = new Uint8Array(OTA_BEFORE);
+    const payload = buildOtadataSector(6);
+    after.set(payload, 0);
+    vi.spyOn(transport, 'readOtadataSnapshot').mockResolvedValueOnce(OTA_BEFORE).mockResolvedValueOnce(after);
+    await expect(transport.writeOtaRecoverySector(0x13000, payload, 6, OTA_BEFORE)).resolves.toBeUndefined();
+    expect(writeFlash).toHaveBeenCalledTimes(1);
+    const options = writeFlash.mock.calls[0]?.[0];
+    expect(options?.eraseAll).toBe(false);
+    expect(options?.fileArray).toHaveLength(1);
+    expect(options?.fileArray[0]).toMatchObject({ address: 0x13000, data: payload });
+    await expect(transport.writeOtaRecoverySector(0x15000, payload, 6, OTA_BEFORE)).rejects.toThrow();
+    expect(writeFlash).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps OTA selection untouched when the application MD5 check fails', async () => {
     const calls: string[] = [];
     const mock = {

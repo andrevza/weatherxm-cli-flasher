@@ -1,5 +1,13 @@
 # WG1200 firmware-write safety audit
 
+> Historical audit: the sections below record findings and gates as they
+> stood at their dated baselines. A maintainer-reported physical OTA slot
+> round trip on 7 November 2026 is now recorded in
+> [`hardware-validation.md`](hardware-validation.md). This supersedes older
+> statements that no physical OTA activation had been demonstrated, but does
+> not change the generic installer gate or establish power-loss recovery,
+> installed bootloader rollback configuration, or a supported raw restore.
+
 ## A. Audit baseline
 
 The documentation-only hardware record was committed first as

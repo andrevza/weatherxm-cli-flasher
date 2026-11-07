@@ -16,7 +16,7 @@ wg1200 -v
 Example:
 
 ```text
-WeatherXM WG1200 Flasher v0.1.0
+WeatherXM WG1200 Flasher v0.1.0-rc.1
 ```
 
 Verbose human-readable and JSON forms are available:
@@ -113,32 +113,37 @@ STATUS              UP TO DATE
 
 The active firmware remains the reference for comparison policy. Inactive-slot contents do not change upgrade, downgrade, duplicate, or approval decisions.
 
-## Review a dry-run
+## Diagnose a selected OTA image without writing
 
 ```sh
-wg1200 flash weatherxm_0_6_2 \
-  --port /dev/cu.usbserial-13210 \
-  --dry-run
+wg1200 flash diagnose --target ota_0 \
+  --port /dev/cu.usbserial-13210 --offline --json --redact
 ```
 
-Example excerpt:
+This compares the OTA application against the verified local official-image cache. It does not change OTA metadata or write flash. The regular `flash <firmware>` installation path is currently hard-blocked.
 
-```text
-SELECTED FIRMWARE
+## Back up OTA metadata before activation
 
-  Firmware          weatherxm v0.6.2-2-g8f4dca2
-  Target Slot       ota_0
-  Target Offset     0x420000
-  Comparison        OLDER
+Choose a new output path. The metadata backup includes an identity-bound manifest and is independently checked against a second full flash read.
 
-STATUS              DOWNGRADE BLOCKED
+```sh
+wg1200 ota backup --port /dev/cu.usbserial-13210 \
+  --output "$HOME/wg1200-otadata-before-activation.bin" --json --redact
+```
 
-The selected firmware is older than the currently running firmware.
+## Review an activation dry-run
 
-TECHNICAL DETAILS
-  Image SHA-256     <downloaded image SHA-256>
+The dry-run enters the ROM inspection flow, reads metadata and verifies the requested slot. It does not write flash. Inspection can reset the gateway while entering and leaving ROM mode.
 
-No flash operations performed.
+```sh
+wg1200 ota activate --target ota_0 \
+  --metadata-backup-manifest "$HOME/wg1200-otadata-before-activation.bin.manifest.json" \
+  --port /dev/cu.usbserial-13210 --verify-mode thorough --dry-run --redact
+```
+
+Without `--dry-run`, activation writes exactly one 4 KiB OTA metadata sector after showing the transaction and receiving the exact interactive confirmation. It does not reflash either application. It then resets to normal boot and reports Secure Boot evidence, the loaded app offset, startup, and optional service observations separately. The command does not automatically roll back.
+
+Return to `ota_1` by taking a fresh metadata backup after activation and explicitly requesting `--target ota_1`. Use the emergency restore command only when normal activation is not possible; see [the backup and recovery guide](docs/backup-recovery.md).
 ```
 
 If the selected image descriptor matches the inactive slot descriptor, the CLI adds this informational note:
@@ -148,7 +153,7 @@ Selected firmware matches the build descriptor stored
 in the inactive OTA slot.
 ```
 
-That note does not verify byte-for-byte image integrity, activate the slot, bypass a downgrade restriction, or skip normal installation policy.
+That note does not verify byte-for-byte image integrity, activate the slot, bypass a downgrade restriction, or authorize writes.
 
 ## Machine-readable output
 

@@ -1,0 +1,12 @@
+# Known limitations
+
+- The standard `flash <firmware>` installation path is hard-blocked. Only pinned WeatherXM 0.8.34 stage-only writing to inactive `ota_0` while `ota_1` is active is enabled. OTA activate/restore write one metadata sector but do not reflash applications.
+- The maintainer reports a physical `ota_1 → ota_0 → ota_1` round trip. Automatic rollback, recovery from interrupted metadata writes, and fallback after application crash are not established by that test.
+- The currently installed gateway bootloader has not been matched to an exact binary/configuration. IDF log version strings do not identify the binary. The bootloader's rollback and anti-rollback configuration remain unknown unless per-device evidence establishes them.
+- Boot validation is serial-evidence based. A loaded offset and startup log prove those observed events only; optional Wi-Fi/MQTT/station health can be absent, and there is no general health probe or long-duration soak test.
+- Fast OTA inspection does not read complete app partitions for SHA-256/signature analysis. Use Thorough mode for full physical-image reads. Fast activation compares exact source image ranges against device-side MD5; MD5 is an equality aid, not cryptographic authentication. Source digest/signature evidence remains separate.
+- Metadata and app backups are different artifacts. An app or partition backup is not a supported restore image. `ota restore` can reconstruct only one valid selection record when a valid bound backup and trusted recovery app remain available.
+- `--redact` is best-effort and cannot guarantee that arbitrary future log fields or unknown identifiers are hidden.
+- The automated Linux ARM64 artifact is built for a 16 KB-compatible environment and needs compatible glibc/C++ runtime plus `libatomic1` on Debian/Ubuntu. Only listed build targets are supported; physical testing on non-ARM64 platforms is not claimed.
+- The current release-candidate source change has not itself been exercised on a gateway. Historical hardware reports are versioned and attributed in [`hardware-validation.md`](hardware-validation.md).
+- The project is independent and is not an official WeatherXM release. Firmware binaries are not included.

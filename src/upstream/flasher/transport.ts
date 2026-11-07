@@ -1099,7 +1099,8 @@ export class Wg1200Transport {
     targetAddress: number,
     sectorBytes: Uint8Array,
     expectedSeq: number,
-    beforeOtadata: Uint8Array
+    beforeOtadata: Uint8Array,
+    signal?: AbortSignal
   ): Promise<void> {
     if (!this.loader) throw new Error('Not connected');
     const { sector, address } = assertAllowedOtaSelectWrite(targetAddress, sectorBytes.byteLength);
@@ -1117,6 +1118,7 @@ export class Wg1200Transport {
     if (!currentBeforeWrite.every((byte, index) => byte === beforeOtadata[index])) {
       throw new Error('OTA metadata changed during app installation; refusing activation');
     }
+    if (signal?.aborted) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
     const intendedSector = buildOtadataSector(expectedSeq);
     if (!sectorBytes.every((byte, index) => byte === intendedSector[index])) {
       throw new Error('OTA metadata payload does not match the intended sequence/state/CRC record');
@@ -1161,7 +1163,7 @@ export class Wg1200Transport {
   }
 
   /** Emergency metadata repair writes one verified boot-selection sector while preserving its peer. */
-  public async writeOtaRecoverySector(targetAddress: number, sectorBytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void> {
+  public async writeOtaRecoverySector(targetAddress: number, sectorBytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array, signal?: AbortSignal): Promise<void> {
     if (!this.loader) throw new Error('Not connected');
     const { sector, address } = assertAllowedOtaSelectWrite(targetAddress, sectorBytes.byteLength);
     if (beforeOtadata.byteLength !== WG1200_CONSTANTS.OTADATA.size || sectorBytes.byteLength !== 4096) throw new Error('Recovery requires an 8 KiB snapshot and one 4 KiB sector');
@@ -1169,6 +1171,7 @@ export class Wg1200Transport {
     if (!sectorBytes.every((byte, index) => byte === expected[index])) throw new Error('Recovery payload must be the exact VALID sequence/CRC sector');
     const live = await this.readOtadataSnapshot();
     if (!live.every((byte, index) => byte === beforeOtadata[index])) throw new Error('OTA metadata changed before emergency recovery; refusing write');
+    if (signal?.aborted) throw new Error('Emergency OTA recovery cancelled before metadata write; flash is unchanged');
     await this.loader.writeFlash({ fileArray: [{ data: sectorBytes, address }], flashSize: '16MB', flashMode: 'dio', flashFreq: '80m', eraseAll: false, compress: false });
     const after = await this.readOtadataSnapshot();
     const start = sector * 4096;

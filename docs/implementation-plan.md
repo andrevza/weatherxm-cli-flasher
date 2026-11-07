@@ -1,5 +1,14 @@
 # WG1200 CLI implementation plan
 
+> Historical plan: this describes the sequence and assumptions at the time it
+> was written. The current supported commands and write gate are documented in
+> [README](../README.md), [SAFETY.md](../SAFETY.md), and the
+> [command reference](command-reference.md). In particular, the ordinary
+> `flash <firmware>` path is now hard-blocked; only the scoped stage-only
+> application write and explicit OTA metadata activation/recovery operations
+> are enabled. Do not use the original phase descriptions below as current
+> write authorization.
+
 This plan follows the source analysis in [official-flasher-analysis.md](official-flasher-analysis.md). Read-only implementation and source-to-code review were completed before the mocked OTA write path was added. No real device writes were performed.
 
 ## Phase 1: CLI foundation and shared rules — complete

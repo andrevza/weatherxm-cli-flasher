@@ -1,5 +1,40 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Maintainer-reported OTA activation round trip (7 November 2026)
+
+The maintainer reports a completed physical OTA selection cycle on the
+Raspberry Pi 5 / WG1200:
+
+```text
+ota_1 → ota_0 → ota_1
+```
+
+The reported operation used the metadata-only `ota activate` path to select
+between already staged and verified OTA applications. It did not reflash
+either application. The task evidence says the cycle completed and that the
+actual selected slot was observed in the boot output; the two application
+images had the same reported firmware version, so the loaded offset was the
+slot-identifying evidence. No device identifier, credentials, raw radio
+payload, or full UART transcript is retained in this ledger.
+
+The baseline named for the release-readiness review is commit
+`064d0afb4f32de75626e871197228eef66716d42`, executable
+`weatherxm-flash-linux-arm64-monitor-format-20261107`, SHA-256
+`c75676a5933d1418fb7766aae3764ff87868431383d1e017a7275e41d4dd6e97`. The
+task identifies that baseline as the current validated build, but the supplied
+summary does not reproduce a fresh `--version --verbose` transcript tied to
+each of the three physical transitions. Treat the round-trip association with
+that exact file as maintainer-reported, not independently verified by Codex.
+
+This is useful evidence that the reported gateway accepted the tested
+selection sequence and booted each requested slot. It does not establish
+power-loss atomicity, automatic rollback, app crash recovery, a matching
+bootloader binary/configuration, other gateways, or all host platforms. The
+release-candidate build prepared from this review includes a later
+presentation/audit and cancellation-guard change and was not run on physical
+hardware by Codex. No physical access or flash operation was performed for
+this release-readiness review.
+
 ## Maintainer-supplied physical boot capture (5 November 2026)
 
 The maintainer supplied a complete `monitor --boot --redact` transcript captured

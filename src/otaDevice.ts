@@ -3,11 +3,10 @@ import { assertSafeInspection, exactLayoutErrors, loadSelectedFirmware, STAGE_ON
 import { DEFAULT_MANIFEST_URL } from './catalog.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
-import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, otaDeviceBinding, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, readOtaMetadataBackup } from './otaManagement.js';
+import { analyzeOtaMetadata, commitOtaActivationTransaction, commitOtaRecoveryTransaction, createOtaMetadataBackup, otaDeviceBinding, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, readOtaMetadataBackup } from './otaManagement.js';
 import { compareSecureBootTrust, parseEsp32S3ImageBoundary } from './upstream/flasher/secureBoot.js';
 import { parseAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { captureBootLogs } from './upstream/flasher/serialLog.js';
-import { buildOtadataSector } from './upstream/flasher/otadata.js';
 import type { ProgressReporter } from './progress.js';
 
 function logger(options: DeviceOptions) {
@@ -412,18 +411,14 @@ export async function restoreOtaMetadata(options: DeviceOptions & { metadataBack
     const plan = planOtaMetadataRestore(liveAnalysis, backupAnalysis, imageValid);
     if (plan.blockers.length) throw new Error(`Emergency metadata recovery blocked: ${plan.blockers.join(' ')}`);
     options.progress?.log(`EMERGENCY OTA METADATA RECOVERY PLAN\nBackup recovery slot: ${target}\nProposed sequence: ${plan.sequence}\nTarget metadata sector: 0x${plan.sectorAddress!.toString(16)}\nWrite length: 4096 bytes\nRecovery image: VERIFIED\nStrategy: write one new VALID selection record first; preserve the peer sector. Application partitions and all other flash ranges remain unchanged.`);
-    if (!(await options.confirm(plan))) throw new Error('Emergency OTA recovery cancelled before metadata write; flash is unchanged');
-    const latest = await transport.readOtadataSnapshot();
-    if (!latest.every((byte: number, index: number) => byte === live[index])) throw new Error('OTA metadata changed after recovery confirmation; refusing write');
-    const sector = plan.sectorAddress === WG1200_CONSTANTS.OTADATA.offset ? 0 : 1;
-    const payload = buildOtadataSector(plan.sequence!);
-    options.progress?.stage(`Writing emergency OTA metadata record at 0x${plan.sectorAddress!.toString(16)}`, 4096);
-    await transport.writeOtaRecoverySector(plan.sectorAddress!, payload, plan.sequence!, live);
+    const committed = await commitOtaRecoveryTransaction({ before: live, address: plan.sectorAddress, sequence: plan.sequence,
+      transport, confirm: () => options.confirm(plan), signal: options.signal,
+      onWriteStart: () => options.progress?.stage(`Writing emergency OTA metadata record at 0x${plan.sectorAddress!.toString(16)}`, 4096) });
     options.progress?.bytes(4096, 4096); options.progress?.finish('complete', 'one recovery record independently read back; peer sector preserved');
     const after = analyzeOtaMetadata(await transport.readOtadataSnapshot(), { factoryPresent: true });
     if (after.selectedByMetadata !== target || after.selectedSequence !== plan.sequence) throw new Error('Emergency recovery readback did not select the backed-up recovery slot');
     captureResetAfterOpen = true;
-    return { target, sequence: plan.sequence, address: WG1200_CONSTANTS.OTADATA.offset + sector * 4096, metadata: after, firmwareVersion: descriptor!.version };
+    return { target, sequence: committed.sequence, address: committed.address, metadata: after, firmwareVersion: descriptor!.version };
   }, () => captureResetAfterOpen);
   const boot = await captureOtaBoot(options.portPath, {
     slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset,

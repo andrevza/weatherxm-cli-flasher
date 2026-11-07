@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, validateOtaMetadataBackup } from '../src/otaManagement.js';
+import { analyzeOtaMetadata, commitOtaActivationTransaction, commitOtaRecoveryTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, validateOtaMetadataBackup } from '../src/otaManagement.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
 import { ProgressReporter } from '../src/progress.js';
 
@@ -124,6 +124,45 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
     expect(accepted).toHaveBeenCalledOnce();
     expect(writeStarted).toHaveBeenCalledOnce();
     expect(writerOrder).toEqual(['writer-entered', 'progress-write-stage']);
+  });
+  it('cancels activation after the final metadata reread without entering the writer', async () => {
+    const before = snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]);
+    const analysis = analyzeOtaMetadata(before, { factoryPresent: true });
+    const plan = planOtaActivation({ analysis, target: 'ota_0', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    const controller = new AbortController(); let finishRead!: (bytes: Uint8Array) => void;
+    const writer = vi.fn(async () => undefined);
+    const pending = commitOtaActivationTransaction({ before, plan,
+      transport: { readOtadataSnapshot: () => new Promise((resolve) => { finishRead = resolve; }), writeOtaSelectSector: writer },
+      confirm: async () => true, signal: controller.signal });
+    await Promise.resolve();
+    controller.abort(); finishRead(before);
+    await expect(pending).rejects.toThrow(/cancelled before metadata write/);
+    expect(writer).not.toHaveBeenCalled();
+  });
+  it('cancels emergency restore during final metadata reread without entering the writer', async () => {
+    const before = snapshot([{ seq: 5, state: ESP_OTA_IMG_INVALID }, { seq: 4, state: ESP_OTA_IMG_ABORTED }]);
+    const controller = new AbortController(); let finishRead!: (bytes: Uint8Array) => void;
+    const writer = vi.fn(async () => undefined);
+    const pending = commitOtaRecoveryTransaction({ before, address: 0x13000, sequence: 6,
+      transport: { readOtadataSnapshot: () => new Promise((resolve) => { finishRead = resolve; }), writeOtaRecoverySector: writer },
+      confirm: async () => true, signal: controller.signal });
+    await Promise.resolve();
+    controller.abort(); finishRead(before);
+    await expect(pending).rejects.toThrow(/cancelled before metadata write/);
+    expect(writer).not.toHaveBeenCalled();
+  });
+  it('restores with one exact 4 KiB valid record at the planned metadata sector', async () => {
+    const before = snapshot([{ seq: 5, state: ESP_OTA_IMG_INVALID }, { seq: 4, state: ESP_OTA_IMG_ABORTED }]);
+    const writer = vi.fn(async (_address: number, _bytes: Uint8Array, _sequence: number) => undefined);
+    const committed = await commitOtaRecoveryTransaction({ before, address: 0x13000, sequence: 6,
+      transport: { readOtadataSnapshot: async () => before, writeOtaRecoverySector: writer }, confirm: async () => true });
+    expect(committed).toEqual({ address: 0x13000, sequence: 6 });
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(writer.mock.calls[0]?.[0]).toBe(0x13000);
+    expect(writer.mock.calls[0]?.[1]).toHaveLength(4096);
+    expect(new DataView(writer.mock.calls[0]![1].buffer).getUint32(28, true)).toBe(calculateOtaSeqCrc32(6));
   });
   it('plans emergency recovery as a first-valid-sector transaction and preserves a viable peer', () => {
     const live = analyzeOtaMetadata(snapshot([{ seq: 5, state: ESP_OTA_IMG_INVALID }, { seq: 4, state: ESP_OTA_IMG_ABORTED }]), { factoryPresent: true });

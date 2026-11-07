@@ -4,7 +4,7 @@ Independent command-line utility for inspecting, verifying and installing compat
 
 ## Status
 
-Commands include `info`, `verify`, `status`, `ota status`, `ota backup`, `firmware list`, `security`, `backup inactive`, `backup partition`, and `flash`. Standard device inspection enters the ESP32-S3 ROM loader and runs a RAM stub; `security` stays in the ROM loader and reads eFuse registers without uploading a stub or accessing flash. Normal OTA installation remains fail-closed. The distinct `flash weatherxm --stage-only` path can write only verified official WeatherXM 0.8.34 to `ota_0` while `ota_1` is active, and never modifies OTA metadata or activates the staged image. `ota status` reads both OTA metadata sectors and both app slots. `ota backup` saves the exact 8 KiB metadata partition with an independent readback and device-bound manifest. `ota activate` can select an already verified OTA image after a fresh device-bound metadata backup, image verification, and exact operator confirmation. It transactionally writes and independently verifies one 4 KiB OTA metadata sector, then captures normal boot; it does not reflash either application or automatically roll back. The installed bootloader rollback/anti-rollback configuration and actual-running slot cannot be inferred from a ROM flash snapshot. `backup inactive` streams the complete inactive OTA partition and creates a verified manifest. `backup partition <name>` explicitly reads one exact discovered allowlisted partition, creating a sensitive full dump and manifest after an interactive confirmation. Stage-only requires the OTA backup manifest and a deliberate interactive confirmation. `flash --dry-run` remains read-only.
+The CLI includes `info`, `verify`, `status`, `check`, `monitor`, `ota`, `backup`, `firmware`, `security`, and `flash` command groups. Standard device inspection enters the ESP32-S3 ROM loader, runs a RAM stub, and resets the gateway on cleanup; `security` stays in ROM and reads eFuse registers without uploading a stub or accessing flash. The ordinary `flash <firmware>` install path is hard-blocked. The separate `flash weatherxm --stage-only` path is narrowly enabled to write the pinned official WeatherXM 0.8.34 image into `ota_0` while `ota_1` is active; it requires a fresh verified backup and interactive confirmation and never changes OTA metadata. `ota activate` and `ota restore` are explicit metadata-writing operations: each writes and independently verifies one 4 KiB OTA metadata sector after image/backup checks and exact interactive confirmation, then captures normal boot. Neither reflashes an application or rolls back automatically. A maintainer-reported physical `ota_1 → ota_0 → ota_1` round trip is recorded in [the hardware validation ledger](docs/hardware-validation.md); this does not establish all bootloader rollback or recovery behavior. `backup inactive` streams the selected OTA partition. `backup partition <name>` creates a sensitive full partition dump after an interactive confirmation. See the [command reference](docs/command-reference.md) and [backup/recovery guide](docs/backup-recovery.md).
 
 `ota status` defaults to `--verify-mode fast`: it validates OTA metadata and reports application identity from 4 KiB descriptor headers without reading complete 4 MiB app partitions. Fast mode does not verify full-image SHA-256 or signatures; it reports those checks as unavailable. Use `ota status --verify-mode thorough` to read both full app partitions, calculate SHA-256, inspect image boundaries and verify Secure Boot V2 signatures where signed-image evidence is present. Both modes report signature validity separately from signer trust, and neither infers anti-rollback settings or the application currently running. The JSON report includes `verificationMode`, overall `assurance`, and per-slot `imageVerification` fields; calculated hashes do not imply a match against a trusted baseline. With `--json`, the final document stays on stdout while the shared progress display remains on stderr; when stderr is a TTY it updates in place even if stdout is JSON.
 
@@ -14,7 +14,7 @@ The official reference repository and exact behavior reviewed are documented in 
 
 ## Hardware validation
 
-The maintainer-reported Linux ARM64 standalone built from commit `b332833` completed one each of `info`, `verify`, and `status` on a Raspberry Pi 5 with a WG1200. This validates those read-only operations on that hardware, not firmware installation, erase, or recovery. The current audited source is newer and has not been physically exercised. See the [hardware validation record](docs/hardware-validation.md) for build identity and limits.
+The hardware ledger contains maintainer-supplied records for read-only inspection, normal boot monitoring, staging, and the OTA slot round trip. These are separately qualified by the exact build evidence available for each record; they do not constitute Codex-observed testing. The release-candidate build described here is automated-tested but has not itself been re-run on physical hardware. See [the hardware validation record](docs/hardware-validation.md).
 
 Contributor workflow and safety requirements are in [AGENTS.md](AGENTS.md). Command examples and sample dual-slot output are in [EXAMPLE.md](EXAMPLE.md).
 
@@ -145,8 +145,8 @@ wg1200 check weatherxm --port /dev/ttyUSB0 --json
 # List firmware releases from the official catalog
 wg1200 firmware list
 
-# Install a listed release; review the displayed identity, image hash, and target slot
-wg1200 flash meshtastic --port /dev/ttyUSB0
+# Compare a backup offline with the verified official firmware cache
+wg1200 firmware compare --backup ./ota0-backup.bin --firmware weatherxm --offline --json
 
 # Complete inspection and then keep listening to the booted device
 wg1200 info --port /dev/ttyUSB0 --monitor
@@ -155,25 +155,14 @@ wg1200 info --port /dev/ttyUSB0 --monitor
 wg1200 info --port /dev/ttyUSB0 --json --redact
 wg1200 status --port /dev/ttyUSB0 --redact
 
-# Capture post-flash boot logs for 30 seconds, or disable the finite capture
-wg1200 flash weatherxm --port /dev/ttyUSB0 --boot-log-seconds 30
-wg1200 flash weatherxm --port /dev/ttyUSB0 --boot-log-seconds 0
+# Read-only diagnosis of an OTA slot against the verified official image cache
+wg1200 flash diagnose --target ota_0 --port /dev/ttyUSB0 --offline --json --redact
 
-# Continue monitoring after a successful installation until Ctrl+C
-wg1200 flash weatherxm --port /dev/ttyUSB0 --monitor
-
-# Explicit noninteractive confirmation for reviewed automation
-wg1200 flash weatherxm --port /dev/ttyUSB0 --yes
-
-# Inspect the image descriptor, compare it with the active app, and show the proposed target without writing
-wg1200 flash weatherxm --port /dev/ttyUSB0 --dry-run
-
-# Intentionally reinstall the exact same firmware build (still requires normal write confirmation)
-wg1200 flash weatherxm --port /dev/ttyUSB0 --force
-
-# Explicitly authorize the official targeted recovery flow for ambiguous OTA metadata
-wg1200 flash weatherxm --port /dev/ttyUSB0 --recover
+# Inspect the ordinary installation preflight without writing (the write gate remains closed)
+wg1200 flash weatherxm --port /dev/ttyUSB0 --dry-run --json --redact
 ```
+
+`flash weatherxm --stage-only` without `--dry-run` writes application bytes to `ota_0` and requires the backup and exact interactive confirmation. `ota activate` and `ota restore` write one 4 KiB metadata sector and also require exact interactive confirmation. The ordinary `flash <firmware>` install path remains blocked even when `--yes`, `--force`, or `--recover` is supplied. Never treat the dry-run examples as write authorization.
 
 Print the application version without accessing a device or the network:
 
@@ -185,11 +174,11 @@ wg1200 --version --verbose --json
 
 The concise form prints the application name and package version. Verbose output also reports embedded build timestamp, source SHA-256, Git commit/tag and working-tree status, plus the operating system, architecture, and Node.js runtime version.
 
-Baud defaults to 115200, matching the WG1200 web flasher. Firmware writes report progress at 5% intervals. After reboot, the CLI listens for up to 12 seconds and reports the detected boot signature, app version, whether the boot log reported Secure Boot signature success, and whether it observed PHY calibration regeneration. `--json` emits machine-readable device/catalog output. `--manifest URL` can point `firmware list` to another HTTPS manifest on the same origin as its firmware files.
+Baud defaults to 115200. Measurable operations report byte progress, throughput, and ETA; device-side digest work reports elapsed time without fabricated byte rates. `ota activate` and `ota restore` capture boot logs live for 15 seconds by default, with `--boot-capture-seconds` up to 3600 seconds. They distinguish metadata verification, Secure Boot evidence, actual loaded OTA offset, application version/startup, and optional service health. Missing optional-service or boot evidence is not guessed. `--json` emits machine-readable output on stdout while progress and diagnostics go to stderr. `--manifest URL` can point `firmware list` to another HTTPS manifest on the same origin as its firmware files.
 
 `check <firmware>` downloads and validates the actual firmware image, inspects the gateway, then applies the same descriptor comparison policy as flash preflight. Completed checks always exit `0`, including up-to-date, update available, downgrade blocked, approval required, and incompatible firmware results. Invalid input, unavailable manifests, image-integrity failures, and device-validation errors exit nonzero. A firmware-type change is reported as incompatible/approval-required and is never described as a normal version upgrade.
 
-`monitor` opens a receive-only serial session without creating an esptool loader or sending serial bytes. It supports `--timestamp`, `--level error|warn|info|debug|verbose`, `--output <file>`, `--raw`, and `--no-color`. The monitor sanitizes certificate/key blocks and long hex values even in raw mode. `--boot` attaches the raw receive handler before opening the port, then holds DTR deasserted (GPIO0 released), asserts RTS for 120 ms (EN reset), and releases RTS; it keeps that same port open through ROM, bootloader, and application output until Ctrl+C. The reset sequence also waits 50 ms before asserting EN and 150 ms after release. This mapping follows the existing esptool transport convention; board-level tracing has not independently verified the WG1200 wiring. Do not infer device configuration from missing log messages. Redaction is best-effort; inspect captures before sharing. `--monitor` on a device operation starts this passive reader after the operation closes and releases its own serial connection; early boot messages can occur before that reader opens.
+`monitor` opens a receive-only serial session without creating an esptool loader or sending serial bytes. It supports `--timestamp`, `--level error|warn|info|debug|verbose`, `--output <file>`, `--raw`, and `--no-color`. The monitor sanitizes certificate/key blocks and long hex values even in raw mode. `monitor --boot` and OTA activation/restore captures use host timestamps by default and share severity/color/redaction formatting. `--boot` attaches the raw receive handler before opening the port, then holds DTR deasserted (GPIO0 released), asserts RTS for 120 ms (EN reset), and releases RTS; it keeps that same port open through ROM, bootloader, and application output until Ctrl+C. The reset sequence also waits 50 ms before asserting EN and 150 ms after release. This mapping follows the existing esptool transport convention; board-level tracing has not independently verified the WG1200 wiring. Do not infer device configuration from missing log messages. Redaction is best-effort; inspect captures before sharing. `--monitor` on a device operation starts this passive reader after the operation closes and releases its own serial connection; early boot messages can occur before that reader opens.
 
 `--redact` masks MAC addresses and partial MAC suffixes, gateway/device and station identifiers/names (including telemetry `ws_fo_id` and station-ownership log messages), certificate common names, fingerprints and PEM blocks, public keys/hashes, serial-number fields, access tokens, MQTT credentials, device/mDNS names, and labeled location/address and IP-address fields in human-readable and JSON output, including application diagnostics and monitor output files. Embedded JSON in serial log lines is parsed and reserialized after sensitive fields are replaced. Sensitive JSON values become string placeholders (JSON `null` stays `null`); for malformed JSON-like key/value fragments, an unquoted sensitive value is replaced with `null` when the key is quoted. In monitor mode it also replaces byte rows inside recognized LoRa packet blocks and `WS PubKey`/`WS SN` identity blocks with byte counts while preserving packet headers and signal metrics. `--raw` changes monitor formatting only; it does not disable redaction. It does not alter values used internally for device identity, validation, or cryptographic checks. It preserves operational details such as chip model, firmware version, reset reason, flash size, partition layout, heap telemetry, ordinary hexadecimal addresses, and labeled public firmware SHA-256 values. Redaction uses field names and recognizable text patterns; unknown log syntax can still leak values, so it is best-effort and not a security proof. Review logs before sharing them.
 
@@ -271,7 +260,7 @@ Tests use fixtures and mocks. They do not connect to a gateway or perform firmwa
 
 ## Release process
 
-The release workflow builds each target on a matching native runner, smoke-tests startup and the serial binding, then waits for the configured self-hosted Linux ARM64 read-only device gate. It generates SHA-256 checksums and creates a **draft prerelease** that is not public until manually published. Its notes distinguish physically tested read-only operations from automated-only write paths. Do not publish it as production-ready until firmware installation and OTA activation have been separately validated on hardware. No release has been created by this task.
+The release workflow builds each target on a matching native runner, smoke-tests startup and the serial binding, then waits for the configured self-hosted Linux ARM64 read-only device gate. It generates SHA-256 checksums and creates a draft prerelease. The read-only hardware gate does not exercise writes. Maintainer-reported stage-only and OTA activation results are recorded separately in the hardware ledger; they do not prove automatic rollback, interruption recovery, or all host/platform combinations. The release candidate described in [the RC notes](docs/release-v0.1.0-rc.1.md) is not an official WeatherXM release, and no public release is created by this task.
 
 The hardware gate is read-only and does not enable firmware writes. The CLI currently blocks all installation attempts because installed-bootloader recovery behavior and physical preservation validation remain incomplete. Automated firmware-write testing remains fixture/mock-only. Never use the release gate to run `flash`.
 
