@@ -103,7 +103,7 @@ export async function buildOtaStatusReport(input: { transport: any; inspection: 
       let partitionSha256: string | null = null;
       let imageLength: number | null = null;
       let imageStatus: string;
-      let signatureVerified: boolean | null = mode === 'fast' ? null : false;
+      let signatureVerified: boolean | null = null;
       let signerTrust: ReturnType<typeof compareSecureBootTrust> | null = null;
       if (mode === 'fast') {
         let header = inspection.appHeaders?.[part.offset.toString(16)] as Uint8Array | undefined;
@@ -126,7 +126,7 @@ export async function buildOtaStatusReport(input: { transport: any; inspection: 
         imageHeaderValid = image[0] === 0xe9;
         imageStatus = boundary.status;
         imageLength = boundary.imageLength ?? null;
-        signatureVerified = boundary.imageEvidence?.signatureValid ?? false;
+        signatureVerified = boundary.imageEvidence ? boundary.imageEvidence.signatureValid : null;
         imageSha256 = boundary.imageLength ? hashImage(image, boundary.imageLength, `Hashing ${slot} signed image`, progress) : null;
         partitionSha256 = hashImage(image, image.byteLength, `Hashing ${slot} full partition`, progress);
       }
@@ -142,7 +142,7 @@ export async function buildOtaStatusReport(input: { transport: any; inspection: 
           explanation: mode === 'fast' ? 'Full image SHA-256 and cryptographic signature were not checked in Fast mode.' : 'Full physical image and partition SHA-256 values were calculated; no trusted digest baseline was supplied, and Secure Boot signature validity is distinct from signer trust.' } };
     }
     return { outcome: 'READ ONLY OTA STATUS', verificationMode: mode,
-      assurance: mode === 'fast' ? 'OTA metadata CRC and application header/descriptor only; full image integrity and signatures not checked' : 'Full application images read, image boundaries and local SHA-256 calculated, Secure Boot V2 signatures checked',
+      assurance: mode === 'fast' ? 'OTA metadata CRC and application header/descriptor only; full image integrity and signatures not checked' : 'Both full app partitions read; image boundaries checked; SHA-256 calculated; Secure Boot V2 signatures checked when signed image evidence is present',
       partitionTable: Object.fromEntries(Object.entries(inspection.partitions).map(([label, p]: [string, any]) => [label, { offset: p.offset, length: p.size }])),
       metadata: analysis, slots,
       activeRunningSlot: { value: null, source: 'unobserved: ROM flash inspection cannot query esp_ota_get_running_partition; collect serial boot logs and inspect Loaded app from partition at offset.' },

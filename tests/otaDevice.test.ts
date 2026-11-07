@@ -38,12 +38,14 @@ describe('OTA status verification modes', () => {
 
   it('reads both complete OTA partitions in thorough mode and reports calculated hashes separately from baseline trust', async () => {
     const { transport, inspection, readRegionChunks } = makeInput();
-    await buildOtaStatusReport({ transport, inspection, verificationMode: 'thorough' });
+    const result = await buildOtaStatusReport({ transport, inspection, verificationMode: 'thorough' });
     expect(readRegionChunks).toHaveBeenCalledTimes(3);
     expect(readRegionChunks.mock.calls.map(([offset, size]) => [offset, size])).toEqual([
       [WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size],
       [WG1200_CONSTANTS.APP_OTA_0.offset, WG1200_CONSTANTS.APP_OTA_0.size],
       [WG1200_CONSTANTS.APP_OTA_1.offset, WG1200_CONSTANTS.APP_OTA_1.size],
     ]);
+    expect(result.slots.ota_0).toMatchObject({ sha256: null, partitionSha256: expect.any(String),
+      imageVerification: { fullSha256Verified: false, fullPartitionSha256Calculated: true, signatureVerified: null } });
   });
 });
