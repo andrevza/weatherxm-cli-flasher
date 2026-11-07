@@ -57,6 +57,17 @@ function transportLogger(options: DeviceOptions) {
     log: (message: string) => { if (verbose) diagnostic(options.progress, `[wg1200] ${message}`); },
     error: (message: string) => diagnostic(options.progress, `[wg1200] ERROR ${message}`),
     debug: (message: string) => { if (verbose) diagnostic(options.progress, message); },
+    progress: (stage: string, state: 'start' | 'complete' | 'failed' | 'bytes', detail?: string, completed?: number, total?: number) => {
+      if (state === 'start') options.progress?.stage(stage, total, detail);
+      else if (state === 'bytes') options.progress?.bytes(completed ?? 0, total);
+      else options.progress?.finish(state, detail);
+    },
+  };
+}
+function serialLifecycle(options: DeviceOptions) {
+  return (stage: string, state: 'start' | 'complete' | 'failed', detail?: string) => {
+    if (state === 'start') options.progress?.log(`${stage}...`);
+    else options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : 'FAILED'}${detail ? ` — ${detail}` : ''}`);
   };
 }
 export interface FlashConfirmation {
@@ -134,7 +145,7 @@ async function createOtaBackupWithTransport(transport: Wg1200Transport, outputPa
 /** Stream a full inactive OTA partition backup to disk; never reads credential partitions. */
 export async function backupInactiveOta(options: DeviceOptions & { outputPath: string; selection?: 'active' | 'inactive' }): Promise<{ manifest: InactiveBackupManifest; manifestPath: string }> {
   const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
-  const port = new NodeSerialPort(options.portPath, trace);
+  const port = new NodeSerialPort(options.portPath, trace, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
@@ -164,7 +175,7 @@ export async function backupInactiveOta(options: DeviceOptions & { outputPath: s
 export async function backupDiscoveredPartition(options: DeviceOptions & { outputPath: string; label: string }): Promise<{ manifest: Awaited<ReturnType<typeof createPartitionBackup>>; manifestPath: string }> {
   const expected = EXPECTED_WG1200_PARTITIONS[options.label];
   if (!expected) throw new Error(`BACKUP FAILED: partition '${options.label}' is not on the WG1200 allowlist`);
-  const port = new NodeSerialPort(options.portPath, options.traceSerial ? (message) => diagnostic(options.progress, `[serial] ${message}`) : undefined);
+  const port = new NodeSerialPort(options.portPath, options.traceSerial ? (message) => diagnostic(options.progress, `[serial] ${message}`) : undefined, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
@@ -230,7 +241,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   const image = verifySecureBootV2Image(selected.verified.data);
   image.secureVersion = selected.descriptor.secureVersion;
   const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
-  const port = new NodeSerialPort(options.portPath, trace);
+  const port = new NodeSerialPort(options.portPath, trace, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   let released = false;
@@ -482,7 +493,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */
 export async function readDeviceSecurity(options: DeviceOptions): Promise<SecureBootDeviceState> {
   const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
-  const port = new NodeSerialPort(options.portPath, trace);
+  const port = new NodeSerialPort(options.portPath, trace, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
@@ -751,7 +762,7 @@ function validateRawPartitionTable(bytes: Uint8Array): string[] {
 /** Read-only inspection adapter. This class intentionally exposes no write operations. */
 export async function inspectDevice(options: DeviceOptions): Promise<Wg1200Inspection> {
   const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
-  const port = new NodeSerialPort(options.portPath, trace);
+  const port = new NodeSerialPort(options.portPath, trace, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   try {
@@ -782,7 +793,7 @@ export async function flashDevice(options: DeviceOptions & {
   options.progress?.finish('complete', 'verified image loaded into an immutable memory snapshot before device access');
 
   const trace = options.traceSerial ? (message: string) => diagnostic(options.progress, `[serial] ${message}`) : undefined;
-  const port = new NodeSerialPort(options.portPath, trace);
+  const port = new NodeSerialPort(options.portPath, trace, undefined, false, serialLifecycle(options));
   const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
   const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
   let completed: { deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; flashVerified: boolean; otaMetadataVerified: boolean; protectedPartitionsVerified: boolean } | undefined;
@@ -871,7 +882,7 @@ export async function flashDevice(options: DeviceOptions & {
   }
   if (!completed) throw new Error('Firmware write completed without a result');
   const bootSeconds = options.bootLogSeconds ?? 15;
-  const bootPort = bootSeconds > 0 ? new NodeSerialPort(options.portPath, trace, undefined, true) : undefined;
+  const bootPort = bootSeconds > 0 ? new NodeSerialPort(options.portPath, trace, undefined, true, serialLifecycle(options)) : undefined;
   options.progress?.stage('Capturing restart and normal boot output');
   const boot = bootPort
     ? await captureBootLogs(bootPort, bootSeconds * 1000, options.onBootLine, { slotOffset: completed.targetOffset, firmwareVersion: selectedDescriptor.version })

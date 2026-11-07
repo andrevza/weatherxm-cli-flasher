@@ -13,6 +13,7 @@ type SerialPortLike = {
 };
 export type SerialTrace = (message: string) => void;
 export type SerialPortFactory = (options: { path: string; baudRate: number; autoOpen: false; hupcl?: boolean }) => SerialPortLike | Promise<SerialPortLike>;
+export type SerialLifecycle = (stage: string, state: 'start' | 'complete' | 'failed', detail?: string) => void;
 
 /** Adapts node-serialport's event API to the Web Serial shape used by esptool-js. */
 export class NodeSerialPort {
@@ -27,6 +28,7 @@ export class NodeSerialPort {
     private readonly trace?: SerialTrace,
     private readonly portFactory?: SerialPortFactory,
     private readonly passive = false,
+    private readonly lifecycle?: SerialLifecycle,
   ) {}
 
   private log(message: string): void {
@@ -42,21 +44,29 @@ export class NodeSerialPort {
     const baudRate = options.baudRate ?? 115200;
     const serialOptions = { path: this.path, baudRate, autoOpen: false as const, ...(this.passive ? { hupcl: false } : {}) };
     this.log(`open path=${this.path} baud=${baudRate} dataBits=8 parity=none stopBits=1 flowControl=none`);
+    const stage = `Opening serial port ${this.path}`;
+    this.lifecycle?.(stage, 'start');
     let port: SerialPortLike;
-    if (this.portFactory) {
-      port = await this.portFactory(serialOptions);
-    } else {
-      const { SerialPort } = await import('serialport');
-      const Port = SerialPort as unknown as SerialPortCtor;
-      port = new Port(serialOptions);
+    try {
+      if (this.portFactory) {
+        port = await this.portFactory(serialOptions);
+      } else {
+        const { SerialPort } = await import('serialport');
+        const Port = SerialPort as unknown as SerialPortCtor;
+        port = new Port(serialOptions);
+      }
+      this.port = port;
+      await new Promise<void>((resolve, reject) => port.open((err: Error | null) => {
+        if (err) {
+          this.log(`open failed: ${err.message}`);
+          reject(err);
+        } else resolve();
+      }));
+      this.lifecycle?.(stage, 'complete');
+    } catch (error) {
+      this.lifecycle?.(stage, 'failed', error instanceof Error ? error.message : String(error));
+      throw error;
     }
-    this.port = port;
-    await new Promise<void>((resolve, reject) => port.open((err: Error | null) => {
-      if (err) {
-        this.log(`open failed: ${err.message}`);
-        reject(err);
-      } else resolve();
-    }));
     this.baudRate = baudRate;
     let receivedBytes = 0;
 
@@ -115,12 +125,22 @@ export class NodeSerialPort {
   }
 
   async setSignals(signals: { dataTerminalReady?: boolean; requestToSend?: boolean }): Promise<void> {
+    const previousDtr = this.dtr; const previousRts = this.rts;
     this.dtr = signals.dataTerminalReady ?? this.dtr;
     this.rts = signals.requestToSend ?? this.rts;
     const port = this.port;
     this.log(`signals dtr=${this.dtr} rts=${this.rts}`);
     if (!port?.isOpen) return;
-    await new Promise<void>((resolve, reject) => port.set({ dtr: this.dtr, rts: this.rts }, (err: Error | null) => err ? reject(err) : resolve()));
+    const changed = previousDtr !== this.dtr || previousRts !== this.rts;
+    const stage = 'Applying RTS/DTR reset signals';
+    if (changed) this.lifecycle?.(stage, 'start');
+    try {
+      await new Promise<void>((resolve, reject) => port.set({ dtr: this.dtr, rts: this.rts }, (err: Error | null) => err ? reject(err) : resolve()));
+      if (changed) this.lifecycle?.(stage, 'complete');
+    } catch (error) {
+      if (changed) this.lifecycle?.(stage, 'failed', error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   async close(): Promise<void> {

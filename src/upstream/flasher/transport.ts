@@ -395,6 +395,9 @@ export interface Wg1200Inspection {
   isPartitionLayoutValid: boolean;
   secureCert: SecureCertVerificationResult;
   otadata: OtadataStatus;
+  /** Read-only bytes and headers retained so OTA status can inspect cached evidence without duplicate serial reads. */
+  otadataRaw?: Uint8Array;
+  appHeaders?: Record<string, Uint8Array>;
   currentFirmware: AppDescriptor | null;
   inactiveFirmware: AppDescriptor | null;
   isValidWg1200: boolean;
@@ -404,6 +407,7 @@ export interface TerminalLogger {
   log: (msg: string) => void;
   error: (msg: string) => void;
   debug?: (msg: string) => void;
+  progress?: (stage: string, state: 'start' | 'complete' | 'failed' | 'bytes', detail?: string, completed?: number, total?: number) => void;
 }
 
 export interface TransportDisconnectResult {
@@ -516,7 +520,8 @@ export class Wg1200Transport {
       throw new Error('Not connected to device');
     }
 
-    // 1. Identify chip
+    // 1. Identify chip and prepare the ROM flash reader.
+    this.logger.progress?.('Identifying ESP32-S3 chip', 'start');
     const chipName: string = (this.loader as any).chip?.CHIP_NAME ?? 'Unknown';
     const isEsp32S3 =
       chipName.toLowerCase().includes('esp32-s3') || chipName.toLowerCase().includes('esp32s3');
@@ -529,9 +534,12 @@ export class Wg1200Transport {
     } catch (e: any) {
       this.logger.debug?.(`Could not read MAC address: ${e?.message ?? e}`);
     }
+    this.logger.progress?.('Identifying ESP32-S3 chip', 'complete', chipName);
 
     // 2. Identify flash size (esptool-js 0.7.0 detectFlashSize)
+    this.logger.progress?.('Detecting flash configuration', 'start');
     let flashSizeBytes = 0;
+    let flashDetectionFailed = false;
     try {
       const rawSize = await this.loader.detectFlashSize();
       if (typeof rawSize === 'string') {
@@ -546,40 +554,40 @@ export class Wg1200Transport {
         flashSizeBytes = rawSize <= 65536 ? rawSize * 1024 : rawSize;
       }
     } catch (e: any) {
+      flashDetectionFailed = true;
       this.logger.error(`Flash size detection failed: ${e.message}`);
+      this.logger.progress?.('Detecting flash configuration', 'failed', e?.message ?? String(e));
     }
     const is16Mb = flashSizeBytes === WG1200_CONSTANTS.FLASH_SIZE_BYTES;
     const flashSizeMb = Math.round(flashSizeBytes / (1024 * 1024));
+    if (flashSizeBytes > 0) this.logger.progress?.('Detecting flash configuration', 'complete', `${flashSizeMb} MiB reported by flash reader`);
+    else if (!flashDetectionFailed) this.logger.progress?.('Detecting flash configuration', 'failed', 'flash reader did not report a capacity');
 
     // 3. Read & Verify Partition Table (0xC000, 4KB)
     this.logger.log('Reading partition table from 0xC000…');
-    const ptBytes = await this.readRegion(
-      WG1200_CONSTANTS.PARTITION_TABLE.offset,
-      WG1200_CONSTANTS.PARTITION_TABLE.size
-    );
+    const ptBytes = await this.readInspectionRegion(WG1200_CONSTANTS.PARTITION_TABLE.offset, WG1200_CONSTANTS.PARTITION_TABLE.size, 'Reading partition table');
     const parsedPt = parsePartitionTableWithMetadata(ptBytes);
+    this.logger.progress?.('Validating exact partition layout', 'start');
     const ptResult = verifyWg1200PartitionTable(
       parsedPt.partitions,
       chipName,
       flashSizeBytes,
       { duplicateLabels: parsedPt.duplicateLabels, md5Valid: parsedPt.md5Valid }
     );
+    this.logger.progress?.('Validating exact partition layout', ptResult.valid ? 'complete' : 'failed', ptResult.errors.join('; '));
 
     // 4. Read & Verify esp_secure_cert (0xD000, 8KB)
     this.logger.log('Reading esp_secure_cert from 0xD000…');
-    const certBytes = await this.readRegion(
-      WG1200_CONSTANTS.SECURE_CERT.offset,
-      WG1200_CONSTANTS.SECURE_CERT.size
-    );
+    const certBytes = await this.readInspectionRegion(WG1200_CONSTANTS.SECURE_CERT.offset, WG1200_CONSTANTS.SECURE_CERT.size, 'Reading secure certificate partition');
+    this.logger.progress?.('Validating secure certificate identity', 'start');
     const secureCert = await verifySecureCertIdentity(certBytes);
+    this.logger.progress?.('Validating secure certificate identity', secureCert.valid ? 'complete' : 'failed', secureCert.valid ? undefined : secureCert.errors.join('; '));
 
     // 5. Read & Parse otadata (0x13000, 8KB)
     this.logger.log('Reading otadata from 0x13000…');
-    const otaBytes = await this.readRegion(
-      WG1200_CONSTANTS.OTADATA.offset,
-      WG1200_CONSTANTS.OTADATA.size
-    );
+    const otaBytes = await this.readInspectionRegion(WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size, 'Reading OTA metadata');
     const otadata = determineActiveBootSlot(otaBytes);
+    const appHeaders: Record<string, Uint8Array> = {};
 
     // 6. Resolve active and target partitions using the device's actual partition table
     const findPartition = (slot: 'factory' | 'ota_0' | 'ota_1'): PartitionRecord | undefined => {
@@ -626,7 +634,8 @@ export class Wg1200Transport {
     let currentFirmware: AppDescriptor | null = null;
     try {
       this.logger.log(`Scanning application descriptor at offset 0x${activeAppOffset.toString(16)}…`);
-      const headerBytes = await this.readRegion(activeAppOffset, 4096);
+      const headerBytes = await this.readInspectionRegion(activeAppOffset, 4096, `Reading ${otadata.activeSlot} application descriptor`);
+      appHeaders[activeAppOffset.toString(16)] = headerBytes;
       currentFirmware = parseAppDescriptor(headerBytes);
 
       // If no valid descriptor found, check if slot is erased or if factory is empty while ota_0 is programmed
@@ -638,7 +647,8 @@ export class Wg1200Transport {
           const ota0Part = findPartition('ota_0');
           const ota0Offset = ota0Part?.offset ?? WG1200_CONSTANTS.APP_OTA_0.offset;
           try {
-            const ota0Header = await this.readRegion(ota0Offset, 4096);
+            const ota0Header = await this.readInspectionRegion(ota0Offset, 4096, 'Reading ota_0 application descriptor');
+            appHeaders[ota0Offset.toString(16)] = ota0Header;
             const ota0Desc = parseAppDescriptor(ota0Header);
             if (ota0Desc) {
               currentFirmware = ota0Desc;
@@ -692,7 +702,8 @@ export class Wg1200Transport {
       this.logger.log(
         `Scanning inactive slot (${otadata.targetSlot}) descriptor at offset 0x${otadata.targetOffset.toString(16)}…`
       );
-      const inactiveHeaderBytes = await this.readRegion(otadata.targetOffset, 4096);
+      const inactiveHeaderBytes = await this.readInspectionRegion(otadata.targetOffset, 4096, `Reading ${otadata.targetSlot} application descriptor`);
+      appHeaders[otadata.targetOffset.toString(16)] = inactiveHeaderBytes;
       inactiveFirmware = parseAppDescriptor(inactiveHeaderBytes);
       if (!inactiveFirmware) {
         const isErased = inactiveHeaderBytes.slice(0, 32).every((b) => b === 0xff);
@@ -752,6 +763,8 @@ export class Wg1200Transport {
       isPartitionLayoutValid: ptResult.valid,
       secureCert,
       otadata,
+      otadataRaw: otaBytes,
+      appHeaders,
       currentFirmware,
       inactiveFirmware,
       isValidWg1200,
@@ -786,6 +799,20 @@ export class Wg1200Transport {
     }
 
     return fullBuffer;
+  }
+
+  private async readInspectionRegion(offset: number, size: number, stage: string): Promise<Uint8Array> {
+    this.logger.progress?.(stage, 'start', undefined, 0, size);
+    const chunks: Uint8Array[] = [];
+    try {
+      for await (const chunk of this.readRegionChunks(offset, size,
+        (completed, total) => this.logger.progress?.(stage, 'bytes', undefined, completed, total))) chunks.push(chunk);
+      this.logger.progress?.(stage, 'complete');
+      return Buffer.concat(chunks, size);
+    } catch (error) {
+      this.logger.progress?.(stage, 'failed', error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   /** Reads a bounded flash range in 4 KiB chunks without allocating the whole range. */

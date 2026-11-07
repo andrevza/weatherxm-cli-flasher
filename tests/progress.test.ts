@@ -102,6 +102,20 @@ describe('progress accounting and rendering', () => {
     expect(failed.join('')).toContain('00:01 elapsed');
   });
 
+  it('suppresses identical updates while preserving changed byte milestones', () => {
+    let now = 0;
+    const output: string[] = [];
+    const reporter = new ProgressReporter({ write: (text) => output.push(text), tty: false, now: () => now, intervalMs: 1000 });
+    reporter.stage('Connecting to ROM');
+    reporter.status('waiting for ROM');
+    reporter.status('waiting for ROM');
+    now = 1000;
+    reporter.finish('complete');
+    const lines = output.join('').trimEnd().split('\n');
+    expect(lines.filter((line) => line === 'Connecting to ROM...')).toHaveLength(1);
+    expect(lines.at(-1)).toContain('Connecting to ROM DONE');
+  });
+
   it('leaves no carriage return behind on cancellation or failure and allows redaction at the output boundary', () => {
     const output: string[] = [];
     const coordinator = new OutputCoordinator({ write: (text) => output.push(text), tty: true });

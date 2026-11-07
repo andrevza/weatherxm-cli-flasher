@@ -47,7 +47,7 @@ export function formatProgressLine(snapshot: ProgressSnapshot, tty = false, widt
   const elapsed = formatDuration(snapshot.elapsedMs);
   if (snapshot.percent === null) {
     if (snapshot.state === 'complete') return `${snapshot.stage} DONE (${(snapshot.elapsedMs / 1000).toFixed(1)}s)`;
-    if (snapshot.state === 'failed' || snapshot.state === 'cancelled') return `${snapshot.stage} ${snapshot.state.toUpperCase()} (${(snapshot.elapsedMs / 1000).toFixed(1)}s)`;
+    if (snapshot.state === 'failed' || snapshot.state === 'cancelled') return `${snapshot.stage} ${snapshot.state.toUpperCase()} (${(snapshot.elapsedMs / 1000).toFixed(1)}s)${snapshot.detail && snapshot.detail !== 'active' ? ` — ${snapshot.detail}` : ''}`;
     const waiting = snapshot.elapsedMs >= 5000 ? ` (still working; ${elapsed} elapsed)` : '';
     return `${snapshot.stage}...${waiting}`;
   }
@@ -59,7 +59,7 @@ export function formatProgressLine(snapshot: ProgressSnapshot, tty = false, widt
   const elapsedText = snapshot.elapsedMs >= 1000 || snapshot.state !== 'running' ? ` | ${elapsed} elapsed` : '';
   const stalled = snapshot.idleMs >= 15_000 && snapshot.state === 'running'
     ? ` | no byte progress for ${formatDuration(snapshot.idleMs)}; still active` : '';
-  const stateText = snapshot.state && snapshot.state !== 'running' ? ` — ${snapshot.state.toUpperCase()}` : '';
+  const stateText = snapshot.state && snapshot.state !== 'running' ? ` — ${snapshot.state.toUpperCase()}${snapshot.state === 'failed' && snapshot.detail && snapshot.detail !== 'active' ? `: ${snapshot.detail}` : ''}` : '';
   if (!tty) return `${snapshot.stage}: ${percent.toFixed(1)}% | ${detail}${speed}${elapsedText}${eta}${stalled}${stateText}`;
   const barWidth = Math.max(4, Math.min(20, width - 42));
   const filled = Math.max(0, Math.min(barWidth, Math.floor(percent / 100 * barWidth)));
@@ -76,6 +76,7 @@ export class OutputCoordinator {
   constructor(private readonly options: { write: (text: string) => void; tty: boolean; width?: () => number }) {}
 
   progress(text: string): void {
+    if (text === this.lastProgress && (this.activeTtyLine || !this.options.tty)) return;
     this.lastProgress = text;
     if (!this.options.tty) { this.options.write(`${text}\n`); return; }
     this.options.write(`\r\u001b[2K${text}`);
@@ -116,6 +117,7 @@ export class ProgressReporter {
   private lastSampleBytes = 0;
   private speed: number | null = null;
   private lastRenderAt = 0;
+  private lastRendered = '';
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly options: {
@@ -143,6 +145,7 @@ export class ProgressReporter {
     this.lastSampleBytes = 0;
     this.speed = null;
     this.lastRenderAt = 0;
+    this.lastRendered = '';
     this.timer = setInterval(() => this.render(this.now(), true), this.options.intervalMs ?? 1000);
     this.timer.unref?.();
     // Show the operation as soon as it starts. Long ROM handshakes and file
@@ -205,6 +208,8 @@ export class ProgressReporter {
     if (!heartbeat && now - this.lastRenderAt < minimumUpdateInterval) return;
     const snapshot = progressSnapshot(this.current, this.startedAt, this.lastProgressAt, now, this.speed);
     const text = formatProgressLine(snapshot, this.options.tty, this.options.width?.() ?? 100);
+    if (text === this.lastRendered) return;
+    this.lastRendered = text;
     this.emitProgress(text);
     this.lastRenderAt = now;
   }

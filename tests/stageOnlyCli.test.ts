@@ -118,8 +118,8 @@ describe('stage-only CLI guards', () => {
   });
 
   it.each([
-    ['status', ['ota', 'status', '--port', '/dev/null', '--json'], 'Connecting to ESP32-S3 and initializing ROM'],
-    ['backup', ['ota', 'backup', '--port', '/dev/null', '--output', '/tmp/wg1200-json-ota-backup.bin', '--json'], 'Connecting to ESP32-S3 and initializing ROM'],
+    ['status', ['ota', 'status', '--port', '/dev/null', '--json'], 'Opening serial port /dev/null'],
+    ['backup', ['ota', 'backup', '--port', '/dev/null', '--output', '/tmp/wg1200-json-ota-backup.bin', '--json'], 'Opening serial port /dev/null'],
   ])('keeps ota %s JSON on stdout and emits redirected progress on stderr', (_name, args, operation) => {
     const result = run(...args);
     expect(result.status).not.toBe(0);
@@ -127,5 +127,12 @@ describe('stage-only CLI guards', () => {
     expect(result.stderr).toContain(operation);
     expect(result.stderr).not.toMatch(/[\r\u001b]/);
     expect(result.stdout).not.toContain(operation);
+  });
+
+  it.each(['fast', 'thorough'])('accepts ota status --verify-mode %s without weakening its read-only interface', (mode) => {
+    const result = run('ota', 'status', '--verify-mode', mode, '--port', '/dev/null', '--json');
+    expect(result.status).not.toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'OTA OPERATION FAILED' });
+    expect(result.stderr).not.toContain('--verify-mode requires');
   });
 });

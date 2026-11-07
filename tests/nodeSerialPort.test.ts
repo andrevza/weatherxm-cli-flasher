@@ -43,6 +43,15 @@ async function makeTransport() {
 }
 
 describe('NodeSerialPort transport contract', () => {
+  it('reports serial-open lifecycle only after the actual port open succeeds', async () => {
+    const port = new FakePort(); const lifecycle: string[] = [];
+    const adapter = new NodeSerialPort('/dev/fake', undefined, (() => port) as unknown as SerialPortFactory, false,
+      (stage, state) => lifecycle.push(`${stage}:${state}`));
+    await adapter.open({ baudRate: 115200 });
+    expect(lifecycle).toEqual(['Opening serial port /dev/fake:start', 'Opening serial port /dev/fake:complete']);
+    await adapter.close();
+  });
+
   it('reassembles a SLIP packet fragmented across serial data events', async () => {
     const { port, transport } = await makeTransport();
     const payload = Uint8Array.from([0x10, 0x20, 0xc0, 0xdb, 0x30]);

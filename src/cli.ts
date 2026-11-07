@@ -127,7 +127,7 @@ function parseArgs(argv: string[]): Args {
     if (out.dryRun && !(out.command === 'flash' || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--dry-run is supported only by flash and ota activate');
     if (out.stageOnly && out.command !== 'flash') throw new Error('--stage-only is supported only by flash');
     if (out.verifyMode && !['fast', 'thorough'].includes(out.verifyMode)) throw new Error('--verify-mode must be fast or thorough');
-    if (out.verifyMode && !out.stageOnly) throw new Error('--verify-mode requires flash --stage-only');
+    if (out.verifyMode && !out.stageOnly && !(out.command === 'ota' && out.subcommand === 'status')) throw new Error('--verify-mode requires flash --stage-only or ota status');
     if (out.backupManifest && out.command !== 'flash') throw new Error('--backup-manifest is supported only by flash --stage-only');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
     if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
@@ -168,11 +168,11 @@ function parseArgs(argv: string[]): Args {
 let activeProgress: ProgressReporter | undefined;
 
 function createProgress(args: Args): ProgressReporter {
-  const tty = !args.json && Boolean(process.stderr.isTTY) && process.env.TERM !== 'dumb';
+  const tty = Boolean(process.stderr.isTTY) && process.env.TERM !== 'dumb';
   const coordinator = new OutputCoordinator({ write: (text) => process.stderr.write(text), tty,
     width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)) });
   const reporter = new ProgressReporter({
-    coordinator, tty, intervalMs: 1000, width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)),
+    coordinator, tty, intervalMs: tty ? 1000 : 5000, width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)),
   });
   activeProgress = reporter;
   return reporter;
@@ -193,7 +193,7 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      ota: `USAGE\n  ${name} ota status --port <path> [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --dry-run [--metadata-backup-manifest <path>] [--json]\n\nStatus and backup are read-only. Activation is dry-run only and always fail-closed until installed bootloader rollback configuration and return behavior are proven. A ROM inspection cannot establish the application actually running.`,
+      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --dry-run [--metadata-backup-manifest <path>] [--json]\n\nOTA status defaults to fast descriptor-and-metadata inspection. Use --verify-mode thorough to read both complete OTA images and verify local SHA-256 and Secure Boot V2 signatures. Fast mode does not verify full-image integrity or signatures. Status and backup are read-only. Activation is dry-run only and always fail-closed until installed bootloader rollback configuration and return behavior are proven. A ROM inspection cannot establish the application actually running.`,
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
@@ -208,7 +208,7 @@ function help(command?: string, plain = false) {
   output += commandRow('info', 'Show device and hardware information');
   output += commandRow('verify', 'Validate device identity and partitions');
   output += commandRow('status', 'Show firmware and OTA boot state');
-  output += commandRow('ota status|backup|activate', 'Inspect OTA metadata; activation is blocked and dry-run only');
+  output += commandRow('ota status|backup|activate', 'Fast OTA status by default; thorough image verification is optional; activation is blocked and dry-run only');
   output += commandRow('check <firmware>', 'Check available firmware; read-only');
   output += commandRow('monitor', 'Passively stream serial console output');
   output += commandRow('backup active|inactive', 'Stream and verify a complete OTA application partition');
@@ -333,7 +333,8 @@ async function main() {
     try {
       let report: unknown;
       if (args.subcommand === 'status') {
-        report = await readOtaStatus({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial, progress, signal: cancellation.signal });
+        report = await readOtaStatus({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
+          verificationMode: args.verifyMode ?? 'fast', progress, signal: cancellation.signal });
         progress.log('OTA STATUS COMPLETE');
       }
       else if (args.subcommand === 'backup') {
@@ -350,10 +351,10 @@ async function main() {
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } catch (error) {
       const cancelled = cancellation.signal.aborted;
-      progress.finish(cancelled ? 'cancelled' : 'failed');
+      progress.finish(cancelled ? 'cancelled' : 'failed', error instanceof Error ? error.message : String(error));
       const message = error instanceof Error ? error.message : String(error);
       if (args.json) process.stdout.write(`${JSON.stringify({ outcome: cancelled ? 'OTA OPERATION CANCELLED' : 'OTA OPERATION FAILED', error: message }, null, 2)}\n`);
-      else progress.log(`${cancelled ? 'OTA OPERATION CANCELLED' : 'OTA OPERATION FAILED'}: ${message}`);
+      progress.log(`${cancelled ? 'OTA OPERATION CANCELLED' : 'OTA OPERATION FAILED'}: ${message}`);
       process.exitCode = 1;
     } finally { removeInterrupt(); progress.close(); }
     return;
