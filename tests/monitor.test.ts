@@ -283,4 +283,120 @@ describe('boot log evidence', () => {
     expect(withoutMqtt.applicationStarted).toBe(true);
     expect(withoutMqtt.health.mqttConnected).toBe(false);
   });
+
+  it.each([
+    { slot: 'ota_0', offset: '0x420000' },
+    { slot: 'ota_1', offset: '0x820000' },
+  ])('parses redacted physical $slot activation evidence and keeps optional services distinct', ({ offset }) => {
+    const result = analyzeBootLogs([
+      'I (812) secure_boot_v2: Signature verified successfully!',
+      `I (906) boot: Loaded app from partition at offset ${offset}`,
+      'I (1378) app_init: App version: 0.8.34-g86b609b',
+      'I (1410) main_task: Calling app_main()',
+      'I (1954) MAIN: LittleFS mounted successfully.',
+      'W (2181) Utils: NVS diagnostics: initial=ESP_OK final=ESP_OK',
+      'I (2696) Settings: All configuration keys loaded from NVS.',
+      'I (11035) WiFi: Got IP: [REDACTED IP]',
+      'Wi-Fi CONNECTED SUCCESSFULLY!',
+      'Starting web server on port 80...',
+      'I (11054) WebServer: Starting web server on port 80...',
+      'I (11116) WiFi: Connected to internet!',
+    ], { slotOffset: Number.parseInt(offset, 16), firmwareVersion: '0.8.34-g86b609b' });
+    expect(result).toMatchObject({ secureBootVerified: true, expectedSlotObserved: true, expectedFirmwareObserved: true, applicationStarted: true });
+    expect(result.health).toMatchObject({ littlefsMounted: true, nvsInitialized: true, wifiConnected: true,
+      dhcpAddress: true, httpServerStarted: true, internetConnected: true, mqttConnected: false,
+      weatherPacketReceived: false, stationReceptionComplete: false, stationActive: false });
+    expect(result.healthDetails.nvs).toMatchObject({ status: 'VERIFIED', evidence: 'W (2181) Utils: NVS diagnostics: initial=ESP_OK final=ESP_OK', uptimeMs: 2181 });
+    expect(result.healthDetails.configuration.status).toBe('VERIFIED');
+    expect(result.healthDetails.httpServer).toMatchObject({ status: 'VERIFIED', startup: 'STARTING', reachable: { status: 'NOT_OBSERVED' } });
+    expect(result.healthDetails.internet.status).toBe('VERIFIED');
+    expect(result.healthDetails.mqtt.status).toBe('NOT_OBSERVED');
+    expect(result.healthDetails.weatherStationPacket.status).toBe('NOT_OBSERVED');
+    const json = JSON.parse(JSON.stringify(result));
+    expect(json.healthDetails.httpServer).toMatchObject({ status: 'VERIFIED', startup: 'STARTING', evidence: 'I (11054) WebServer: Starting web server on port 80...', reachable: { status: 'NOT_OBSERVED' } });
+    expect(json.healthDetails.internet).toMatchObject({ status: 'VERIFIED', evidence: 'I (11116) WiFi: Connected to internet!', uptimeMs: 11116 });
+  });
+
+  it('classifies service failures, filesystem recovery, MQTT recovery, station markers, ANSI, duplicates and timed evidence', () => {
+    const result = analyzeBootLogs([
+      '\u001b[31mE (100) LittleFS mount failed\u001b[0m',
+      'I (250) LittleFS recovery completed by formatting filesystem',
+      'I (300) LittleFS mounted successfully.',
+      'E (400) NVS initialization failed: ESP_ERR_NVS_NO_FREE_PAGES',
+      'W (500) MQTT connection failed: timeout',
+      'I (2100) MQTT connected successfully',
+      'I (2200) MQTT publish successful',
+      'I (2300) Valid WS1001 weather packet decoded successfully',
+      'I (2350) Weather station reception reached 65%',
+      'I (2400) Weather station reception reached 100%',
+      'I (2450) Weather station ownership confirmed',
+      'I (2500) Station status: ACTIVE_OK',
+      'I (2600) HTTP server started successfully and is listening',
+      'I (2700) HTTP health check passed; server is accepting requests',
+      'E (2800) Internet connectivity check failed',
+      'I (3000) Wi-Fi connected successfully',
+      'I (3100) Connected to internet!',
+      'I (3200) MQTT connected successfully',
+    ], expected);
+    expect(result.healthDetails.littlefs).toMatchObject({ status: 'VERIFIED', uptimeMs: 300 });
+    expect(result.healthDetails.filesystemRecovery.status).toBe('VERIFIED');
+    expect(result.healthDetails.nvs.status).toBe('FAILED');
+    expect(result.healthDetails.mqtt).toMatchObject({ status: 'VERIFIED', uptimeMs: 3200 });
+    expect(result.healthDetails.weatherStationPacket.status).toBe('VERIFIED');
+    expect(result.healthDetails.stationReception.status).toBe('VERIFIED');
+    expect(result.healthDetails.stationReception.percentage).toBe(100);
+    expect(result.healthDetails.stationOwnership.status).toBe('VERIFIED');
+    expect(result.healthDetails.stationActive.status).toBe('VERIFIED');
+    expect(result.healthDetails.httpServer).toMatchObject({ status: 'VERIFIED', startup: 'STARTED', reachable: { status: 'VERIFIED' } });
+    expect(result.healthDetails.internet).toMatchObject({ status: 'VERIFIED', uptimeMs: 3100 });
+  });
+
+  it('does not promote partial lines, duplicate markers, or explicit failures into stronger service claims', () => {
+    const result = analyzeBootLogs([
+      'Starting web server on port 80...',
+      'Starting web server on port 80...',
+      'E WebServer: Failed to start HTTP server',
+      'MQTT connection failed',
+      'Weather station packet decode failed',
+      'station communication failed',
+    ], expected);
+    expect(result.healthDetails.httpServer.startup).toBe('FAILED');
+    expect(result.healthDetails.httpServer.reachable.status).toBe('NOT_OBSERVED');
+    expect(result.healthDetails.mqtt.status).toBe('FAILED');
+    expect(result.healthDetails.weatherStationPacket.status).toBe('FAILED');
+    expect(result.healthDetails.stationActive.status).toBe('FAILED');
+    const partialOnly = analyzeBootLogs(['I (11054) WebServer: Starting web server on por'], expected, true);
+    expect(partialOnly.health.httpServerStarted).toBe(false);
+    expect(partialOnly.healthDetails.httpServer.status).toBe('NOT_OBSERVED');
+  });
+
+  it('reports recovered NVS initialization and incomplete station reception without calling either a failure', () => {
+    const result = analyzeBootLogs([
+      'W (400) Utils: NVS diagnostics: initial=ESP_ERR_NVS_NO_FREE_PAGES final=ESP_OK',
+      'I (9000) Weather station reception reached 65%',
+    ], expected);
+    expect(result.healthDetails.nvs).toMatchObject({ status: 'VERIFIED', uptimeMs: 400 });
+    expect(result.healthDetails.stationReception).toMatchObject({ status: 'NOT_OBSERVED', percentage: 65, uptimeMs: 9000 });
+    expect(result.health.stationReceptionComplete).toBe(false);
+  });
+
+  it('keeps live lines and evidence analysis identical across fragmented UART reads', async () => {
+    const encoder = new TextEncoder();
+    const chunks = [
+      'I (812) secure_boot_v2: Signature verified successfully!\r\nI (906) boot: Loaded app from partition at offset 0x420000\r\n',
+      'W (2181) Utils: NVS diagnostics: initial=ESP_OK final=ESP_OK\r\nI (11054) WebServer: Starting web server on port ',
+      '80...\r\nI (11116) WiFi: Connected to internet!\r\nI (12000) MQTT connected successfully\r\n',
+    ];
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) { for (const chunk of chunks) controller.enqueue(encoder.encode(chunk)); controller.close(); },
+    });
+    const port = { readable, async close() {} };
+    const live: string[] = [];
+    const result = await captureBootLogs(port, 100, (line) => live.push(line), expected);
+    expect(live).toEqual(result.lines);
+    expect(result.healthDetails.nvs.status).toBe('VERIFIED');
+    expect(result.healthDetails.httpServer.startup).toBe('STARTING');
+    expect(result.healthDetails.internet.status).toBe('VERIFIED');
+    expect(result.healthDetails.mqtt.status).toBe('VERIFIED');
+  });
 });

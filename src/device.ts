@@ -862,7 +862,7 @@ export async function flashDevice(options: DeviceOptions & {
   bootLogSeconds?: number; onBootLine?: (line: string) => void;
   confirm: (summary: FlashConfirmation) => Promise<boolean>;
   approveComparisonException?: (comparison: FirmwareComparison) => Promise<boolean>;
-}): Promise<{ deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; firmwareSlots?: ReturnType<typeof firmwareSlotSummary>['firmwareSlots']; ota?: ReturnType<typeof firmwareSlotSummary>['ota']; inactiveMatch?: boolean; bootSignature?: string; bootVersion?: string; secureBootVerified?: boolean; calibrationUpdated?: boolean; dryRun?: boolean; writeBlockedReason?: string; alreadyInstalled?: boolean; comparison: FirmwareComparison; flashVerified?: boolean; otaMetadataVerified?: boolean; protectedPartitionsVerified?: boolean; bootObserved?: boolean; expectedSlotObserved?: boolean | null; expectedFirmwareObserved?: boolean | null; applicationStarted?: boolean; applicationHealthy?: 'not-checked'; bootFailureObserved?: boolean; bootFailureLines?: string[]; bootLines?: string[] }> {
+}): Promise<{ deviceName: string; firmwareKey: string; targetSlot: string; targetOffset: number; sha256: string; firmwareSlots?: ReturnType<typeof firmwareSlotSummary>['firmwareSlots']; ota?: ReturnType<typeof firmwareSlotSummary>['ota']; inactiveMatch?: boolean; bootSignature?: string; bootVersion?: string; secureBootVerified?: boolean; calibrationUpdated?: boolean; dryRun?: boolean; writeBlockedReason?: string; alreadyInstalled?: boolean; comparison: FirmwareComparison; flashVerified?: boolean; otaMetadataVerified?: boolean; protectedPartitionsVerified?: boolean; bootObserved?: boolean; expectedSlotObserved?: boolean | null; expectedFirmwareObserved?: boolean | null; applicationStarted?: boolean; applicationHealthy?: 'not-checked'; bootFailureObserved?: boolean; bootFailureLines?: string[]; bootLines?: string[]; bootHealth?: ReturnType<typeof analyzeBootLogs>['health']; bootHealthDetails?: ReturnType<typeof analyzeBootLogs>['healthDetails'] }> {
   options.progress?.stage('Retrieving and verifying official firmware');
   const { entry, verified, descriptor: selectedDescriptor } = await loadSelectedFirmware(options.firmwareKey, options.manifestUrl, {
     progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
@@ -973,7 +973,7 @@ export async function flashDevice(options: DeviceOptions & {
     bootObserved: boot.bootObserved, expectedSlotObserved: boot.expectedSlotObserved,
     expectedFirmwareObserved: boot.expectedFirmwareObserved, applicationStarted: boot.applicationStarted, applicationHealthy: boot.applicationHealthy,
     bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines,
-    bootLines: boot.lines, comparison: flashComparison,
+    bootLines: boot.lines, bootHealth: boot.health, bootHealthDetails: boot.healthDetails, comparison: flashComparison,
   };
 }
 

@@ -382,7 +382,8 @@ export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0'
     bootSelectionVerified: boot.expectedSlotObserved === true, applicationStarted: boot.applicationStarted,
     bootValidationFailed, applicationHealth: 'unverified', transaction, boot: { secureBootVerified: boot.secureBootVerified,
       bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines, bootVersion: boot.bootVersion,
-      expectedFirmwareObserved: boot.expectedFirmwareObserved, applicationVerified, health: boot.health, captureError: boot.captureError ?? null, lines: boot.lines } };
+      expectedFirmwareObserved: boot.expectedFirmwareObserved, applicationVerified, health: boot.health, healthDetails: boot.healthDetails,
+      captureError: boot.captureError ?? null, lines: boot.lines } };
 }
 
 export async function restoreOtaMetadata(options: DeviceOptions & { metadataBackupManifest: string;
@@ -433,5 +434,6 @@ export async function restoreOtaMetadata(options: DeviceOptions & { metadataBack
     bootValidationFailed,
     bootSelectionVerified: boot.expectedSlotObserved === true, applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction,
     boot: { secureBootVerified: boot.secureBootVerified, bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines,
-      bootVersion: boot.bootVersion, expectedFirmwareObserved: boot.expectedFirmwareObserved, health: boot.health, captureError: boot.captureError ?? null, lines: boot.lines } };
+      bootVersion: boot.bootVersion, expectedFirmwareObserved: boot.expectedFirmwareObserved, health: boot.health, healthDetails: boot.healthDetails,
+      captureError: boot.captureError ?? null, lines: boot.lines } };
 }

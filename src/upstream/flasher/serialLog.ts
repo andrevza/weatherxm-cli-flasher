@@ -15,14 +15,39 @@ export interface BootLogAnalysis {
   captureError?: string;
   health: { littlefsMounted: boolean; nvsInitialized: boolean; wifiConnected: boolean; dhcpAddress: boolean; httpServerStarted: boolean;
     internetConnected: boolean; mqttConnected: boolean; weatherPacketReceived: boolean; stationReceptionComplete: boolean; stationActive: boolean };
+  /** Evidence-rich service state. Legacy booleans above remain for existing JSON consumers. */
+  healthDetails: BootHealthDetails;
 }
 
-export function analyzeBootLogs(lines: string[], expected: { slotOffset?: number; firmwareVersion?: string } = {}): BootLogAnalysis {
-  const detected = detectBootEvidence(lines, expected);
+export type BootHealthStatus = 'VERIFIED' | 'NOT_OBSERVED' | 'FAILED';
+export interface BootHealthEvidence {
+  status: BootHealthStatus;
+  evidence: string | null;
+  uptimeMs: number | null;
+  reason: string | null;
+}
+export interface BootHealthDetails {
+  littlefs: BootHealthEvidence;
+  filesystemRecovery: BootHealthEvidence;
+  nvs: BootHealthEvidence;
+  configuration: BootHealthEvidence;
+  wifi: BootHealthEvidence;
+  dhcp: BootHealthEvidence;
+  httpServer: BootHealthEvidence & { startup: 'NOT_OBSERVED' | 'STARTING' | 'STARTED' | 'FAILED'; reachable: BootHealthEvidence };
+  internet: BootHealthEvidence;
+  mqtt: BootHealthEvidence;
+  weatherStationPacket: BootHealthEvidence;
+  stationReception: BootHealthEvidence & { percentage: number | null };
+  stationOwnership: BootHealthEvidence;
+  stationActive: BootHealthEvidence;
+}
+
+export function analyzeBootLogs(lines: string[], expected: { slotOffset?: number; firmwareVersion?: string } = {}, incompleteFinalLine = false): BootLogAnalysis {
+  const detected = detectBootEvidence(lines, expected, incompleteFinalLine);
   return { lines, rawText: lines.join('\n'), ...detected };
 }
 
-function detectBootEvidence(lines: string[], expected: { slotOffset?: number; firmwareVersion?: string }) {
+function detectBootEvidence(lines: string[], expected: { slotOffset?: number; firmwareVersion?: string }, incompleteFinalLine: boolean) {
   let detectedSign: BootLogAnalysis['detectedSign'] = 'none';
   let bootObserved = false;
   let observedSlot: number | undefined;
@@ -33,7 +58,25 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
   let appStarted = false;
   const health = { littlefsMounted: false, nvsInitialized: false, wifiConnected: false, dhcpAddress: false, httpServerStarted: false,
     internetConnected: false, mqttConnected: false, weatherPacketReceived: false, stationReceptionComplete: false, stationActive: false };
-  for (const line of lines) {
+  const emptyEvidence = (): BootHealthEvidence => ({ status: 'NOT_OBSERVED', evidence: null, uptimeMs: null, reason: 'No conclusive matching log evidence was captured.' });
+  const healthDetails: BootHealthDetails = {
+    littlefs: emptyEvidence(), filesystemRecovery: emptyEvidence(), nvs: emptyEvidence(), configuration: emptyEvidence(),
+    wifi: emptyEvidence(), dhcp: emptyEvidence(),
+    httpServer: { ...emptyEvidence(), startup: 'NOT_OBSERVED', reachable: emptyEvidence() },
+    internet: emptyEvidence(), mqtt: emptyEvidence(), weatherStationPacket: emptyEvidence(),
+    stationReception: { ...emptyEvidence(), percentage: null }, stationOwnership: emptyEvidence(), stationActive: emptyEvidence(),
+  };
+  const uptime = (line: string): number | null => {
+    const match = line.match(/\b\w?\s*\((\d+)\)/);
+    return match ? Number(match[1]) : null;
+  };
+  const record = (current: BootHealthEvidence, status: BootHealthStatus, line: string, reason: string | null = null): BootHealthEvidence =>
+    ({ status, evidence: line, uptimeMs: uptime(line), reason });
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    // The capture window can end mid-UART line. Keep that text in the transcript,
+    // but do not interpret its partial words as conclusive boot/service evidence.
+    if (incompleteFinalLine && lineIndex === lines.length - 1) continue;
     const clean = line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
     const lower = clean.toLowerCase();
     if (/secure_boot_v2[^\r\n]*signature verified successfully/i.test(clean)) secureBootVerified = true;
@@ -49,16 +92,90 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
     }
     if (/esp-idf|boot:|rst:|configsip|entry 0x|load:0x|secure_boot_v2|app version:/i.test(clean)) bootObserved = true;
     if (/\bapp_main\b|application started|starting application|app startup complete/i.test(clean)) appStarted = true;
-    health.littlefsMounted ||= /littlefs.*mount(?:ed| successful)|mount(?:ed| successful).*littlefs/i.test(clean);
-    health.nvsInitialized ||= /nvs.*(?:initiali[sz]ed|loaded|init(?:ialized)? successfully)/i.test(clean);
-    health.wifiConnected ||= /wi-?fi connected successfully|wifi connected|got ip:/i.test(clean);
-    health.dhcpAddress ||= /got ip:|dhcp.*(?:bound|address)/i.test(clean);
-    health.httpServerStarted ||= /http server.*(?:started|listening)|server started on port/i.test(clean);
-    health.internetConnected ||= /internet connectivity.*success|internet connected/i.test(clean);
-    health.mqttConnected ||= /mqtt.*connected successfully|connected to mqtt|mqtt connected/i.test(clean);
-    health.weatherPacketReceived ||= /weather[- ]station.*packet received|valid ws\d+ weather packet/i.test(clean);
-    health.stationReceptionComplete ||= /weather[- ]station reception.*100%|reception reached 100%/i.test(clean);
-    health.stationActive ||= /station status\s*[:=]\s*active_ok/i.test(clean);
+    const filesystemSuccess = /littlefs.*(?:mounted successfully|mount(?:ed)? successfully|mount(?:ed)? ok)|(?:mounted|mount(?:ed)? successfully).*littlefs/i.test(clean);
+    const filesystemFailure = /littlefs.*(?:failed to mount|mount failed|mount error|mounting failed)/i.test(clean);
+    if (filesystemSuccess) healthDetails.littlefs = record(healthDetails.littlefs, 'VERIFIED', clean);
+    else if (filesystemFailure) healthDetails.littlefs = record(healthDetails.littlefs, 'FAILED', clean, 'LittleFS mount failed.');
+    if (/littlefs.*(?:recover(?:y|ed|ing)|format(?:ted|ting)?)/i.test(clean)) healthDetails.filesystemRecovery = record(healthDetails.filesystemRecovery, 'VERIFIED', clean);
+    if (filesystemSuccess) health.littlefsMounted = true;
+
+    const nvsDiagnostic = clean.match(/nvs diagnostics\s*:\s*initial\s*=\s*(ESP_OK|ESP_ERR_[A-Z0-9_]+)\s+final\s*=\s*(ESP_OK|ESP_ERR_[A-Z0-9_]+)/i);
+    const nvsSuccess = Boolean(nvsDiagnostic && nvsDiagnostic[2].toUpperCase() === 'ESP_OK');
+    const nvsFailure = nvsDiagnostic ? nvsDiagnostic[2].toUpperCase() !== 'ESP_OK'
+      : /nvs.*(?:init(?:ialization)? failed|failed to init|ESP_ERR_[A-Z0-9_]+)|initial\s*=\s*ESP_ERR_|final\s*=\s*ESP_ERR_/i.test(clean);
+    const configLoaded = /(?:all )?configuration keys loaded from nvs|settings loaded from nvs|configuration loaded successfully/i.test(clean);
+    if (nvsSuccess) healthDetails.nvs = record(healthDetails.nvs, 'VERIFIED', clean,
+      nvsDiagnostic![1].toUpperCase() === 'ESP_OK' ? null : 'Initial NVS diagnostics reported an error, but final initialization returned ESP_OK.');
+    else if (nvsFailure) healthDetails.nvs = record(healthDetails.nvs, 'FAILED', clean, 'NVS initialization reported an ESP-IDF error.');
+    if (configLoaded) {
+      healthDetails.configuration = record(healthDetails.configuration, 'VERIFIED', clean);
+      if (healthDetails.nvs.status !== 'VERIFIED') healthDetails.nvs = record(healthDetails.nvs, 'VERIFIED', clean, 'Successful configuration loading confirms NVS data was readable.');
+    }
+    health.nvsInitialized ||= nvsSuccess || configLoaded;
+
+    const wifiSuccess = /wi[- ]?fi\s+(?:connected successfully|connection successful|connected|association successful|associated successfully)|got ip:/i.test(clean);
+    const wifiFailure = /wi[- ]?fi.*(?:authentication failed|auth failed|connection failed|failed to connect|disconnected|association failed)|(?:auth|association) failed/i.test(clean);
+    if (wifiSuccess) healthDetails.wifi = record(healthDetails.wifi, 'VERIFIED', clean);
+    else if (wifiFailure) healthDetails.wifi = record(healthDetails.wifi, 'FAILED', clean, 'Wi-Fi association or connection failed.');
+    const dhcpSuccess = /got ip:|dhcp.*(?:bound|lease|address assigned)/i.test(clean);
+    const dhcpFailure = /dhcp.*(?:failed|failure|timeout|no offer)/i.test(clean);
+    if (dhcpSuccess) healthDetails.dhcp = record(healthDetails.dhcp, 'VERIFIED', clean);
+    else if (dhcpFailure) healthDetails.dhcp = record(healthDetails.dhcp, 'FAILED', clean, 'DHCP did not assign an address.');
+    health.wifiConnected ||= wifiSuccess;
+    health.dhcpAddress ||= dhcpSuccess;
+
+    const httpFailure = /(?:http|web) server.*(?:failed to start|startup failed|start failed|error starting)|failed to start (?:the )?(?:http|web) server/i.test(clean);
+    const httpStarted = /(?:http|web) server.*(?:started successfully|started|listening)|server started on port/i.test(clean);
+    const httpStarting = /(?:starting|initializing) (?:the )?(?:http|web) server|(?:http|web) server.*starting/i.test(clean);
+    if (httpFailure) {
+      healthDetails.httpServer = { ...record(healthDetails.httpServer, 'FAILED', clean, 'HTTP server startup failed.'), startup: 'FAILED', reachable: healthDetails.httpServer.reachable };
+    } else if (httpStarted) {
+      healthDetails.httpServer = { ...record(healthDetails.httpServer, 'VERIFIED', clean), startup: 'STARTED', reachable: healthDetails.httpServer.reachable };
+    } else if (httpStarting) {
+      // Preserve the legacy signal that server startup was observed, while the
+      // evidence-rich field explicitly says startup is still in progress.
+      healthDetails.httpServer = { ...record(healthDetails.httpServer, 'VERIFIED', clean, 'Startup initiation is verified; completion and reachability were not observed.'), startup: 'STARTING', reachable: healthDetails.httpServer.reachable };
+    }
+    health.httpServerStarted ||= httpStarting || httpStarted;
+    if (/http.*(?:reachable|health check passed|request handled|response sent)|(?:http|web) server.*accepting requests/i.test(clean)) {
+      healthDetails.httpServer.reachable = record(healthDetails.httpServer.reachable, 'VERIFIED', clean);
+    } else if (/http.*(?:unreachable|request failed|health check failed)/i.test(clean)) {
+      healthDetails.httpServer.reachable = record(healthDetails.httpServer.reachable, 'FAILED', clean, 'HTTP reachability check failed.');
+    }
+
+    const internetSuccess = /connected to internet|internet connectivity.*(?:success|verified)|internet connected/i.test(clean);
+    const internetFailure = /(?:internet|connectivity).*(?:connection failed|unavailable|not reachable|failed)|no internet connection/i.test(clean);
+    if (internetSuccess) healthDetails.internet = record(healthDetails.internet, 'VERIFIED', clean);
+    else if (internetFailure) healthDetails.internet = record(healthDetails.internet, 'FAILED', clean, 'Internet connectivity check failed.');
+    health.internetConnected ||= internetSuccess;
+
+    const mqttSuccess = /mqtt.*(?:connected successfully|connection successful|connected)|connected to mqtt|mqtt (?:publish|subscribe).*success/i.test(clean);
+    const mqttFailure = /mqtt.*(?:connection failed|connect failed|disconnected|error|publish failed|subscribe failed)/i.test(clean);
+    if (mqttSuccess) healthDetails.mqtt = record(healthDetails.mqtt, 'VERIFIED', clean);
+    else if (mqttFailure) healthDetails.mqtt = record(healthDetails.mqtt, 'FAILED', clean, 'The latest MQTT connection or operation evidence indicates a failure/disconnection.');
+    health.mqttConnected ||= mqttSuccess;
+
+    const packetSuccess = /(?:valid )?ws\s*[- ]?1001\s+(?:weather )?packet (?:received|decoded)|weather[- ]station.*(?:valid )?packet (?:received|decoded)|packet decoded successfully/i.test(clean);
+    const packetFailure = /weather[- ]station.*(?:packet (?:invalid|decode failed)|communication failed)|ws\s*[- ]?1001.*(?:invalid|decode error)/i.test(clean);
+    if (packetSuccess) healthDetails.weatherStationPacket = record(healthDetails.weatherStationPacket, 'VERIFIED', clean);
+    else if (packetFailure) healthDetails.weatherStationPacket = record(healthDetails.weatherStationPacket, 'FAILED', clean, 'Weather-station packet reception or decoding failed.');
+    health.weatherPacketReceived ||= packetSuccess;
+    const receptionPercent = clean.match(/(?:weather[- ]station )?reception(?: reached| at|:)?\s*(\d+(?:\.\d+)?)\s*%/i)?.[1];
+    const receptionComplete = Boolean(receptionPercent && Number(receptionPercent) >= 100) || /weather[- ]station reception.*100\s*%|reception reached 100\s*%|packet reception.*100\s*%/i.test(clean);
+    const receptionFailure = /weather[- ]station.*(?:reception failed|no packets|timeout)/i.test(clean);
+    if (receptionComplete) healthDetails.stationReception = { ...record(healthDetails.stationReception, 'VERIFIED', clean), percentage: receptionPercent ? Number(receptionPercent) : 100 };
+    else if (receptionPercent) healthDetails.stationReception = { ...record(healthDetails.stationReception, 'NOT_OBSERVED', clean, 'Reception progress was observed but did not reach completion.'), percentage: Number(receptionPercent) };
+    else if (receptionFailure) healthDetails.stationReception = { ...record(healthDetails.stationReception, 'FAILED', clean, 'Station reception did not complete successfully.'), percentage: healthDetails.stationReception.percentage };
+    health.stationReceptionComplete ||= receptionComplete;
+    const ownershipSuccess = /(?:station|weather station).*(?:paired successfully|pairing complete|ownership confirmed|owned by this gateway|ownership verified)/i.test(clean);
+    const ownershipFailure = /(?:station|weather station).*(?:pairing failed|ownership (?:missing|failed|not confirmed))/i.test(clean);
+    if (ownershipSuccess) healthDetails.stationOwnership = record(healthDetails.stationOwnership, 'VERIFIED', clean);
+    else if (ownershipFailure) healthDetails.stationOwnership = record(healthDetails.stationOwnership, 'FAILED', clean, 'Station pairing or ownership was not confirmed.');
+    const stationActive = /(?:station(?: status)?|weather station).*\bACTIVE_OK\b|\bACTIVE_OK\b/i.test(clean);
+    const stationInactive = /(?:station|weather station).*(?:inactive|not paired|ownership (?:missing|failed)|communication failed)/i.test(clean);
+    if (stationActive) healthDetails.stationActive = record(healthDetails.stationActive, 'VERIFIED', clean);
+    else if (stationInactive) healthDetails.stationActive = record(healthDetails.stationActive, 'FAILED', clean, 'Station is not active or ownership/communication failed.');
+    health.stationActive ||= stationActive;
     if (/guru meditation|assert failed|panic(?:'ed)?|abort\(\)|invalid image|invalid signature|signature verification failed|no bootable app|boot failed|watchdog reset/i.test(clean)) {
       bootFailureLines.push(clean);
       bootObserved = true;
@@ -79,6 +196,7 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
     secureBootVerified,
     applicationStarted: appStarted,
     health,
+    healthDetails,
   };
 }
 
@@ -217,6 +335,7 @@ export async function captureBootLogs(
     return analyzeBootLogs([], expected);
   }
   const lines: string[] = [];
+  let incompleteFinalLine = false;
 
   try {
     if (!port.readable) {
@@ -263,6 +382,7 @@ export async function captureBootLogs(
     }
 
     if (buffer.trim().length) {
+      incompleteFinalLine = true;
       const cleanLine = sanitizer.sanitizeLine(buffer.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').trim());
       if (cleanLine !== null) {
         lines.push(cleanLine);
@@ -279,12 +399,12 @@ export async function captureBootLogs(
     }
   } catch (err: any) {
     try { await port.close(); } catch { /* preserve the capture failure */ }
-    const failed = analyzeBootLogs(lines, expected);
+    const failed = analyzeBootLogs(lines, expected, incompleteFinalLine);
     failed.captureError = `Boot log capture failed: ${err instanceof Error ? err.message : String(err)}`;
     return failed;
   }
 
-  return analyzeBootLogs(lines, expected);
+  return analyzeBootLogs(lines, expected, incompleteFinalLine);
 }
 
 /**

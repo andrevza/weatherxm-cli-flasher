@@ -22,7 +22,7 @@ import type { VerificationMode } from './verification.js';
 import { ConfirmationCancelledError, retryExactConfirmation } from './verification.js';
 import { confirmWithSuspendedProgress } from './operatorConfirmation.js';
 import { activateOtaSlot, backupOtaMetadata, dryRunOtaActivation, readOtaStatus, restoreOtaMetadata } from './otaDevice.js';
-import { renderHelp } from './help.js';
+import { renderHelp, resolveHelpTopic } from './help.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
@@ -123,7 +123,7 @@ function parseArgs(argv: string[]): Args {
     else positional.push(arg);
   }
   out.command = helpRequested ? 'help' : positional[0] || 'help';
-  if (helpRequested) out.helpTarget = positional.slice(0, 2).join(' ') || undefined;
+  if (helpRequested) out.helpTarget = resolveHelpTopic(positional);
   out.subcommand = positional[1];
   out.target = optionTarget ?? positional[2];
   if (!Number.isInteger(out.baud) || out.baud < 1200 || out.baud > 2000000) throw new Error('Baud rate must be an integer from 1200 to 2000000');
@@ -135,11 +135,13 @@ function parseArgs(argv: string[]): Args {
     if (out.verifyMode && !out.stageOnly && !(out.command === 'ota' && ['status', 'activate'].includes(out.subcommand ?? ''))) throw new Error('--verify-mode requires flash --stage-only, ota status, or ota activate');
     if (out.backupManifest && out.command !== 'flash') throw new Error('--backup-manifest is supported only by flash --stage-only');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
-    if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
+    if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list/download/compare, check, flash, and security check');
+    if (manifestProvided && out.command === 'flash' && out.subcommand === 'diagnose') throw new Error('--manifest is not supported by read-only flash diagnose, which uses the approved pinned image');
+    if (manifestProvided && out.command === 'security' && out.subcommand !== 'check') throw new Error('--manifest is supported only by security check');
     if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security', 'ota'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
     if (out.boot && out.command !== 'monitor') throw new Error('--boot is supported only by monitor');
-    if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
+    if ((out.timestamp || out.level || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
     if (out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? '') && out.bootLogSeconds < 15) throw new Error('OTA activation and restoration boot capture must be at least 15 seconds');
@@ -166,6 +168,7 @@ function parseArgs(argv: string[]): Args {
     if (out.offline && !(['firmware', 'flash', 'check'].includes(out.command) || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--offline is supported only by firmware, check, flash, and ota activate commands');
     if (out.cacheDirectory && !(['firmware', 'flash', 'check'].includes(out.command) || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--cache-dir is supported only by firmware, check, flash, and ota activate commands');
     if (out.command === 'firmware' && !['list', 'download', 'compare'].includes(out.subcommand ?? '')) throw new Error('firmware supports list, download, and compare');
+    if (out.command === 'firmware' && out.subcommand === 'list' && (out.offline || out.cacheDirectory)) throw new Error('firmware list reads the catalog directly and does not accept --offline or --cache-dir');
     if (out.command === 'firmware' && out.subcommand === 'download' && !['weatherxm', 'meshtastic'].includes(out.target ?? '')) throw new Error('firmware download requires weatherxm or meshtastic');
     if (out.command === 'firmware' && out.subcommand === 'compare' && (!out.backupPath || (Boolean(out.firmwareKey) === Boolean(out.firmwareFile)))) throw new Error('firmware compare requires --backup and exactly one of --firmware <key> or --firmware-file <path>');
     if (out.outputFile && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
@@ -326,7 +329,7 @@ async function main() {
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no flash write has started.`),
             });
           } });
-        const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; bootFailureObserved: boolean; captureError?: string | null; lines: string[]; health: { wifiConnected: boolean; mqttConnected: boolean } } };
+        const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; bootFailureObserved: boolean; captureError?: string | null; lines: string[]; healthDetails: { wifi: { status: string }; mqtt: { status: string }; internet: { status: string }; httpServer: { startup: string; reachable: { status: string } } } } };
         if (args.bootLogOutput) {
           const text = `${recovery.boot.lines.join('\n')}\n`;
           await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
@@ -334,7 +337,7 @@ async function main() {
         }
         progress.log(recovery.bootSelectionVerified ? 'RECOVERY BOOT SELECTION VERIFIED' : 'RECOVERY BOOT SELECTION NOT VERIFIED');
         progress.log(recovery.applicationStarted ? 'RECOVERY APPLICATION STARTED' : 'RECOVERY APPLICATION START NOT OBSERVED');
-        progress.log(`Wi-Fi: ${recovery.boot.health.wifiConnected ? 'CONNECTED' : 'NOT OBSERVED'}; MQTT: ${recovery.boot.health.mqttConnected ? 'CONNECTED' : 'NOT OBSERVED'}`);
+        progress.log(`Optional services: Wi-Fi ${recovery.boot.healthDetails.wifi.status}; HTTP ${recovery.boot.healthDetails.httpServer.startup}; internet ${recovery.boot.healthDetails.internet.status}; MQTT ${recovery.boot.healthDetails.mqtt.status}`);
         if (!recovery.boot.secureBootVerified) progress.log('SECURE BOOT VERIFICATION NOT OBSERVED');
         if (recovery.boot.bootFailureObserved) progress.log('APPLICATION FAILURE OBSERVED IN BOOT LOG');
         if (recovery.boot.captureError) progress.log(recovery.boot.captureError);
@@ -356,7 +359,7 @@ async function main() {
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no metadata write has started.`),
             });
           } });
-        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; expectedFirmwareObserved: boolean | null; bootFailureObserved: boolean; bootVersion?: string; captureError?: string | null; lines: string[]; health: { wifiConnected: boolean; mqttConnected: boolean } } };
+        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; expectedFirmwareObserved: boolean | null; bootFailureObserved: boolean; bootVersion?: string; captureError?: string | null; lines: string[]; healthDetails: { wifi: { status: string }; mqtt: { status: string }; internet: { status: string }; httpServer: { startup: string; reachable: { status: string } } } } };
         if (args.bootLogOutput) {
           const text = `${activation.boot.lines.join('\n')}\n`;
           await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
@@ -366,7 +369,7 @@ async function main() {
         progress.log(activation.boot.secureBootVerified ? 'SECURE BOOT SIGNATURE VERIFIED BY BOOTLOADER' : 'SECURE BOOT VERIFICATION NOT OBSERVED');
         progress.log(activation.applicationStarted ? 'APPLICATION STARTED' : 'APPLICATION START NOT OBSERVED');
         progress.log(`APPLICATION VERSION ${activation.boot.expectedFirmwareObserved === true ? 'VERIFIED' : activation.boot.expectedFirmwareObserved === false ? 'MISMATCH' : 'NOT OBSERVED'}${activation.boot.bootVersion ? ` (${activation.boot.bootVersion})` : ''}`);
-        progress.log(`Wi-Fi: ${activation.boot.health.wifiConnected ? 'CONNECTED' : 'NOT OBSERVED'}; MQTT: ${activation.boot.health.mqttConnected ? 'CONNECTED' : 'NOT OBSERVED'}`);
+        progress.log(`Optional services: Wi-Fi ${activation.boot.healthDetails.wifi.status}; HTTP ${activation.boot.healthDetails.httpServer.startup}; internet ${activation.boot.healthDetails.internet.status}; MQTT ${activation.boot.healthDetails.mqtt.status}`);
         if (activation.boot.bootFailureObserved) progress.log('APPLICATION FAILURE OBSERVED IN BOOT LOG');
         if (activation.boot.captureError) progress.log(activation.boot.captureError);
         if (!activation.bootSelectionVerified || !activation.applicationStarted || !activation.boot.secureBootVerified ||
@@ -690,13 +693,15 @@ async function main() {
         secureBootVerified: boot.secureBootVerified, bootObserved: boot.bootObserved,
         expectedSlotObserved: boot.expectedSlotObserved, expectedFirmwareObserved: boot.expectedFirmwareObserved,
         applicationStarted: boot.applicationStarted, applicationHealthy: boot.applicationHealthy, bootFailureObserved: boot.bootFailureObserved,
-        bootFailureLines: boot.bootFailureLines, bootLines: boot.lines };
+        bootFailureLines: boot.bootFailureLines, bootLines: boot.lines, bootHealth: boot.health, bootHealthDetails: boot.healthDetails };
     }
     if (args.json) {
       const { comparison: _comparison, ...flashFields } = finalResult;
       process.stdout.write(`${JSON.stringify({ ...flashFields, comparison: result.comparison.kind }, null, 2)}\n`);
     } else {
-      process.stdout.write(`FLASH RESULT\n${'─'.repeat(46)}\nFlash verification       ${finalResult.flashVerified ? 'PASSED' : 'NOT VERIFIED'}\nOTA metadata             ${finalResult.otaMetadataVerified ? 'VERIFIED' : 'NOT VERIFIED'}\nProtected partitions     ${finalResult.protectedPartitionsVerified ? 'UNCHANGED' : 'NOT VERIFIED'}\n\nPOST-FLASH BOOT MONITOR\n${'─'.repeat(46)}\nBoot observed            ${finalResult.bootObserved ? 'YES' : 'NOT OBSERVED'}\nExpected OTA slot        ${finalResult.expectedSlotObserved === null ? 'NOT OBSERVED' : finalResult.expectedSlotObserved ? 'YES' : 'NO'}\nExpected firmware        ${finalResult.expectedFirmwareObserved === null ? 'NOT OBSERVED' : finalResult.expectedFirmwareObserved ? 'YES' : 'NO'}\nApplication startup      ${finalResult.applicationStarted ? 'OBSERVED' : 'NOT OBSERVED'}\nApplication health       NOT CHECKED\nBoot failure             ${finalResult.bootFailureObserved ? 'OBSERVED' : 'NOT OBSERVED'}${finalResult.bootVersion ? `\nBoot version             ${finalResult.bootVersion}` : ''}\nBoot monitoring complete. Serial port released.\n`);
+      const health = finalResult.bootHealthDetails;
+      const optionalHealth = health ? `\nOptional services         Wi-Fi ${health.wifi.status}; HTTP ${health.httpServer.startup}; internet ${health.internet.status}; MQTT ${health.mqtt.status}` : '\nOptional services         NOT OBSERVED';
+      process.stdout.write(`FLASH RESULT\n${'─'.repeat(46)}\nFlash verification       ${finalResult.flashVerified ? 'PASSED' : 'NOT VERIFIED'}\nOTA metadata             ${finalResult.otaMetadataVerified ? 'VERIFIED' : 'NOT VERIFIED'}\nProtected partitions     ${finalResult.protectedPartitionsVerified ? 'UNCHANGED' : 'NOT VERIFIED'}\n\nPOST-FLASH BOOT MONITOR\n${'─'.repeat(46)}\nBoot observed            ${finalResult.bootObserved ? 'YES' : 'NOT OBSERVED'}\nExpected OTA slot        ${finalResult.expectedSlotObserved === null ? 'NOT OBSERVED' : finalResult.expectedSlotObserved ? 'YES' : 'NO'}\nExpected firmware        ${finalResult.expectedFirmwareObserved === null ? 'NOT OBSERVED' : finalResult.expectedFirmwareObserved ? 'YES' : 'NO'}\nApplication startup      ${finalResult.applicationStarted ? 'OBSERVED' : 'NOT OBSERVED'}${optionalHealth}\nBoot failure             ${finalResult.bootFailureObserved ? 'OBSERVED' : 'NOT OBSERVED'}${finalResult.bootVersion ? `\nBoot version             ${finalResult.bootVersion}` : ''}\nBoot monitoring complete. Serial port released.\n`);
     }
     return;
   }
