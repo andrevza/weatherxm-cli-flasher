@@ -111,15 +111,15 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
-          prerelease: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
-            This draft is a prerelease candidate, not a production-ready firmware installer.
+            Independent WeatherXM WG1200 CLI release. This project is not an official WeatherXM product or endorsement.
 
-            **Maintainer-reported physical validation:** Linux ARM64 read-only `info`, `verify`, and `status` on Raspberry Pi 5 / WG1200 using an earlier build (see `docs/hardware-validation.md`). Current source changes have not been physically exercised.
+            **Maintainer-reported physical evidence:** the v0.1.0-rc.1 Linux ARM64 binary passed read-only startup, OTA metadata/CRC inspection, Secure Boot V2 boot, application startup, networking, MQTT, station reception, redacted/timestamped monitoring, and monitor cancellation on a Raspberry Pi 5 / WG1200. It did not write OTA metadata. Earlier development builds reportedly completed `ota_1 → ota_0 → ota_1`; that cycle was not performed by the RC or this final executable. See `docs/hardware-validation.md` for attribution and scope.
 
-            **Write safety status:** installation is blocked because Secure Boot key trust and device anti-rollback compatibility cannot be established. OTA rollback behavior is not confirmed for the deployed gateway.
+            **Safety and recovery:** the generic `flash <firmware>` installer remains blocked; a narrowly scoped WeatherXM stage-only application write is enabled with backup and confirmation safeguards. OTA activation and emergency restore write one 4 KiB metadata sector under explicit confirmation. Automatic rollback is not established. Emergency `ota restore` has automated tests but no physical recovery test. The stable v0.1.0 binary itself was not physically run.
 
-            **Not physically validated:** firmware installation, OTA activation, and recovery. Automated write-path tests use fixtures and mocks. The CLI exposes no erase command. Do not publish this release as production-ready.
+            This job creates a draft. Review the documentation and provenance before publishing it.
           files: |
             release/weatherxm-flash-*
             release/SHA256SUMS

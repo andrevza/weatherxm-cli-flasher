@@ -1,5 +1,43 @@
 # Raspberry Pi 5 read-only hardware validation
 
+## Maintainer-reported v0.1.0-rc.1 physical acceptance (7 November 2026)
+
+The maintainer reports that the Linux ARM64 `v0.1.0-rc.1` executable was
+copied to `bugs`, its SHA-256 matched the candidate's checksum manifest, and it
+was run on a Raspberry Pi ARM64 host connected to a WG1200. The reported
+executable checksum was
+`365a0c2aeaeab576074597ff8ce381ca3be1e6049740196baf55d5623efb1127`, from
+commit `5dd2055a9a9b28a2435d7d0eec6727f4793f8484`, with clean embedded source
+provenance. This evidence was supplied by the maintainer; Codex did not access
+the Pi or gateway and did not independently recalculate the deployed file's
+hash.
+
+The supplied report says startup, embedded build metadata, structured help,
+read-only OTA metadata inspection and both metadata CRC checks passed. The
+gateway booted normally with Secure Boot V2 signature verification, loaded
+`ota_1` at `0x820000`, and ran WeatherXM `0.8.34-g86b609b`. The reported
+metadata selected `ota_1` at sequence 6; sector 0 contained sequence 5 in
+`VALID` state and sector 1 sequence 6 in `VALID` state, with both CRCs valid.
+The report also says LittleFS mounted, NVS initialized, Wi-Fi and internet
+connected, HTTP server startup was initiated, MQTT connected and communicated,
+and WS1001 station packets were received with reception reported at 100%.
+Timestamp formatting, redaction and clean Ctrl+C monitor termination were
+reported successful. The supplied boot evidence included:
+
+```text
+secure_boot_v2: Signature verified successfully!
+boot: Loaded app from partition at offset 0x820000
+app_init: App version: 0.8.34-g86b609b
+```
+
+The RC checks were read-only and did not write OTA metadata. They are separate
+from the `ota_1 → ota_0 → ota_1` switching cycle reported for earlier
+development builds below. The final stable `v0.1.0` executable built for this
+release was not itself run on physical hardware. Emergency `ota restore` has
+automated regression coverage but has not undergone physical recovery testing.
+The supplied acceptance report is summarized without device identity,
+credentials, radio payloads, or raw sensitive UART data.
+
 ## Maintainer-reported OTA activation round trip (7 November 2026)
 
 The maintainer reports a completed physical OTA selection cycle on the

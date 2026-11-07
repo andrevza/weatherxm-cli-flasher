@@ -8,5 +8,5 @@
 - Metadata and app backups are different artifacts. An app or partition backup is not a supported restore image. `ota restore` can reconstruct only one valid selection record when a valid bound backup and trusted recovery app remain available.
 - `--redact` is best-effort and cannot guarantee that arbitrary future log fields or unknown identifiers are hidden.
 - The automated Linux ARM64 artifact is built for a 16 KB-compatible environment and needs compatible glibc/C++ runtime plus `libatomic1` on Debian/Ubuntu. Only listed build targets are supported; physical testing on non-ARM64 platforms is not claimed.
-- The current release-candidate source change has not itself been exercised on a gateway. Historical hardware reports are versioned and attributed in [`hardware-validation.md`](hardware-validation.md).
+- Maintainer-reported read-only physical acceptance was performed with the v0.1.0-rc.1 executable. The stable v0.1.0 executable built for this release has not itself been run on a gateway. The earlier physical OTA switching cycle used development builds, and emergency restore has not undergone physical recovery testing. Hardware reports are versioned and attributed in [`hardware-validation.md`](hardware-validation.md).
 - The project is independent and is not an official WeatherXM release. Firmware binaries are not included.

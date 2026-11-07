@@ -16,7 +16,7 @@ wg1200 -v
 Example:
 
 ```text
-WeatherXM WG1200 Flasher v0.1.0-rc.1
+WeatherXM WG1200 Flasher v0.1.0
 ```
 
 Verbose human-readable and JSON forms are available:
