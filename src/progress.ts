@@ -56,7 +56,7 @@ export function formatProgressLine(snapshot: ProgressSnapshot, tty = false, widt
   const detail = `${formatBytes(snapshot.completed!)} / ${formatBytes(snapshot.total!)}`;
   const speed = snapshot.speedBytesPerSecond === null ? '' : ` | ${formatBytes(snapshot.speedBytesPerSecond)}/s`;
   const eta = snapshot.etaMs === null ? '' : ` | ETA ${formatDuration(snapshot.etaMs)}`;
-  const elapsedText = snapshot.elapsedMs >= 1000 ? ` | ${elapsed} elapsed` : '';
+  const elapsedText = snapshot.elapsedMs >= 1000 || snapshot.state !== 'running' ? ` | ${elapsed} elapsed` : '';
   const stalled = snapshot.idleMs >= 15_000 && snapshot.state === 'running'
     ? ` | no byte progress for ${formatDuration(snapshot.idleMs)}; still active` : '';
   const stateText = snapshot.state && snapshot.state !== 'running' ? ` — ${snapshot.state.toUpperCase()}` : '';
@@ -145,6 +145,9 @@ export class ProgressReporter {
     this.lastRenderAt = 0;
     this.timer = setInterval(() => this.render(this.now(), true), this.options.intervalMs ?? 1000);
     this.timer.unref?.();
+    // Show the operation as soon as it starts. Long ROM handshakes and file
+    // hashing must not leave the operator staring at an empty terminal.
+    this.render(now, true);
   }
 
   status(detail: string): void {
@@ -187,9 +190,8 @@ export class ProgressReporter {
     if (state === 'complete' && event.total !== undefined) event.completed = event.total;
     if (render) {
       const snapshot = progressSnapshot(event, this.startedAt, this.lastProgressAt, now, this.speed);
-      const short = snapshot.elapsedMs < 500;
-      const text = short
-        ? `${event.stage} ${state === 'complete' ? `DONE (${(snapshot.elapsedMs / 1000).toFixed(1)}s)` : state.toUpperCase()}`
+      const text = state === 'complete' && snapshot.elapsedMs < 500
+        ? `${event.stage} DONE (${(snapshot.elapsedMs / 1000).toFixed(1)}s)`
         : formatProgressLine(snapshot, this.options.tty, this.options.width?.() ?? 100);
       this.emitFinal(text);
     }
@@ -201,7 +203,6 @@ export class ProgressReporter {
     const interval = this.options.intervalMs ?? 1000;
     const minimumUpdateInterval = this.options.tty ? 250 : interval;
     if (!heartbeat && now - this.lastRenderAt < minimumUpdateInterval) return;
-    if (now - this.startedAt < 500) return;
     const snapshot = progressSnapshot(this.current, this.startedAt, this.lastProgressAt, now, this.speed);
     const text = formatProgressLine(snapshot, this.options.tty, this.options.width?.() ?? 100);
     this.emitProgress(text);

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { analyzeOtaMetadata, createOtaMetadataBackup, planOtaActivation, validateOtaMetadataBackup } from '../src/otaManagement.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
+import { ProgressReporter } from '../src/progress.js';
 
 function snapshot(records: Array<{ seq: number; state: number; crc?: number }>): Uint8Array {
   const bytes = new Uint8Array(8192).fill(0xff); const view = new DataView(bytes.buffer);
@@ -54,6 +55,32 @@ describe('exact OTA metadata backup', () => {
       await writeFile(outputPath, new Uint8Array(8192).fill(0x11));
       await expect(validateOtaMetadataBackup(`${outputPath}.manifest.json`, { bytes, deviceBinding: binding })).rejects.toThrow(/corrupt or stale/);
     } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('reports measured backup/readback bytes and cancellation through the shared reporter', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wg-otadata-progress-'));
+    const binding = { macAddressSha256: 'a'.repeat(64), secureCertificateSha256: 'b'.repeat(64) };
+    const bytes = new Uint8Array(8192).fill(0x5a); const lines: string[] = [];
+    const progress = new ProgressReporter({ write: (line) => lines.push(line), tty: false, intervalMs: 1 });
+    async function* fullChunks() { yield bytes.subarray(0, 4096); progress.bytes(4096, 8192); yield bytes.subarray(4096); progress.bytes(8192, 8192); }
+    try {
+      progress.stage('Connecting to ESP32-S3'); progress.finish('complete');
+      await createOtaMetadataBackup({ outputPath: join(dir, 'progress.bin'), deviceBinding: binding, readChunks: fullChunks(), progress,
+        hashLivePartition: async () => { progress.bytes(8192, 8192); return manifestSha(bytes); } });
+      progress.close();
+      expect(lines.join('')).toContain('Reading and saving otadata backup');
+      expect(lines.join('')).toContain('Independent flash readback SHA-256');
+      expect(lines.join('')).toContain('Saving backup and manifest DONE');
+      expect(lines.join('')).not.toMatch(/[\r\u001b]/);
+
+      const controller = new AbortController(); const cancelledLines: string[] = [];
+      const cancelledProgress = new ProgressReporter({ write: (line) => cancelledLines.push(line), tty: false });
+      async function* interruptedChunks() { yield bytes.subarray(0, 4096); controller.abort(); yield bytes.subarray(4096); }
+      await expect(createOtaMetadataBackup({ outputPath: join(dir, 'cancelled.bin'), deviceBinding: binding, readChunks: interruptedChunks(),
+        hashLivePartition: async () => manifestSha(bytes), signal: controller.signal, progress: cancelledProgress })).rejects.toThrow(/cancelled/);
+      cancelledProgress.close();
+      expect(cancelledLines.join('')).toContain('CANCELLED');
+      expect(await readdir(dir)).toEqual(['progress.bin', 'progress.bin.manifest.json']);
+    } finally { progress.close(); await rm(dir, { recursive: true, force: true }); }
   });
   it('does not finalize a mismatched or short snapshot', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'wg-otadata-')); const outputPath = join(dir, 'otadata.bin');

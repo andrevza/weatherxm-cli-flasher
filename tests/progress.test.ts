@@ -81,6 +81,27 @@ describe('progress accounting and rendering', () => {
     slow.finish('cancelled');
   });
 
+  it('prints a non-TTY operation immediately and includes elapsed time for cancellation and failure', () => {
+    let now = 0;
+    const output: string[] = [];
+    const reporter = new ProgressReporter({ write: (text) => output.push(text), tty: false, now: () => now, intervalMs: 1000 });
+    reporter.stage('Connecting to ESP32-S3');
+    expect(output.join('')).toContain('Connecting to ESP32-S3...\n');
+    now = 1250;
+    reporter.finish('cancelled');
+    expect(output.join('')).toContain('CANCELLED (1.3s)');
+    expect(output.join('')).not.toMatch(/[\r\u001b]/);
+
+    const failed: string[] = [];
+    const second = new ProgressReporter({ write: (text) => failed.push(text), tty: false, now: () => now, intervalMs: 1000 });
+    second.stage('Reading otadata', 8192);
+    now += 1750;
+    second.bytes(4096, 8192);
+    second.finish('failed');
+    expect(failed.join('')).toContain('FAILED');
+    expect(failed.join('')).toContain('00:01 elapsed');
+  });
+
   it('leaves no carriage return behind on cancellation or failure and allows redaction at the output boundary', () => {
     const output: string[] = [];
     const coordinator = new OutputCoordinator({ write: (text) => output.push(text), tty: true });

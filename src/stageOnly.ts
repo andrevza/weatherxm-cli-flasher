@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import type { AppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { parseEsp32S3ImageBoundary, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
+import type { ProgressReporter } from './progress.js';
 
 export interface InactiveBackupManifest {
   backupFormatVersion: 1;
@@ -41,7 +42,7 @@ export interface PartitionBackupManifest {
 export async function createPartitionBackup(input: {
   outputPath: string; label: string; offset: number; length: number;
   chip: { model: string; revision: string | null }; readChunks: AsyncIterable<Uint8Array>;
-  hashLivePartition: () => Promise<string>; signal?: AbortSignal;
+  hashLivePartition: () => Promise<string>; signal?: AbortSignal; progress?: ProgressReporter;
 }): Promise<PartitionBackupManifest> {
   const outputPath = resolve(input.outputPath);
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
@@ -78,13 +79,16 @@ export async function createPartitionBackup(input: {
       partition: { label: input.label, offset: input.offset, length: input.length }, backupFile: basename(outputPath), bytes, sha256,
       sensitive: true, independentReadbackVerified: true,
       tool: { version: build.packageVersion, gitCommit: build.gitCommit, sourceSha256: build.sourceSha256 } };
+    input.progress?.stage('Saving backup and manifest');
     const mh = await open(tempManifest, 'wx', 0o600);
     try { await mh.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'); await mh.sync(); } finally { await mh.close(); }
     await link(tempOutput, outputPath); outputLinked = true;
     await link(tempManifest, manifestPath); manifestLinked = true;
     await unlink(tempOutput); await unlink(tempManifest);
+    input.progress?.finish('complete', 'backup and manifest saved');
     return manifest;
   } catch (error) {
+    input.progress?.finish(input.signal?.aborted ? 'cancelled' : 'failed');
     await unlink(tempOutput).catch(() => undefined); await unlink(tempManifest).catch(() => undefined);
     if (manifestLinked) await unlink(manifestPath).catch(() => undefined);
     if (outputLinked) await unlink(outputPath).catch(() => undefined);
@@ -169,7 +173,8 @@ export async function inspectBackupImage(path: string, partitionLength: number):
 export async function createInactiveBackup(input: {
   outputPath: string; label: 'ota_0' | 'ota_1'; offset: number; length: number;
   chip: { model: string; revision: string | null }; readChunks: AsyncIterable<Uint8Array>;
-  hashLivePartition: () => Promise<string>; signal?: AbortSignal; inspect?: (path: string, length: number) => ReturnType<typeof inspectBackupImage>;
+  hashLivePartition: () => Promise<string>; signal?: AbortSignal; progress?: ProgressReporter;
+  inspect?: (path: string, length: number) => ReturnType<typeof inspectBackupImage>;
 }): Promise<InactiveBackupManifest> {
   const outputPath = resolve(input.outputPath);
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
@@ -203,7 +208,9 @@ export async function createInactiveBackup(input: {
     const independentReadbackVerified = (await input.hashLivePartition()).toLowerCase() === sha256;
     if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
     if (!independentReadbackVerified) throw new Error('backup file SHA-256 does not match independent second flash-read SHA-256');
+    input.progress?.stage('Verifying saved backup image signature');
     const imageInfo = await (input.inspect ?? inspectBackupImage)(tempOutput, input.length);
+    input.progress?.finish('complete', `${imageInfo.signature.status} signature evidence collected`);
     if (input.signal?.aborted) throw new Error('Backup cancelled; temporary file removed');
     const build = getEmbeddedBuildInfo();
     const manifest: InactiveBackupManifest = {
@@ -215,14 +222,17 @@ export async function createInactiveBackup(input: {
       signatureKeyDigests: imageInfo.signatureKeyDigests ?? [],
       tool: { version: build.packageVersion, gitCommit: build.gitCommit, sourceSha256: build.sourceSha256 },
     };
+    input.progress?.stage('Saving backup and manifest');
     const manifestHandle = await open(tempManifest, 'wx', 0o600);
     try { await manifestHandle.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'); await manifestHandle.sync(); }
     finally { await manifestHandle.close(); }
     await link(tempOutput, outputPath); outputLinked = true;
     await link(tempManifest, manifestPath); manifestLinked = true;
     await unlink(tempOutput); await unlink(tempManifest);
+    input.progress?.finish('complete', 'backup and manifest saved');
     return manifest;
   } catch (error) {
+    input.progress?.finish(input.signal?.aborted ? 'cancelled' : 'failed');
     await unlink(tempOutput).catch(() => undefined);
     await unlink(tempManifest).catch(() => undefined);
     if (manifestLinked) await unlink(manifestPath).catch(() => undefined);

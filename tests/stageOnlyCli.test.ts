@@ -109,9 +109,23 @@ describe('stage-only CLI guards', () => {
   });
 
   it('keeps JSON stdout parseable while progress and diagnostics stay on redirected stderr', () => {
-    const result = run('firmware', 'download', 'weatherxm', '--offline', '--cache-dir', '/tmp/wg1200-empty-json-cache', '--json');
+    const result = run('firmware', 'download', 'weatherxm', '--manifest', 'http://127.0.0.1:1/manifest.json', '--cache-dir', '/tmp/wg1200-empty-json-cache', '--json');
     expect(result.status).not.toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'FIRMWARE DOWNLOAD FAILED' });
     expect(result.stderr).not.toMatch(/[\r\u001b]/);
+    expect(result.stderr).toContain('Retrieving firmware catalog');
+    expect(result.stdout).not.toContain('Retrieving firmware catalog');
+  });
+
+  it.each([
+    ['status', ['ota', 'status', '--port', '/dev/null', '--json'], 'Connecting to ESP32-S3 and initializing ROM'],
+    ['backup', ['ota', 'backup', '--port', '/dev/null', '--output', '/tmp/wg1200-json-ota-backup.bin', '--json'], 'Connecting to ESP32-S3 and initializing ROM'],
+  ])('keeps ota %s JSON on stdout and emits redirected progress on stderr', (_name, args, operation) => {
+    const result = run(...args);
+    expect(result.status).not.toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'OTA OPERATION FAILED' });
+    expect(result.stderr).toContain(operation);
+    expect(result.stderr).not.toMatch(/[\r\u001b]/);
+    expect(result.stdout).not.toContain(operation);
   });
 });

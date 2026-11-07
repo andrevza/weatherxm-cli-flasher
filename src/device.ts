@@ -117,10 +117,11 @@ export function assertStageOnlySecurityEvidence(image: SecureBootImageEvidence, 
 async function createOtaBackupWithTransport(transport: Wg1200Transport, outputPath: string, slot: 'ota_0' | 'ota_1',
   chip: { model: string; revision: string | null }, progress?: ProgressReporter, signal?: AbortSignal): Promise<InactiveBackupManifest> {
   const partition = slot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
-  progress?.stage(`Reading ${slot}`, partition.size);
+  progress?.stage(`Reading and saving ${slot} firmware backup`, partition.size);
   const manifest = await createInactiveBackup({ outputPath, label: slot, offset: partition.offset, length: partition.size, chip,
     readChunks: transport.readRegionChunks(partition.offset, partition.size, (done, total) => progress?.bytes(done, total), signal),
     signal,
+    progress,
     hashLivePartition: () => {
       progress?.stage(`Independently verifying ${slot}`, partition.size);
       return transport.hashRegionSha256(partition.offset, partition.size, (done, total) => progress?.bytes(done, total));
@@ -182,7 +183,7 @@ export async function backupDiscoveredPartition(options: DeviceOptions & { outpu
     const manifest = await createPartitionBackup({ outputPath: options.outputPath, label: options.label, offset: found.offset, length: found.size,
       chip: { model: security.chip.model, revision: security.chip.revision },
       readChunks: transport.readRegionChunks(found.offset, found.size, (done, total) => options.progress?.bytes(done, total), options.signal),
-      signal: options.signal,
+      signal: options.signal, progress: options.progress,
       hashLivePartition: () => {
         options.progress?.stage(`Independently verifying ${options.label} with full physical SHA-256`, found.size);
         return transport.hashRegionSha256(found.offset, found.size, (done, total) => options.progress?.bytes(done, total), options.signal);

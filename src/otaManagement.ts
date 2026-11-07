@@ -4,6 +4,7 @@ import { link, mkdir, open, readFile, unlink } from 'node:fs/promises';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_NEW, ESP_OTA_IMG_PENDING_VERIFY, ESP_OTA_IMG_UNDEFINED, ESP_OTA_IMG_VALID } from './upstream/flasher/otadata.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
+import type { ProgressReporter } from './progress.js';
 
 export interface OtaSectorDiagnostic {
   index: 0 | 1;
@@ -103,13 +104,14 @@ export function otaDeviceBinding(macAddress: string | undefined, secureCertifica
 
 export async function createOtaMetadataBackup(input: {
   outputPath: string; deviceBinding: OtaMetadataBackupManifest['deviceBinding'];
-  readChunks: AsyncIterable<Uint8Array>; hashLivePartition: () => Promise<string>; signal?: AbortSignal;
+  readChunks: AsyncIterable<Uint8Array>; hashLivePartition: () => Promise<string>; signal?: AbortSignal; progress?: ProgressReporter;
 }): Promise<OtaMetadataBackupManifest> {
   const outputPath = resolve(input.outputPath); const manifestPath = `${outputPath}.manifest.json`;
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
   const tag = `.tmp-${cryptoRandomTag()}`; const tempOutput = `${outputPath}${tag}`; const tempManifest = `${manifestPath}${tag}`;
   let outputLinked = false; let manifestLinked = false;
   try {
+    input.progress?.stage('Reading and saving otadata backup', WG1200_CONSTANTS.OTADATA.size);
     const handle = await open(tempOutput, 'wx', 0o600); const hash = createHash('sha256'); let bytes = 0;
     try {
       for await (const chunk of input.readChunks) {
@@ -124,19 +126,27 @@ export async function createOtaMetadataBackup(input: {
       if (bytes !== WG1200_CONSTANTS.OTADATA.size) throw new Error('OTA metadata backup must contain exactly 8192 bytes');
       await handle.sync();
     } finally { await handle.close(); }
+    input.progress?.finish('complete', '8192 bytes read and staged to a restrictive temporary file');
     const sha256 = hash.digest('hex');
-    if ((await input.hashLivePartition()).toLowerCase() !== sha256) throw new Error('OTA metadata backup does not match independent physical readback');
+    input.progress?.stage('Independent flash readback SHA-256', WG1200_CONSTANTS.OTADATA.size);
+    const liveSha256 = (await input.hashLivePartition()).toLowerCase();
+    input.progress?.finish(liveSha256 === sha256 ? 'complete' : 'failed', liveSha256 === sha256 ? 'physical readback matches' : 'physical readback differs from backup');
+    if (liveSha256 !== sha256) throw new Error('OTA metadata backup does not match independent physical readback');
     if (input.signal?.aborted) throw new Error('OTA metadata backup cancelled; temporary files removed');
     const build = getEmbeddedBuildInfo();
     const manifest: OtaMetadataBackupManifest = { format: 'wg1200-ota-metadata-backup-v1', createdAt: new Date().toISOString(),
       partition: { label: 'otadata', offset: WG1200_CONSTANTS.OTADATA.offset, length: WG1200_CONSTANTS.OTADATA.size },
       backupFile: basename(outputPath), bytes, sha256, deviceBinding: input.deviceBinding, independentReadbackVerified: true,
       tool: { version: build.packageVersion, gitCommit: build.gitCommit, sourceSha256: build.sourceSha256 } };
+    input.progress?.stage('Saving backup and manifest');
     const manifestHandle = await open(tempManifest, 'wx', 0o600);
     try { await manifestHandle.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'); await manifestHandle.sync(); } finally { await manifestHandle.close(); }
     await link(tempOutput, outputPath); outputLinked = true; await link(tempManifest, manifestPath); manifestLinked = true;
-    await unlink(tempOutput); await unlink(tempManifest); return manifest;
+    await unlink(tempOutput); await unlink(tempManifest);
+    input.progress?.finish('complete', 'backup and manifest saved without overwriting existing files');
+    return manifest;
   } catch (error) {
+    input.progress?.finish(input.signal?.aborted ? 'cancelled' : 'failed');
     await unlink(tempOutput).catch(() => undefined); await unlink(tempManifest).catch(() => undefined);
     if (manifestLinked) await unlink(manifestPath).catch(() => undefined); if (outputLinked) await unlink(outputPath).catch(() => undefined);
     if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') throw new Error('OTA metadata backup or manifest already exists; refusing to overwrite it');

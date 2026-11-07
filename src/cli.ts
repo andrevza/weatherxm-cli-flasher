@@ -172,7 +172,7 @@ function createProgress(args: Args): ProgressReporter {
   const coordinator = new OutputCoordinator({ write: (text) => process.stderr.write(text), tty,
     width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)) });
   const reporter = new ProgressReporter({
-    coordinator, tty, intervalMs: 5000, width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)),
+    coordinator, tty, intervalMs: 1000, width: () => Math.max(20, Math.min(160, process.stderr.columns || 100)),
   });
   activeProgress = reporter;
   return reporter;
@@ -328,19 +328,34 @@ async function main() {
   if (args.command === 'ota') {
     if (!args.port) throw new Error(`ota ${args.subcommand} requires --port, for example --port /dev/ttyUSB0`);
     const progress = createProgress(args);
+    const cancellation = new AbortController();
+    const removeInterrupt = bindAbortOnSigint(process, cancellation);
     try {
       let report: unknown;
-      if (args.subcommand === 'status') report = await readOtaStatus({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, progress });
+      if (args.subcommand === 'status') {
+        report = await readOtaStatus({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial, progress, signal: cancellation.signal });
+        progress.log('OTA STATUS COMPLETE');
+      }
       else if (args.subcommand === 'backup') {
         if (!args.outputFile) throw new Error('ota backup requires --output <file>');
-        report = await backupOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, outputPath: args.outputFile, progress });
+        report = await backupOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
+          outputPath: args.outputFile, progress, signal: cancellation.signal });
+        progress.log('OTA METADATA BACKUP VERIFIED');
       } else {
-        report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose,
-          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest });
+        report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
+          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest, progress, signal: cancellation.signal });
+        progress.log('ACTIVATION PLAN COMPLETE — BLOCKED; NO FLASH WRITES PERFORMED');
         process.exitCode = 1;
       }
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    } finally { progress.close(); }
+    } catch (error) {
+      const cancelled = cancellation.signal.aborted;
+      progress.finish(cancelled ? 'cancelled' : 'failed');
+      const message = error instanceof Error ? error.message : String(error);
+      if (args.json) process.stdout.write(`${JSON.stringify({ outcome: cancelled ? 'OTA OPERATION CANCELLED' : 'OTA OPERATION FAILED', error: message }, null, 2)}\n`);
+      else progress.log(`${cancelled ? 'OTA OPERATION CANCELLED' : 'OTA OPERATION FAILED'}: ${message}`);
+      process.exitCode = 1;
+    } finally { removeInterrupt(); progress.close(); }
     return;
   }
   if (args.command === 'backup') {
@@ -426,7 +441,11 @@ async function main() {
     const progress = createProgress(args);
     try {
       let report;
-      if (args.firmwareFile) report = await compareFirmwareFiles(args.backupPath!, args.firmwareFile, args.expectedSha256);
+      if (args.firmwareFile) {
+        progress.stage('Comparing backup and firmware image files');
+        report = await compareFirmwareFiles(args.backupPath!, args.firmwareFile, args.expectedSha256);
+        progress.finish('complete');
+      }
       else {
         const firmware = await getOfficialFirmware({ key: args.firmwareKey!, manifestUrl: args.manifest,
           offline: args.offline, cacheDirectory: args.cacheDirectory, progress: (event) => progress.event(event) });
