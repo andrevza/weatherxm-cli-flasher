@@ -70,6 +70,6 @@ describe('complete CLI help audit', () => {
     expect(parserSource).toContain('firmware list reads the catalog directly and does not accept --offline or --cache-dir');
     expect(parserSource).toContain('--manifest is not supported by read-only flash diagnose');
     expect(parserSource).toContain('--manifest is supported only by security check');
-    expect(parserSource).toContain('Monitor formatting options require monitor or --monitor');
+    expect(parserSource).toContain('Monitor formatting options require monitor, ota activate, or ota restore');
   });
 });

@@ -73,6 +73,9 @@ describe('structured CLI help', () => {
     expect(activation).toContain('--metadata-backup-manifest <file>');
     expect(activation).toContain('--dry-run');
     expect(activation).toContain('15–3600 seconds');
+    expect(activation).toContain('--timestamp');
+    expect(activation).toContain('--no-color');
+    expect(source(['ota', 'restore', '--help']).stdout).toContain('--no-color');
     const normalized = activation.replace(/\s+/g, ' ');
     expect(normalized).toContain('on-chip MD5');
     expect(normalized).toContain('physical SHA-256');

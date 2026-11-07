@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { formatMonitorLine, monitorSerial, parseSerialLevel, resetForNormalBoot, writeMonitorOutput } from '../src/monitor.js';
+import { formatMonitorLine, formatSanitizedMonitorLine, monitorColorEnabled, monitorSerial, parseSerialLevel, resetForNormalBoot, writeMonitorOutput } from '../src/monitor.js';
 import { analyzeBootLogs, captureBootLogs } from '../src/upstream/flasher/serialLog.js';
 import { LogSanitizer } from '../src/upstream/flasher/serialLog.js';
 
@@ -165,6 +165,57 @@ describe('passive serial monitor', () => {
     expect(formatMonitorLine('\u001b[32mI (123) tag: started\u001b[0m', { noColor: true })).toBe('I (123) tag: started');
     expect(formatMonitorLine('W (123) tag: warning', { timestamp: true })).toMatch(/^\d{4}-\d\d-\d\dT.* W \(123\) tag: warning$/);
     expect(formatMonitorLine('I (123) tag: raw', { raw: true, timestamp: true })).toBe('I (123) tag: raw');
+  });
+
+  it('uses the same timestamped, severity-coloured presentation for monitor and OTA boot lines', () => {
+    const raw = 'W (123) WiFi: credentials unavailable';
+    const monitor = formatMonitorLine(raw, { timestamp: true, color: true });
+    const ota = formatSanitizedMonitorLine(raw, { timestamp: true, color: true });
+    expect(ota).toBe(monitor);
+    expect(ota).toMatch(/^\u001b\[33m\d{4}-\d\d-\d\dT.* W \(123\) WiFi: credentials unavailable\u001b\[0m$/);
+    const banner = formatSanitizedMonitorLine('WeatherXM WG1200 starting', { color: true });
+    expect(banner).toBe('\u001b[36mWeatherXM WG1200 starting\u001b[0m');
+  });
+
+  it('keeps OTA and monitor logs plain when color is disabled, redirected, or NO_COLOR is set', () => {
+    expect(monitorColorEnabled({ isTTY: true, env: { TERM: 'xterm-256color' } })).toBe(true);
+    expect(monitorColorEnabled({ isTTY: true, noColor: true, env: { TERM: 'xterm-256color' } })).toBe(false);
+    expect(monitorColorEnabled({ isTTY: true, env: { TERM: 'xterm-256color', NO_COLOR: '1' } })).toBe(false);
+    expect(monitorColorEnabled({ isTTY: false, env: { TERM: 'xterm-256color' } })).toBe(false);
+    expect(formatSanitizedMonitorLine('\u001b[31mE (9) fatal\u001b[0m', { timestamp: true, noColor: true, color: false }))
+      .toMatch(/^\d{4}-\d\d-\d\dT.* E \(9\) fatal$/);
+  });
+
+  it('saves the same timestamped plain text that it displays without allowing decoration into boot evidence', () => {
+    const rawEvidence = ['I (123) MAIN: booting', 'E (124) MAIN: sample failure'];
+    const analysis = analyzeBootLogs(rawEvidence);
+    const displayed: string[] = [];
+    const saved: string[] = [];
+    for (const line of rawEvidence) {
+      const formatted = formatSanitizedMonitorLine(line, { timestamp: true, color: true })!;
+      writeMonitorOutput(`${formatted}\n`, true, (text) => displayed.push(text), (text) => saved.push(text));
+    }
+    expect(displayed.join('')).toBe(saved.join(''));
+    expect(saved.join('')).not.toMatch(/\u001b\[/);
+    expect(saved.join('')).toMatch(/^\d{4}-\d\d-\d\dT/m);
+    expect(analysis.lines).toEqual(rawEvidence);
+    expect(analysis.bootFailureObserved).toBe(true);
+  });
+
+  it('redacts multiline sensitive UART blocks before shared formatting', () => {
+    const sanitizer = new LogSanitizer();
+    const safe = [
+      sanitizer.sanitizeLine('Certificate PEM:'),
+      sanitizer.sanitizeLine('-----BEGIN CERTIFICATE-----'),
+      sanitizer.sanitizeLine('SECRET-CERTIFICATE-CONTENT'),
+      sanitizer.sanitizeLine('-----END CERTIFICATE-----'),
+      sanitizer.sanitizeLine('I (130) MAIN: boot continues'),
+    ].filter((line): line is string => line !== null);
+    const output = safe.map((line) => formatSanitizedMonitorLine(line, { timestamp: true, noColor: true })).join('\n');
+    expect(output).not.toContain('SECRET-CERTIFICATE-CONTENT');
+    expect(output).toContain('[REDACTED_SENSITIVE_BLOCK_START]');
+    expect(output).toContain('[REDACTED_SENSITIVE_BLOCK_END]');
+    expect(output).toContain('boot continues');
   });
 });
 

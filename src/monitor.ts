@@ -50,6 +50,11 @@ export async function resetForNormalBoot(port: MonitorPort, delay: (ms: number) 
 const rank: Record<MonitorLevel, number> = { error: 0, warn: 1, info: 2, debug: 3, verbose: 4 };
 const ansi = /\u001b\[[0-?]*[ -/]*[@-~]/g;
 
+export function monitorColorEnabled(input: { isTTY: boolean; noColor?: boolean; env?: NodeJS.ProcessEnv }): boolean {
+  const env = input.env ?? process.env;
+  return input.isTTY && !input.noColor && !env.NO_COLOR && env.TERM !== 'dumb';
+}
+
 /** Sends one already-rendered monitor chunk through the same redaction boundary for console and file sinks. */
 export function writeMonitorOutput(
   rendered: string,
@@ -73,10 +78,11 @@ export function parseSerialLevel(line: string): MonitorLevel | undefined {
 export function formatMonitorLine(line: string, options: Pick<MonitorOptions, 'timestamp'|'level'|'raw'|'noColor'|'color'> = {}): string | null {
   const sanitizer = new LogSanitizer();
   const safe = sanitizer.sanitizeLine(line);
-  return safe === null ? null : formatSafeLine(safe, options);
+  return safe === null ? null : formatSanitizedMonitorLine(safe, options);
 }
 
-function formatSafeLine(safe: string, options: Pick<MonitorOptions, 'timestamp'|'level'|'raw'|'noColor'|'color'>): string | null {
+/** Shared presentation stage for already-sanitized UART evidence. */
+export function formatSanitizedMonitorLine(safe: string, options: Pick<MonitorOptions, 'timestamp'|'level'|'raw'|'noColor'|'color'> = {}): string | null {
   if (safe === null || safe.length === 0) return null;
   const severity = parseSerialLevel(safe);
   if (options.level && severity && rank[severity] > rank[options.level]) return null;
@@ -86,6 +92,8 @@ function formatSafeLine(safe: string, options: Pick<MonitorOptions, 'timestamp'|
   if (!options.raw && !options.noColor && options.color && severity) {
     const color = severity === 'error' ? '31' : severity === 'warn' ? '33' : severity === 'debug' || severity === 'verbose' ? '90' : '32';
     output = `\u001b[${color}m${output}\u001b[0m`;
+  } else if (!options.raw && !options.noColor && options.color && /\bWeatherXM\b|WeatherXM WG1200/i.test(safe)) {
+    output = `\u001b[36m${output}\u001b[0m`;
   }
   return output;
 }
@@ -114,7 +122,7 @@ export async function monitorSerial(options: MonitorOptions): Promise<string[]> 
   const writeLine = (rawLine: string) => {
     const safe = sanitizer.sanitizeLine(rawLine);
     if (safe === null) return;
-    const line = formatSafeLine(safe, options);
+    const line = formatSanitizedMonitorLine(safe, options);
     if (line === null) return;
     lines.push(safe.replace(ansi, ''));
     options.output?.(line);

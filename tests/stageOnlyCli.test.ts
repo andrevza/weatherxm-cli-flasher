@@ -115,6 +115,10 @@ describe('stage-only CLI guards', () => {
     expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('--metadata-backup-manifest');
     const arbitrary = run('ota', 'activate', '--target', '0x13000', '--port', '/dev/null', '--dry-run');
     expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('activate --target');
+    const formattedInvalidActivation = run('ota', 'activate', '--target', 'ota_2', '--port', '/dev/null', '--metadata-backup-manifest', '/tmp/backup.json', '--timestamp', '--no-color');
+    expect(formattedInvalidActivation.stderr).toContain('ota supports status, backup --output, activate --target and restore');
+    const formattedRestore = run('ota', 'restore', '--port', '/dev/null', '--metadata-backup-manifest', '/tmp/backup.json', '--timestamp', '--no-color');
+    expect(formattedRestore.stderr).toContain('explicit high-risk confirmation requires an interactive terminal');
     expect(run('ota', '--help').stdout).toContain('OTA COMMANDS');
     const restore = run('ota', 'restore', '--port', '/dev/null');
     expect(restore.status).not.toBe(0); expect(restore.stderr).toContain('--metadata-backup-manifest');

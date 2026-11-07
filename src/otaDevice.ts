@@ -202,7 +202,7 @@ async function resetNormalBootWithReceiver(port: NodeSerialPort, progress?: Prog
 }
 
 async function captureOtaBoot(portPath: string, expected: { slotOffset: number; firmwareVersion: string }, seconds: number,
-  progress: ProgressReporter | undefined) {
+  progress: ProgressReporter | undefined, onBootLine?: (line: string) => void) {
   const lifecycle = (stage: string, state: 'start' | 'complete' | 'failed', detail?: string) => {
     if (state === 'start') progress?.log(`${stage}...`);
     else progress?.log(`${stage} ${state === 'complete' ? 'DONE' : 'FAILED'}${detail ? ` — ${detail}` : ''}`);
@@ -213,7 +213,7 @@ async function captureOtaBoot(portPath: string, expected: { slotOffset: number; 
   const port = new NodeSerialPort(portPath, undefined, undefined, true, lifecycle);
   progress?.stage('Preparing serial boot monitor');
   try {
-    const boot = await captureBootLogs(port, seconds * 1000, (line) => progress?.log(line), expected,
+    const boot = await captureBootLogs(port, seconds * 1000, (line) => onBootLine ? onBootLine(line) : progress?.log(line), expected,
       async () => { await resetNormalBootWithReceiver(port, progress); },
       () => {
         progress?.stage(`Capturing live boot output (${seconds} seconds)`);
@@ -346,7 +346,7 @@ const WG1200_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900
 
 /** Performs a confirmed one-sector activation through the ESP32 ROM/stub transport. Never called by tests on physical hardware. */
 export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0' | 'ota_1'; metadataBackupManifest: string;
-  confirm: (plan: ReturnType<typeof planOtaActivation>) => Promise<boolean>; bootLogSeconds?: number; verificationMode?: OtaStatusVerificationMode }) {
+  confirm: (plan: ReturnType<typeof planOtaActivation>) => Promise<boolean>; bootLogSeconds?: number; verificationMode?: OtaStatusVerificationMode; onBootLine?: (line: string) => void }) {
   const evidence = await loadActivationEvidence(options);
   let captureResetAfterOpen = false;
   const transaction = await withOtaDevice(options, async (transport, inspection) => {
@@ -373,7 +373,7 @@ export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0'
   }, () => captureResetAfterOpen);
   const boot = await captureOtaBoot(options.portPath, {
     slotOffset: options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset,
-    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress);
+    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress, options.onBootLine);
   const bootVerified = boot.expectedSlotObserved === true && boot.secureBootVerified;
   const applicationVerified = boot.applicationStarted && boot.expectedFirmwareObserved === true && !boot.bootFailureObserved;
   const bootValidationFailed = boot.bootFailureObserved || boot.expectedSlotObserved === false || boot.expectedFirmwareObserved === false;
@@ -387,7 +387,7 @@ export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0'
 }
 
 export async function restoreOtaMetadata(options: DeviceOptions & { metadataBackupManifest: string;
-  confirm: (plan: ReturnType<typeof planOtaMetadataRestore>) => Promise<boolean>; bootLogSeconds?: number }) {
+  confirm: (plan: ReturnType<typeof planOtaMetadataRestore>) => Promise<boolean>; bootLogSeconds?: number; onBootLine?: (line: string) => void }) {
   let captureResetAfterOpen = false;
   const transaction = await withOtaDevice(options, async (transport, inspection) => {
     if (!inspection.secureCert?.sha256) throw new Error('Emergency metadata recovery requires a verified Secure Certificate identity');
@@ -427,7 +427,7 @@ export async function restoreOtaMetadata(options: DeviceOptions & { metadataBack
   }, () => captureResetAfterOpen);
   const boot = await captureOtaBoot(options.portPath, {
     slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset,
-    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress);
+    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress, options.onBootLine);
   const bootValidationFailed = boot.bootFailureObserved || boot.expectedSlotObserved === false || boot.expectedFirmwareObserved === false;
   return { outcome: boot.expectedSlotObserved && boot.secureBootVerified && boot.applicationStarted && !boot.bootFailureObserved
     ? 'OTA METADATA RECOVERY COMPLETE' : bootValidationFailed ? 'OTA METADATA UPDATED; BOOT VALIDATION FAILED' : 'OTA METADATA UPDATED; BOOT UNVERIFIED', metadataUpdated: true,

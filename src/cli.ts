@@ -13,8 +13,8 @@ import { createWriteStream } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { finished } from 'node:stream/promises';
-import { analyzeBootLogs } from './upstream/flasher/serialLog.js';
-import { monitorSerial, type MonitorLevel, writeMonitorOutput } from './monitor.js';
+import { analyzeBootLogs, LogSanitizer } from './upstream/flasher/serialLog.js';
+import { formatSanitizedMonitorLine, monitorColorEnabled, monitorSerial, type MonitorLevel, writeMonitorOutput } from './monitor.js';
 import { formatCheckOutput, formatDryRunOutput, formatStatusOutput, standalonePresentationFixture } from './presentation.js';
 import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 import { bindAbortOnSigint } from './interrupt.js';
@@ -141,7 +141,7 @@ function parseArgs(argv: string[]): Args {
     if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security', 'ota'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
     if (out.boot && out.command !== 'monitor') throw new Error('--boot is supported only by monitor');
-    if ((out.timestamp || out.level || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
+    if ((out.timestamp || out.level || out.raw || out.noColor) && out.command !== 'monitor' && !out.monitor && !(out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? '') && !out.dryRun && !out.level && !out.raw)) throw new Error('Monitor formatting options require monitor, ota activate, or ota restore');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
     if (out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? '') && out.bootLogSeconds < 15) throw new Error('OTA activation and restoration boot capture must be at least 15 seconds');
@@ -250,10 +250,10 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
   if (!args.port) throw new Error(`${args.command} requires --port, for example --port /dev/ttyUSB0`);
   const target = args.json ? process.stderr : process.stdout;
   const file = args.outputFile ? createWriteStream(args.outputFile, { flags: 'a' }) : undefined;
-  const color = Boolean(target.isTTY) && !args.noColor && !process.env.NO_COLOR && process.env.TERM !== 'dumb';
+  const color = monitorColorEnabled({ isTTY: Boolean(target.isTTY), noColor: args.noColor });
   try {
     const lines = await monitorSerial({
-      portPath: args.port, baudRate: args.baud, boot: args.boot, redact: args.redact, timestamp: args.timestamp, level: args.level,
+      portPath: args.port, baudRate: args.baud, boot: args.boot, redact: args.redact, timestamp: args.timestamp || args.boot, level: args.level,
       raw: args.raw, noColor: args.noColor, color, header,
       output: (value) => {
         const rendered = `${value}${value.endsWith('\n') ? '' : '\n'}`;
@@ -268,6 +268,23 @@ async function runMonitor(args: Args, header?: string): Promise<string[]> {
       await finished(file);
     }
   }
+}
+
+/** Formats sanitized live boot lines through the same pipeline used by monitorSerial. */
+function createOtaBootPresenter(args: Args): { onLine: (line: string) => void; savedText: () => string } {
+  const saved: string[] = [];
+  const sanitizer = new LogSanitizer({ suppressRadioPayloads: args.redact });
+  const color = monitorColorEnabled({ isTTY: Boolean(process.stderr.isTTY), noColor: args.noColor });
+  return {
+    onLine: (line) => {
+      const safeLine = sanitizer.sanitizeLine(line);
+      if (safeLine === null) return;
+      const formatted = formatSanitizedMonitorLine(safeLine, { timestamp: true, noColor: args.noColor, color });
+      if (formatted === null) return;
+      writeMonitorOutput(`${formatted}\n`, args.redact, (text) => process.stderr.write(text), (text) => saved.push(text));
+    },
+    savedText: () => saved.join(''),
+  };
 }
 
 async function main() {
@@ -319,6 +336,7 @@ async function main() {
   if (args.command === 'ota') {
     if (!args.port) throw new Error(`ota ${args.subcommand} requires --port, for example --port /dev/ttyUSB0`);
     const progress = createProgress(args);
+    const bootPresenter = ['activate', 'restore'].includes(args.subcommand ?? '') ? createOtaBootPresenter(args) : undefined;
     const cancellation = new AbortController();
     const removeInterrupt = bindAbortOnSigint(process, cancellation);
     try {
@@ -337,6 +355,7 @@ async function main() {
         if (!stdin.isTTY || !stdout.isTTY) throw new Error('EMERGENCY OTA RECOVERY BLOCKED: explicit high-risk confirmation requires an interactive terminal');
         report = await restoreOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal, bootLogSeconds: args.bootLogSeconds,
+          onBootLine: bootPresenter!.onLine,
           confirm: async (plan) => {
             const phrase = `RESTORE OTA TARGET ${plan.target} SEQUENCE ${plan.sequence}`;
             return confirmWithSuspendedProgress({ phrase, progress, promptIntro: `High-risk recovery. Type exactly: ${phrase}`,
@@ -348,8 +367,7 @@ async function main() {
           } });
         const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; bootFailureObserved: boolean; captureError?: string | null; lines: string[]; healthDetails: { wifi: { status: string }; mqtt: { status: string }; internet: { status: string }; httpServer: { startup: string; reachable: { status: string } } } } };
         if (args.bootLogOutput) {
-          const text = `${recovery.boot.lines.join('\n')}\n`;
-          await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
+          await writeFile(resolvePath(args.bootLogOutput), bootPresenter!.savedText(), { encoding: 'utf8' });
           progress.log(`Boot log saved to ${resolvePath(args.bootLogOutput)}`);
         }
         progress.log(recovery.bootSelectionVerified ? 'RECOVERY BOOT SELECTION VERIFIED' : 'RECOVERY BOOT SELECTION NOT VERIFIED');
@@ -368,7 +386,7 @@ async function main() {
         if (!stdin.isTTY || !stdout.isTTY) throw new Error('OTA ACTIVATION BLOCKED: explicit confirmation requires an interactive terminal');
         report = await activateOtaSlot({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal,
-          bootLogSeconds: args.bootLogSeconds, verificationMode: args.verifyMode ?? 'fast', offline: args.offline, cacheDirectory: args.cacheDirectory, confirm: async (plan) => {
+          bootLogSeconds: args.bootLogSeconds, verificationMode: args.verifyMode ?? 'fast', offline: args.offline, cacheDirectory: args.cacheDirectory, onBootLine: bootPresenter!.onLine, confirm: async (plan) => {
             const phrase = `ACTIVATE ${plan.target} SEQUENCE ${plan.proposedUpdate.sequence}`;
             return confirmWithSuspendedProgress({ phrase, progress, promptIntro: `Type exactly: ${phrase}`,
               askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Waiting for confirmation: type the exact phrase and press Enter (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
@@ -378,8 +396,7 @@ async function main() {
           } });
         const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; expectedFirmwareObserved: boolean | null; bootFailureObserved: boolean; bootVersion?: string; captureError?: string | null; lines: string[]; healthDetails: { wifi: { status: string }; mqtt: { status: string }; internet: { status: string }; httpServer: { startup: string; reachable: { status: string } } } } };
         if (args.bootLogOutput) {
-          const text = `${activation.boot.lines.join('\n')}\n`;
-          await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
+          await writeFile(resolvePath(args.bootLogOutput), bootPresenter!.savedText(), { encoding: 'utf8' });
           progress.log(`Boot log saved to ${resolvePath(args.bootLogOutput)}`);
         }
         progress.log(activation.bootSelectionVerified ? 'BOOT SELECTION VERIFIED' : 'BOOT SELECTION NOT VERIFIED');
