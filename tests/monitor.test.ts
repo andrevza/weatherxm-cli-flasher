@@ -373,7 +373,7 @@ describe('boot log evidence', () => {
   it('reports recovered NVS initialization and incomplete station reception without calling either a failure', () => {
     const result = analyzeBootLogs([
       'W (400) Utils: NVS diagnostics: initial=ESP_ERR_NVS_NO_FREE_PAGES final=ESP_OK',
-      'I (9000) Weather station reception reached 65%',
+      'I (9000) Packet reception percentage: 65%',
     ], expected);
     expect(result.healthDetails.nvs).toMatchObject({ status: 'VERIFIED', uptimeMs: 400 });
     expect(result.healthDetails.stationReception).toMatchObject({ status: 'NOT_OBSERVED', percentage: 65, uptimeMs: 9000 });

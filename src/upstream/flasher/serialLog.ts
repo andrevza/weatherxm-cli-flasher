@@ -96,7 +96,9 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
     const filesystemFailure = /littlefs.*(?:failed to mount|mount failed|mount error|mounting failed)/i.test(clean);
     if (filesystemSuccess) healthDetails.littlefs = record(healthDetails.littlefs, 'VERIFIED', clean);
     else if (filesystemFailure) healthDetails.littlefs = record(healthDetails.littlefs, 'FAILED', clean, 'LittleFS mount failed.');
-    if (/littlefs.*(?:recover(?:y|ed|ing)|format(?:ted|ting)?)/i.test(clean)) healthDetails.filesystemRecovery = record(healthDetails.filesystemRecovery, 'VERIFIED', clean);
+    if (/littlefs.*(?:recover(?:y|ed|ing)|format(?:ted|ting)?)|(?:recover(?:y|ed|ing)|format(?:ted|ting)?).*littlefs/i.test(clean)) {
+      healthDetails.filesystemRecovery = record(healthDetails.filesystemRecovery, 'VERIFIED', clean);
+    }
     if (filesystemSuccess) health.littlefsMounted = true;
 
     const nvsDiagnostic = clean.match(/nvs diagnostics\s*:\s*initial\s*=\s*(ESP_OK|ESP_ERR_[A-Z0-9_]+)\s+final\s*=\s*(ESP_OK|ESP_ERR_[A-Z0-9_]+)/i);
@@ -160,7 +162,7 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
     if (packetSuccess) healthDetails.weatherStationPacket = record(healthDetails.weatherStationPacket, 'VERIFIED', clean);
     else if (packetFailure) healthDetails.weatherStationPacket = record(healthDetails.weatherStationPacket, 'FAILED', clean, 'Weather-station packet reception or decoding failed.');
     health.weatherPacketReceived ||= packetSuccess;
-    const receptionPercent = clean.match(/(?:weather[- ]station )?reception(?: reached| at|:)?\s*(\d+(?:\.\d+)?)\s*%/i)?.[1];
+    const receptionPercent = clean.match(/\breception\b[^\d%]{0,40}(\d+(?:\.\d+)?)\s*%/i)?.[1];
     const receptionComplete = Boolean(receptionPercent && Number(receptionPercent) >= 100) || /weather[- ]station reception.*100\s*%|reception reached 100\s*%|packet reception.*100\s*%/i.test(clean);
     const receptionFailure = /weather[- ]station.*(?:reception failed|no packets|timeout)/i.test(clean);
     if (receptionComplete) healthDetails.stationReception = { ...record(healthDetails.stationReception, 'VERIFIED', clean), percentage: receptionPercent ? Number(receptionPercent) : 100 };
