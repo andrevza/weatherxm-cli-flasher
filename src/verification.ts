@@ -1,6 +1,28 @@
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 
 export type VerificationMode = 'fast' | 'thorough';
+
+export async function establishProtectedRegionSnapshot<TFast, TThorough>(input: {
+  mode: VerificationMode;
+  fastSnapshot: () => Promise<TFast>;
+  thoroughSnapshot: () => Promise<TThorough>;
+  signal?: AbortSignal;
+  onFallback?: (reason: string) => void;
+}): Promise<{ mode: 'fast'; snapshot: TFast } | { mode: 'thorough'; snapshot: TThorough }> {
+  if (input.mode === 'fast') {
+    try {
+      if (input.signal?.aborted) throw Object.assign(new Error('Operation cancelled'), { name: 'AbortError' });
+      const snapshot = await input.fastSnapshot();
+      if (input.signal?.aborted) throw Object.assign(new Error('Operation cancelled'), { name: 'AbortError' });
+      return { mode: 'fast', snapshot };
+    } catch (error) {
+      if (input.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+      input.onFallback?.(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return { mode: 'thorough', snapshot: await input.thoroughSnapshot() };
+}
+
 export interface RegionVerificationRecord {
   address: number;
   length: number;
@@ -8,6 +30,15 @@ export interface RegionVerificationRecord {
   method: 'device-side SPI_FLASH_MD5' | 'physical flash read';
   outcome: 'MATCH';
   elapsedMs: number;
+}
+export interface ProtectedRegionVerificationRecord {
+  name: string;
+  address: number;
+  length: number;
+  algorithm: 'MD5' | 'SHA-256' | 'byte-for-byte';
+  method: 'device-side SPI_FLASH_MD5' | 'physical flash read';
+  snapshot: 'SNAPSHOT';
+  postWrite: 'MATCH';
 }
 export class RegionVerificationMismatch extends Error {
   constructor(readonly address: number, readonly length: number, readonly algorithm: 'MD5' | 'SHA-256') {

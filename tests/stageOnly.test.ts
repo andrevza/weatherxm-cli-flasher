@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createInactiveBackup, runStageOnlyTransaction, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
+import { createInactiveBackup, createPartitionBackup, runStageOnlyTransaction, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
 import { retryExactConfirmation } from '../src/verification.js';
 
 const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -15,6 +15,7 @@ async function tempDir() {
   tempDirs.push(dir);
   return dir;
 }
+async function* oneChunk(data: Uint8Array) { yield data; }
 afterEach(async () => { await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
 
 function ops(overrides: Partial<StageOnlyOperations> = {}) {
@@ -125,6 +126,34 @@ describe('stage-only transaction', () => {
     const otaChanged = ops({ readOtadata: vi.fn(async () => new Uint8Array(8192).fill(0xbb)) });
     await expect(runStageOnlyTransaction(otaChanged.mock, otaChanged.input)).rejects.toThrow(/OTA metadata changed/);
     expect(otaChanged.mock.resetNormal).not.toHaveBeenCalled();
+  });
+});
+
+describe('sensitive full partition backups', () => {
+  it('writes restrictive files, records SHA-256 provenance and independently verifies without overwriting', async () => {
+    const dir = await tempDir(); const outputPath = join(dir, 'factory.bin');
+    const result = await createPartitionBackup({ outputPath, label: 'factory', offset: 0x20000, length: bytes.length,
+      chip: { model: 'ESP32-S3', revision: 'v0.2' }, readChunks: oneChunk(bytes), hashLivePartition: async () => sha(bytes) });
+    expect(result).toMatchObject({ format: 'wg1200-partition-backup-v1', sensitive: true, independentReadbackVerified: true,
+      partition: { label: 'factory', offset: 0x20000, length: bytes.length }, sha256: sha(bytes), bytes: bytes.length });
+    expect((await stat(outputPath)).mode & 0o777).toBe(0o600);
+    expect((await stat(`${outputPath}.manifest.json`)).mode & 0o777).toBe(0o600);
+    await expect(createPartitionBackup({ outputPath, label: 'factory', offset: 0x20000, length: bytes.length,
+      chip: { model: 'ESP32-S3', revision: 'v0.2' }, readChunks: oneChunk(bytes), hashLivePartition: async () => sha(bytes) })).rejects.toThrow(/refusing to overwrite/);
+  });
+
+  it('cleans partial files on cancellation or independent readback mismatch', async () => {
+    const dir = await tempDir(); const outputPath = join(dir, 'nvs.bin');
+    const controller = new AbortController();
+    async function* cancelled() { yield bytes.subarray(0, 2); controller.abort(); yield bytes.subarray(2); }
+    await expect(createPartitionBackup({ outputPath, label: 'nvs', offset: 0xf000, length: bytes.length,
+      chip: { model: 'ESP32-S3', revision: null }, readChunks: cancelled(), hashLivePartition: async () => sha(bytes), signal: controller.signal }))
+      .rejects.toThrow(/cancelled/);
+    expect(await readdir(dir)).toEqual([]);
+    await expect(createPartitionBackup({ outputPath, label: 'nvs', offset: 0xf000, length: bytes.length,
+      chip: { model: 'ESP32-S3', revision: null }, readChunks: oneChunk(bytes), hashLivePartition: async () => 'f'.repeat(64) }))
+      .rejects.toThrow(/independent second flash-read/);
+    expect(await readdir(dir)).toEqual([]);
   });
 });
 

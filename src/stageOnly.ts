@@ -24,6 +24,75 @@ export interface InactiveBackupManifest {
   tool: { version: string; gitCommit: string | null; sourceSha256: string | null };
 }
 
+export interface PartitionBackupManifest {
+  format: 'wg1200-partition-backup-v1';
+  createdAt: string;
+  chip: { model: string; revision: string | null };
+  partition: { label: string; offset: number; length: number };
+  backupFile: string;
+  bytes: number;
+  sha256: string;
+  sensitive: true;
+  independentReadbackVerified: true;
+  tool: { version: string; gitCommit: string | null; sourceSha256: string | null };
+}
+
+/** Creates a sensitive full-partition dump; data and manifest are finalized atomically and never overwrite. */
+export async function createPartitionBackup(input: {
+  outputPath: string; label: string; offset: number; length: number;
+  chip: { model: string; revision: string | null }; readChunks: AsyncIterable<Uint8Array>;
+  hashLivePartition: () => Promise<string>; signal?: AbortSignal;
+}): Promise<PartitionBackupManifest> {
+  const outputPath = resolve(input.outputPath);
+  await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
+  const manifestPath = `${outputPath}.manifest.json`;
+  const tag = `.tmp-${randomUUID()}`;
+  const tempOutput = `${outputPath}${tag}`;
+  const tempManifest = `${manifestPath}${tag}`;
+  let outputLinked = false;
+  let manifestLinked = false;
+  try {
+    const handle = await open(tempOutput, 'wx', 0o600);
+    const hash = createHash('sha256');
+    let bytes = 0;
+    try {
+      for await (const chunk of input.readChunks) {
+        if (input.signal?.aborted) throw new Error('Partition backup cancelled; temporary file removed');
+        hash.update(chunk); bytes += chunk.byteLength;
+        let cursor = 0;
+        while (cursor < chunk.byteLength) {
+          const result = await handle.write(chunk, cursor, chunk.byteLength - cursor);
+          if (result.bytesWritten <= 0) throw new Error('partition backup write made no progress');
+          cursor += result.bytesWritten;
+        }
+      }
+      if (input.signal?.aborted) throw new Error('Partition backup cancelled; temporary file removed');
+      if (bytes !== input.length) throw new Error(`partition backup length ${bytes} does not match expected ${input.length}`);
+      await handle.sync();
+    } finally { await handle.close(); }
+    const sha256 = hash.digest('hex');
+    if ((await input.hashLivePartition()).toLowerCase() !== sha256) throw new Error('partition backup SHA-256 does not match independent second flash-read SHA-256');
+    if (input.signal?.aborted) throw new Error('Partition backup cancelled; temporary file removed');
+    const build = getEmbeddedBuildInfo();
+    const manifest: PartitionBackupManifest = { format: 'wg1200-partition-backup-v1', createdAt: new Date().toISOString(), chip: input.chip,
+      partition: { label: input.label, offset: input.offset, length: input.length }, backupFile: basename(outputPath), bytes, sha256,
+      sensitive: true, independentReadbackVerified: true,
+      tool: { version: build.packageVersion, gitCommit: build.gitCommit, sourceSha256: build.sourceSha256 } };
+    const mh = await open(tempManifest, 'wx', 0o600);
+    try { await mh.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'); await mh.sync(); } finally { await mh.close(); }
+    await link(tempOutput, outputPath); outputLinked = true;
+    await link(tempManifest, manifestPath); manifestLinked = true;
+    await unlink(tempOutput); await unlink(tempManifest);
+    return manifest;
+  } catch (error) {
+    await unlink(tempOutput).catch(() => undefined); await unlink(tempManifest).catch(() => undefined);
+    if (manifestLinked) await unlink(manifestPath).catch(() => undefined);
+    if (outputLinked) await unlink(outputPath).catch(() => undefined);
+    if ((error as NodeJS.ErrnoException)?.code === 'EEXIST') throw new Error('Partition backup output or manifest already exists; refusing to overwrite it');
+    throw error;
+  }
+}
+
 export async function hashFileDigests(path: string): Promise<{ sha256: string; md5: string; bytes: number }> {
   const sha256 = createHash('sha256');
   const md5 = createHash('md5');
@@ -171,6 +240,7 @@ export interface StageOnlySummary {
   backupSignatureStatus: 'valid' | 'invalid' | 'not-verified' | 'no-signature' | 'unsupported';
   eraseStart: number; eraseEnd: number; flashEncryption: boolean;
   verificationMode: 'fast' | 'thorough';
+  protectedVerificationMode: 'fast' | 'thorough';
   metadataWillChange: false; autoActivation: false;
 }
 

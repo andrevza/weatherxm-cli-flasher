@@ -78,6 +78,9 @@ describe('stage-only CLI guards', () => {
     const wrong = run('backup', 'factory', '--port', '/dev/null', '--output', '/tmp/not-written.bin');
     expect(wrong.status).not.toBe(0);
     expect(wrong.stderr).toContain('backup requires `backup <active|inactive>');
+    const nonInteractive = run('backup', 'partition', 'factory', '--port', '/dev/null', '--output', '/tmp/wg1200-partition-test.bin');
+    expect(nonInteractive.status).not.toBe(0);
+    expect(nonInteractive.stderr).toContain('interactive terminal for explicit confirmation');
   });
 
   it('accepts active OTA backup selection and validates dedicated firmware command arguments', () => {

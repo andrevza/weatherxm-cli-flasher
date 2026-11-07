@@ -354,6 +354,32 @@ export interface ProtectedRegionSnapshot {
   sha256: string;
 }
 
+export interface StageOnlyRegionDigestSnapshot {
+  readonly name: string;
+  readonly offset: number;
+  readonly size: number;
+  readonly algorithm: 'MD5';
+  readonly digest: string;
+}
+
+export function stageOnlyProtectedRanges(preservedOtaSlot: 'ota_0' | 'ota_1'): Array<{ name: string; offset: number; size: number }> {
+  const ota = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  return [
+    { name: 'bootloader', offset: 0, size: WG1200_CONSTANTS.PARTITION_TABLE.offset },
+    ...PROTECTED_REGIONS.map(({ name, offset, size }) => ({ name, offset, size })),
+    { name: 'preserved_ota', offset: ota.offset, size: ota.size },
+  ];
+}
+
+export function assertCompleteStageOnlyMd5Snapshots(snapshots: readonly StageOnlyRegionDigestSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1'): void {
+  const expected = stageOnlyProtectedRanges(preservedOtaSlot).sort((a, b) => a.name.localeCompare(b.name));
+  const actual = snapshots.map(({ name, offset, size, algorithm, digest }) => {
+    if (algorithm !== 'MD5' || !/^[a-f0-9]{32}$/i.test(digest)) throw new Error(`Protected region '${name}' has an invalid device-side MD5 snapshot`);
+    return { name, offset, size };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Stage-only MD5 verification requires complete, exact protected-region snapshots');
+}
+
 export interface Wg1200Inspection {
   chipName: string;
   macAddress?: string;
@@ -853,6 +879,38 @@ export class Wg1200Transport {
     return snapshots;
   }
 
+  /** Captures device-side MD5 snapshots of every protected range for stage-only Fast mode. */
+  public async snapshotProtectedRegionsMd5(preservedOtaSlot: 'ota_0' | 'ota_1', onRegion?: (snapshot: StageOnlyRegionDigestSnapshot, elapsedMs: number) => void, signal?: AbortSignal): Promise<readonly StageOnlyRegionDigestSnapshot[]> {
+    const snapshots: StageOnlyRegionDigestSnapshot[] = [];
+    for (const target of stageOnlyProtectedRanges(preservedOtaSlot)) {
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
+      const started = performance.now();
+      const digest = await this.md5FlashRegion(target.offset, target.size);
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
+      const snapshot = Object.freeze({ ...target, algorithm: 'MD5' as const, digest });
+      snapshots.push(snapshot);
+      onRegion?.(snapshot, Math.max(0, performance.now() - started));
+    }
+    assertCompleteStageOnlyMd5Snapshots(snapshots, preservedOtaSlot);
+    return Object.freeze(snapshots);
+  }
+
+  /** Rechecks every exact stage-only protected range against its immutable device-side MD5 snapshot. */
+  public async verifyProtectedRegionsMd5(snapshots: readonly StageOnlyRegionDigestSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1', onRegion?: (snapshot: StageOnlyRegionDigestSnapshot, elapsedMs: number) => void, signal?: AbortSignal): Promise<{ valid: boolean; mismatches: string[] }> {
+    assertCompleteStageOnlyMd5Snapshots(snapshots, preservedOtaSlot);
+    const mismatches: string[] = [];
+    for (const snapshot of snapshots) {
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
+      const started = performance.now();
+      const digest = await this.md5FlashRegion(snapshot.offset, snapshot.size);
+      if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
+      const elapsedMs = Math.max(0, performance.now() - started);
+      if (digest !== snapshot.digest) mismatches.push(`Protected region '${snapshot.name}' MD5 changed`);
+      onRegion?.(snapshot, elapsedMs);
+    }
+    return { valid: mismatches.length === 0, mismatches };
+  }
+
   /**
    * Re-reads protected regions and verifies hashes match the pre-flash snapshot.
    */
@@ -937,10 +995,18 @@ export class Wg1200Transport {
 
   /** The stage-only fast path permits device-side MD5 only for the exact inactive ota_0 partition. */
   public async md5InactiveOta0(): Promise<string> {
-    if (!this.loader) throw new Error('Not connected');
     const target = WG1200_CONSTANTS.APP_OTA_0;
+    return this.md5FlashRegion(target.offset, target.size);
+  }
+
+  /** Runs stub SPI_FLASH_MD5 for a validated flash range and rejects malformed responses. */
+  public async md5FlashRegion(offset: number, size: number): Promise<string> {
+    if (!this.loader) throw new Error('Not connected');
     if (!this.loader.IS_STUB) throw new Error('ESP32-S3 RAM stub is unavailable for the supported 16-byte SPI_FLASH_MD5 response');
-    const digest = await this.loader.flashMd5sum(target.offset, target.size);
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size <= 0 || offset + size > WG1200_CONSTANTS.FLASH_SIZE_BYTES) {
+      throw new Error('Invalid SPI_FLASH_MD5 range');
+    }
+    const digest = await this.loader.flashMd5sum(offset, size);
     if (!/^[a-f0-9]{32}$/i.test(digest)) throw new Error('ESP32-S3 SPI_FLASH_MD5 returned an unexpected digest format');
     return digest.toLowerCase();
   }

@@ -1,13 +1,35 @@
 import { describe, expect, it, vi } from 'vitest';
-import { retryExactConfirmation, RegionVerificationMismatch, verifyInactiveBackupFreshness } from '../src/verification.js';
+import { establishProtectedRegionSnapshot, retryExactConfirmation, RegionVerificationMismatch, verifyInactiveBackupFreshness } from '../src/verification.js';
 import { WG1200_CONSTANTS } from '../src/upstream/flasher/constants.js';
-import { Wg1200Transport } from '../src/upstream/flasher/transport.js';
+import { assertCompleteStageOnlyMd5Snapshots, stageOnlyProtectedRanges, Wg1200Transport } from '../src/upstream/flasher/transport.js';
+import { PROTECTED_REGIONS } from '../src/upstream/flasher/constants.js';
 
 const target = WG1200_CONSTANTS.APP_OTA_0;
 const md5 = 'a'.repeat(32);
 const sha256 = 'b'.repeat(64);
 
 describe('stage-only verification modes', () => {
+  it('falls from failed Fast protected MD5 to Thorough before confirmation and never substitutes MD5 for selected Thorough', async () => {
+    const onFallback = vi.fn(); const thoroughSnapshot = vi.fn(async () => ({ sha: sha256 }));
+    const fast = await establishProtectedRegionSnapshot({ mode: 'fast', fastSnapshot: async () => { throw new Error('stub MD5 unsupported'); }, thoroughSnapshot, onFallback });
+    expect(fast).toEqual({ mode: 'thorough', snapshot: { sha: sha256 } });
+    expect(onFallback).toHaveBeenCalledWith('stub MD5 unsupported');
+    const fastSnapshot = vi.fn(async () => md5);
+    const thorough = await establishProtectedRegionSnapshot({ mode: 'thorough', fastSnapshot, thoroughSnapshot });
+    expect(thorough).toEqual({ mode: 'thorough', snapshot: { sha: sha256 } });
+    expect(fastSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('fails closed if Thorough fallback cannot establish a SHA snapshot or cancellation interrupts Fast capture', async () => {
+    await expect(establishProtectedRegionSnapshot({ mode: 'fast', fastSnapshot: async () => { throw new Error('stub unavailable'); },
+      thoroughSnapshot: async () => { throw new Error('physical read failed'); } })).rejects.toThrow('physical read failed');
+    const controller = new AbortController(); controller.abort();
+    const thoroughSnapshot = vi.fn(async () => sha256);
+    await expect(establishProtectedRegionSnapshot({ mode: 'fast', fastSnapshot: async () => md5, thoroughSnapshot, signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(thoroughSnapshot).not.toHaveBeenCalled();
+  });
+
   it('uses device SPI_FLASH_MD5 for exact ota_0 backup freshness and records range and elapsed time', async () => {
     let now = 100;
     const deviceMd5 = vi.fn(async () => md5);
@@ -65,6 +87,35 @@ describe('stage-only verification modes', () => {
 
     (transport as any).loader = { IS_STUB: false, flashMd5sum: vi.fn(async () => md5) };
     await expect(transport.md5InactiveOta0()).rejects.toThrow(/RAM stub is unavailable/);
+  });
+
+  it('covers every protected range, active OTA, bootloader and OTA metadata with exact device MD5 ranges', async () => {
+    const ranges = stageOnlyProtectedRanges('ota_1');
+    expect(ranges).toEqual([{ name: 'bootloader', offset: 0, size: WG1200_CONSTANTS.PARTITION_TABLE.offset },
+      ...PROTECTED_REGIONS.map(({ name, offset, size }) => ({ name, offset, size })),
+      { name: 'preserved_ota', offset: WG1200_CONSTANTS.APP_OTA_1.offset, size: WG1200_CONSTANTS.APP_OTA_1.size }]);
+    const loader = { IS_STUB: true, flashMd5sum: vi.fn(async () => md5) };
+    const transport = new Wg1200Transport(); (transport as any).loader = loader;
+    const snapshots = await transport.snapshotProtectedRegionsMd5('ota_1');
+    expect(snapshots.map(({ name, offset, size }) => ({ name, offset, size }))).toEqual(ranges);
+    expect(loader.flashMd5sum.mock.calls).toEqual(ranges.map(({ offset, size }) => [offset, size]));
+    expect(() => assertCompleteStageOnlyMd5Snapshots(snapshots, 'ota_1')).not.toThrow();
+    expect(() => assertCompleteStageOnlyMd5Snapshots(snapshots.slice(1), 'ota_1')).toThrow(/complete, exact/);
+    expect(Object.isFrozen(snapshots)).toBe(true); expect(Object.isFrozen(snapshots[0])).toBe(true);
+  });
+
+  it('detects a protected-region digest mismatch and rejects malformed MD5 responses', async () => {
+    const transport = new Wg1200Transport();
+    const ranges = stageOnlyProtectedRanges('ota_1');
+    const before = ranges.map((region) => Object.freeze({ ...region, algorithm: 'MD5' as const, digest: md5 }));
+    let call = 0;
+    (transport as any).loader = { IS_STUB: true, flashMd5sum: vi.fn(async () => (++call === 3 ? 'f'.repeat(32) : md5)) };
+    const result = await transport.verifyProtectedRegionsMd5(before, 'ota_1');
+    expect(result.valid).toBe(false); expect(result.mismatches).toEqual([`Protected region '${before[2].name}' MD5 changed`]);
+    (transport as any).loader = { IS_STUB: true, flashMd5sum: vi.fn(async () => 'not-md5') };
+    await expect(transport.snapshotProtectedRegionsMd5('ota_1')).rejects.toThrow(/unexpected digest format/);
+    (transport as any).loader = { IS_STUB: false, flashMd5sum: vi.fn(async () => md5) };
+    await expect(transport.snapshotProtectedRegionsMd5('ota_1')).rejects.toThrow(/RAM stub is unavailable/);
   });
 });
 

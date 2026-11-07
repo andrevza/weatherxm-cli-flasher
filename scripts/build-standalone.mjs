@@ -50,6 +50,9 @@ if (!existsSync(addonPath)) {
 
 const distDir = resolve(root, 'dist');
 mkdirSync(distDir, { recursive: true });
+const outputPath = process.env.WG1200_STANDALONE_OUTPUT_FILE
+  ? resolve(process.env.WG1200_STANDALONE_OUTPUT_FILE)
+  : resolve(distDir, output.name);
 const sourceFiles = [];
 const collectSourceFiles = (dir) => {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -73,7 +76,7 @@ const buildMetadata = JSON.stringify({ packageVersion: JSON.parse(readFileSync(r
   gitDirty,
 });
 const workDir = mkdtempSync(join(distDir, '.sea-build-'));
-const executable = join(distDir, output.name);
+const executable = outputPath;
 const stagedExecutable = join(workDir, output.name);
 const mainPath = join(workDir, 'main.cjs');
 const seaConfigPath = join(workDir, 'sea-config.json');

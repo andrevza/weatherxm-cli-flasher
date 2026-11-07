@@ -41,6 +41,7 @@ describe('standalone executable packaging', () => {
     expect(help).toContain('check <firmware>');
     expect(help).toContain('monitor');
     expect(help).toContain('backup active|inactive');
+    expect(help).toContain('backup partition <name>');
     expect(help).toContain('firmware download');
     expect(help).toContain('firmware compare');
     expect(help).toContain('--stage-only');

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { assertCompleteProtectedRegionSnapshots, type Wg1200Inspection, type Wg1200Transport } from './upstream/flasher/transport.js';
+import { assertCompleteProtectedRegionSnapshots, stageOnlyProtectedRanges, type StageOnlyRegionDigestSnapshot, type Wg1200Inspection, type Wg1200Transport } from './upstream/flasher/transport.js';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
 import { EXPECTED_WG1200_PARTITIONS, parsePartitionTableWithMetadata } from './upstream/flasher/partitions.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
@@ -13,12 +13,12 @@ import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from 
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
 import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
 import { compareSecureBootTrust, verifySecureBootV2Image, type SecureBootDeviceState, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
-import { createInactiveBackup, validateInactiveBackup, runStageOnlyTransaction, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
+import { createInactiveBackup, createPartitionBackup, validateInactiveBackup, runStageOnlyTransaction, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
 import { getApplicationEraseRange } from './upstream/flasher/writeGuard.js';
 import { DEFAULT_MANIFEST_URL } from './catalog.js';
 import { getOfficialFirmware, type FirmwareProgress } from './firmwareStore.js';
 import type { ProgressReporter } from './progress.js';
-import { ConfirmationCancelledError, RegionVerificationMismatch, verifyInactiveBackupFreshness, type RegionVerificationRecord, type VerificationMode } from './verification.js';
+import { ConfirmationCancelledError, establishProtectedRegionSnapshot, RegionVerificationMismatch, verifyInactiveBackupFreshness, type ProtectedRegionVerificationRecord, type RegionVerificationRecord, type VerificationMode } from './verification.js';
 
 export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
@@ -159,6 +159,39 @@ export async function backupInactiveOta(options: DeviceOptions & { outputPath: s
   } finally { options.progress?.stage('Returning gateway to normal boot'); await disconnectAndReport(transport, options.progress); }
 }
 
+/** Explicit full-partition read-only backup; every supported dump is treated as sensitive. */
+export async function backupDiscoveredPartition(options: DeviceOptions & { outputPath: string; label: string }): Promise<{ manifest: Awaited<ReturnType<typeof createPartitionBackup>>; manifestPath: string }> {
+  const expected = EXPECTED_WG1200_PARTITIONS[options.label];
+  if (!expected) throw new Error(`BACKUP FAILED: partition '${options.label}' is not on the WG1200 allowlist`);
+  const port = new NodeSerialPort(options.portPath, options.traceSerial ? (message) => diagnostic(options.progress, `[serial] ${message}`) : undefined);
+  const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
+  try {
+    options.progress?.stage('Connecting to ROM and initializing flash reader');
+    const inspection = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete', 'ROM stub ready');
+    assertSafeInspection(inspection, await exactLayoutErrors(transport));
+    const found = inspection.partitions[options.label];
+    if (!found || found.label !== options.label || found.offset !== expected.offset || found.size !== expected.size ||
+        found.type !== expected.type || found.subtype !== expected.subtype) {
+      throw new Error(`BACKUP FAILED: selected '${options.label}' is not the exact discovered allowlisted partition`);
+    }
+    options.progress?.log(`Sensitive device-specific backup: ${options.label}; protect the file and manifest before sharing.`);
+    const security = await transport.readSecureBootConfiguration();
+    options.progress?.stage(`Reading complete ${options.label} partition`, found.size);
+    const manifest = await createPartitionBackup({ outputPath: options.outputPath, label: options.label, offset: found.offset, length: found.size,
+      chip: { model: security.chip.model, revision: security.chip.revision },
+      readChunks: transport.readRegionChunks(found.offset, found.size, (done, total) => options.progress?.bytes(done, total), options.signal),
+      signal: options.signal,
+      hashLivePartition: () => {
+        options.progress?.stage(`Independently verifying ${options.label} with full physical SHA-256`, found.size);
+        return transport.hashRegionSha256(found.offset, found.size, (done, total) => options.progress?.bytes(done, total), options.signal);
+      } });
+    options.progress?.finish('complete', 'backup and independent physical readback verified');
+    return { manifest, manifestPath: `${options.outputPath}.manifest.json` };
+  } finally { options.progress?.stage('Returning gateway to normal boot'); await disconnectAndReport(transport, options.progress); }
+}
+
 /** First physical stage-only operation: writes only ota_0 and never commits OTA metadata. */
 export type StageOnlyBackupDecision =
   | { choice: 'create'; outputPath: string }
@@ -177,11 +210,12 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   targetRange: { start: number; end: number }; eraseRange: { start: number; end: number };
   backupSha256: string; otaMetadataUnchanged: true; activeApplicationUnchanged: true;
   protectedRegionsUnchanged: true; automaticActivation: false; verificationMode: VerificationMode;
+  protectedVerificationMode: VerificationMode; protectedRegionChecks: ProtectedRegionVerificationRecord[];
   backupFreshnessChecks: RegionVerificationRecord[];
 }> {
   const verificationMode = options.verificationMode ?? 'fast';
   const backupFreshnessChecks: RegionVerificationRecord[] = [];
-  options.progress?.log(`Verification mode: ${verificationMode.toUpperCase()}. Device-side MD5 is a routine equality check, not cryptographic authentication; firmware signature/SHA-256 and protected-region SHA-256 checks remain mandatory.`);
+  options.progress?.log(`Verification mode: ${verificationMode.toUpperCase()}. Device-side MD5 is a routine equality check, not cryptographic authentication; firmware signature/SHA-256 and independent post-write firmware SHA-256 remain mandatory.`);
   options.progress?.stage('Retrieving and verifying official firmware', undefined, 'checking persistent cache and official manifest');
   const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL, {
     progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
@@ -266,15 +300,47 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     if (metadataState.isAmbiguous || metadataState.activeSlot !== 'ota_1' || metadataState.targetSlot !== 'ota_0' || metadataState.targetOffset !== target.offset) {
       throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: raw OTA metadata does not confirm active ota_1 and inactive ota_0');
     }
-    options.progress?.stage('Hashing protected partitions and active ota_1');
-    const protectedSnapshots = await transport.snapshotProtectedRegions('ota_1', (name, done, total) => {
-      options.progress?.event({ stage: `Hashing protected ${name}`, completed: done, total });
-    }, options.signal);
-    options.progress?.finish('complete');
-    options.progress?.stage('Hashing bootloader and partition table', WG1200_CONSTANTS.PARTITION_TABLE.offset);
-    const bootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => options.progress?.bytes(done, total), options.signal);
-    throwIfAborted(options.signal);
-    options.progress?.finish('complete');
+    let md5ProtectedSnapshots: readonly StageOnlyRegionDigestSnapshot[] | undefined;
+    let protectedSnapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>> | undefined;
+    let bootloaderHash: string | undefined;
+    options.progress?.stage(verificationMode === 'fast' ? 'Capturing protected-region device-side MD5 snapshots' : 'Hashing protected regions with physical SHA-256');
+    const protectedCapture = await establishProtectedRegionSnapshot({ mode: verificationMode,
+      fastSnapshot: () => transport.snapshotProtectedRegionsMd5('ota_1', (snapshot, elapsedMs) => {
+        options.progress?.log(`Protected ${snapshot.name}: MD5 SNAPSHOT @ 0x${snapshot.offset.toString(16)} length ${snapshot.size} (${(elapsedMs / 1000).toFixed(1)}s)`);
+      }, options.signal),
+      thoroughSnapshot: async () => {
+        options.progress?.stage('Hashing protected partitions and active ota_1 with physical SHA-256');
+        const snapshots = await transport.snapshotProtectedRegions('ota_1', (name, done, total) => {
+          options.progress?.event({ stage: `Physical SHA-256 snapshot ${name}`, completed: done, total });
+        }, options.signal);
+        options.progress?.finish('complete');
+        options.progress?.stage('Hashing bootloader with physical SHA-256', WG1200_CONSTANTS.PARTITION_TABLE.offset);
+        const hash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => options.progress?.bytes(done, total), options.signal);
+        throwIfAborted(options.signal);
+        options.progress?.finish('complete');
+        return { snapshots, bootloaderHash: hash };
+      },
+      signal: options.signal,
+      onFallback: (reason) => options.progress?.log(`Fast protected-region MD5 unavailable (${reason}); falling back to full physical SHA-256 snapshots before confirmation.`),
+    });
+    const protectedVerificationMode = protectedCapture.mode;
+    if (protectedCapture.mode === 'fast') {
+      md5ProtectedSnapshots = protectedCapture.snapshot;
+      options.progress?.finish('complete', `${md5ProtectedSnapshots.length} exact protected regions captured by device-side MD5`);
+    } else {
+      protectedSnapshots = protectedCapture.snapshot.snapshots;
+      bootloaderHash = protectedCapture.snapshot.bootloaderHash;
+    }
+    if (!md5ProtectedSnapshots && !protectedSnapshots) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: protected-region snapshot was not established');
+    const protectedRegionChecks: ProtectedRegionVerificationRecord[] = stageOnlyProtectedRanges('ota_1').map((region) => ({
+      name: region.name, address: region.offset, length: region.size,
+      algorithm: protectedVerificationMode === 'fast' ? 'MD5' : region.name === 'otadata' ? 'byte-for-byte' : 'SHA-256',
+      method: 'physical flash read' as const,
+      snapshot: 'SNAPSHOT' as const, postWrite: 'MATCH' as const,
+    }));
+    for (const check of protectedRegionChecks) {
+      if (protectedVerificationMode === 'fast') check.method = 'device-side SPI_FLASH_MD5';
+    }
     const eraseRange = getApplicationEraseRange(target.offset, selected.verified.data.byteLength);
     const summary: StageOnlySummary = {
       deviceModel: security.chip.model, deviceName: before.deviceName ?? 'WeatherXM WG1200', activeSlot: 'ota_1', activeFirmware: before.currentFirmware?.version ?? null,
@@ -284,13 +350,12 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       backupFirmwareVersion: backup.manifest.firmwareVersion,
       backupSignatureStatus: backup.manifest.signatureVerification.status,
       eraseStart: eraseRange.start, eraseEnd: eraseRange.end, flashEncryption: security.flashEncryption.enabled === true,
-      verificationMode,
+      verificationMode, protectedVerificationMode,
       metadataWillChange: false, autoActivation: false,
     };
     const confirmed = await options.confirm(summary);
     throwIfAborted(options.signal);
     if (!confirmed) throw new Error('STAGING BLOCKED — OPERATOR DECLINED: confirmation was not accepted; no write was started');
-    const shaReadback = async (offset: number, length: number) => transport.hashRegionSha256(offset, length);
     const transaction = await runStageOnlyTransaction({
       revalidate: async () => {
         options.progress?.stage('Revalidating device immediately before write');
@@ -302,10 +367,17 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
         const currentOtadata = await transport.readOtadataSnapshot();
         if (!Buffer.from(currentOtadata).equals(Buffer.from(otadataBefore))) return false;
         await verifyBackupFreshness();
-        if ((await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset)) !== bootloaderHash) return false;
-        const valid = (await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1', (name, done, total) => {
+        if (protectedVerificationMode === 'fast') {
+          const result = await transport.verifyProtectedRegionsMd5(md5ProtectedSnapshots!, 'ota_1', (snapshot, elapsedMs) => {
+            options.progress?.log(`Rechecked protected ${snapshot.name}: MD5 ${elapsedMs.toFixed(0)} ms`);
+          }, options.signal);
+          options.progress?.finish(result.valid ? 'complete' : 'failed', result.mismatches.join('; '));
+          return result.valid;
+        }
+        if ((await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, undefined, options.signal)) !== bootloaderHash) return false;
+        const valid = (await transport.verifyProtectedRegions(protectedSnapshots!, 'ota_1', (name, done, total) => {
           options.progress?.event({ stage: `Rechecking ${name}`, completed: done, total });
-        })).valid;
+        }, options.signal)).valid;
         options.progress?.finish('complete');
         return valid;
       },
@@ -329,14 +401,21 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       },
       verifyProtected: async () => {
         options.progress?.stage('Verifying preserved partitions');
-        const checked = await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1', (name, done, total) => {
+        if (protectedVerificationMode === 'fast') {
+          const checked = await transport.verifyProtectedRegionsMd5(md5ProtectedSnapshots!, 'ota_1', (snapshot, elapsedMs) => {
+            options.progress?.log(`Verified protected ${snapshot.name}: MD5 ${elapsedMs.toFixed(0)} ms`);
+          }, options.signal);
+          options.progress?.finish(checked.valid ? 'complete' : 'failed', checked.mismatches.join('; '));
+          return checked;
+        }
+        const checked = await transport.verifyProtectedRegions(protectedSnapshots!, 'ota_1', (name, done, total) => {
           options.progress?.event({ stage: `Verifying preserved ${name}`, completed: done, total });
-        });
+        }, options.signal);
         const currentBootloaderHash = await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset, (done, total) => {
           options.progress?.event({ stage: 'Verifying bootloader and partition table', completed: done, total });
-        });
+        }, options.signal);
         options.progress?.finish(checked.valid && currentBootloaderHash === bootloaderHash ? 'complete' : 'failed');
-        return currentBootloaderHash === bootloaderHash ? checked : { valid: false, mismatches: ['bootloader region changed'] };
+        return currentBootloaderHash === bootloaderHash ? checked : { valid: false, mismatches: ['Protected region \'bootloader\' changed'] };
       },
       readOtadata: async () => {
         options.progress?.stage('Comparing OTA metadata byte-for-byte', WG1200_CONSTANTS.OTADATA.size);
@@ -363,7 +442,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       expectedMd5: transaction.expectedMd5, hardwareMd5Verified: transaction.hardwareMd5Verified, bytesRead: transaction.bytesRead,
       targetRange: transaction.range, eraseRange: { start: eraseRange.start, end: eraseRange.end },
       backupSha256: backup.manifest.sha256, otaMetadataUnchanged: true, activeApplicationUnchanged: true,
-      protectedRegionsUnchanged: true, automaticActivation: false, verificationMode, backupFreshnessChecks };
+      protectedRegionsUnchanged: true, automaticActivation: false, verificationMode, protectedVerificationMode, protectedRegionChecks, backupFreshnessChecks };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const kind = error instanceof Error && (error.name === 'AbortError' || error instanceof ConfirmationCancelledError) ? 'operator_cancelled'
