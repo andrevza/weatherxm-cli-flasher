@@ -217,7 +217,7 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
 export async function commitOtaActivationTransaction(input: {
   before: Uint8Array; plan: OtaActivationPlan;
   transport: { readOtadataSnapshot(): Promise<Uint8Array>; writeOtaSelectSector(address: number, bytes: Uint8Array, sequence: number, before: Uint8Array): Promise<void> };
-  confirm(): Promise<boolean>; signal?: AbortSignal;
+  confirm(): Promise<boolean>; signal?: AbortSignal; onConfirmationAccepted?: () => void; onWriteStart?: () => void;
 }): Promise<{ metadata: OtaMetadataAnalysis; address: number; sequence: number; bytesWritten: 4096 }> {
   if (input.plan.blockers.length) throw new Error(`Activation blocked: ${input.plan.blockers.join(' ')}`);
   const { sectorAddress: address, sequence } = input.plan.proposedUpdate;
@@ -226,6 +226,7 @@ export async function commitOtaActivationTransaction(input: {
     throw new Error('Activation plan has an invalid or non-sector write range');
   }
   if (!(await input.confirm())) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
+  input.onConfirmationAccepted?.();
   if (input.signal?.aborted) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
   const live = await input.transport.readOtadataSnapshot();
   if (live.byteLength !== input.before.byteLength || !live.every((byte, index) => byte === input.before[index])) {
@@ -234,7 +235,9 @@ export async function commitOtaActivationTransaction(input: {
   const sectorIndex = address === WG1200_CONSTANTS.OTADATA.offset ? 0 : address === WG1200_CONSTANTS.OTADATA.offset + 4096 ? 1 : -1;
   if (sectorIndex < 0) throw new Error('Activation address is outside the two OTA metadata sectors');
   const payload = buildTransactionalOtadataSector(sequence, sectorIndex as 0 | 1);
-  await input.transport.writeOtaSelectSector(address, payload.sectorData, sequence, input.before);
+  const write = input.transport.writeOtaSelectSector(address, payload.sectorData, sequence, input.before);
+  input.onWriteStart?.();
+  await write;
   const metadata = analyzeOtaMetadata(await input.transport.readOtadataSnapshot(), { factoryPresent: true });
   if (metadata.selectedByMetadata !== input.plan.target || metadata.selectedSequence !== sequence) {
     throw new Error('Metadata readback did not select the requested OTA slot and sequence');

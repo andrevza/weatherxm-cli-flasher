@@ -18,6 +18,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 import { bindAbortOnSigint } from './interrupt.js';
 import type { VerificationMode } from './verification.js';
 import { ConfirmationCancelledError, retryExactConfirmation } from './verification.js';
+import { confirmWithSuspendedProgress } from './operatorConfirmation.js';
 import { activateOtaSlot, backupOtaMetadata, dryRunOtaActivation, readOtaStatus, restoreOtaMetadata } from './otaDevice.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
@@ -351,9 +352,9 @@ async function main() {
           metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal, bootLogSeconds: args.bootLogSeconds,
           confirm: async (plan) => {
             const phrase = `RESTORE OTA TARGET ${plan.target} SEQUENCE ${plan.sequence}`;
-            progress.log(`High-risk recovery. Type exactly: ${phrase}`);
-            return retryExactConfirmation({ phrase,
-              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Confirm emergency metadata recovery (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
+            return confirmWithSuspendedProgress({ phrase, progress, promptIntro: `High-risk recovery. Type exactly: ${phrase}`,
+              acceptedMessage: 'Confirmation accepted.\nBeginning emergency OTA metadata restoration...',
+              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Waiting for confirmation: type the exact phrase and press Enter (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
               askRetry: async () => { const rl = createInterface({ input: stdin, output: stdout }); try { const v = (await rl.question('1) Retry  2) Cancel [1]: ', { signal: cancellation.signal })).trim(); return v === '' || v === '1' ? 'retry' : 'cancel'; } finally { rl.close(); } },
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no flash write has started.`),
             });
@@ -373,9 +374,8 @@ async function main() {
           target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal,
           bootLogSeconds: args.bootLogSeconds, verificationMode: args.verifyMode ?? 'fast', offline: args.offline, cacheDirectory: args.cacheDirectory, confirm: async (plan) => {
             const phrase = `ACTIVATE ${plan.target} SEQUENCE ${plan.proposedUpdate.sequence}`;
-            progress.log(`Type exactly: ${phrase}`);
-            return retryExactConfirmation({ phrase,
-              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Confirm OTA metadata update (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
+            return confirmWithSuspendedProgress({ phrase, progress, promptIntro: `Type exactly: ${phrase}`,
+              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Waiting for confirmation: type the exact phrase and press Enter (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
               askRetry: async () => { const rl = createInterface({ input: stdin, output: stdout }); try { const v = (await rl.question('1) Retry  2) Cancel [1]: ', { signal: cancellation.signal })).trim(); return v === '' || v === '1' ? 'retry' : 'cancel'; } finally { rl.close(); } },
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no metadata write has started.`),
             });

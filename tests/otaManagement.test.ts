@@ -1,7 +1,7 @@
 import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, validateOtaMetadataBackup } from '../src/otaManagement.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
 import { ProgressReporter } from '../src/progress.js';
@@ -94,6 +94,36 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
     expect(live.subarray(4096)).toEqual(before.subarray(4096));
     expect(new DataView(writes[0]!.bytes.buffer).getUint32(24, true)).toBe(ESP_OTA_IMG_VALID);
     expect(new DataView(writes[0]!.bytes.buffer).getUint32(28, true)).toBe(calculateOtaSeqCrc32(5));
+  });
+  it('does not enter the metadata writer while confirmation is still waiting, and tests writer timeout separately', async () => {
+    const before = snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]);
+    const analysis = analyzeOtaMetadata(before, { factoryPresent: true });
+    const plan = planOtaActivation({ analysis, target: 'ota_0', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    let finishConfirmation!: (accepted: boolean) => void;
+    const writes: number[] = []; const accepted = vi.fn(); const writeStarted = vi.fn();
+    const transport = { readOtadataSnapshot: async () => before,
+      writeOtaSelectSector: async () => { writes.push(1); } };
+    const pending = commitOtaActivationTransaction({ before, plan, transport,
+      confirm: () => new Promise<boolean>((resolve) => { finishConfirmation = resolve; }), onConfirmationAccepted: accepted, onWriteStart: writeStarted });
+    await Promise.resolve();
+    expect(writes).toEqual([]);
+    expect(accepted).not.toHaveBeenCalled();
+    expect(writeStarted).not.toHaveBeenCalled();
+    finishConfirmation(false);
+    await expect(pending).rejects.toThrow(/cancelled before metadata write/);
+    expect(writes).toEqual([]);
+
+    const timeout = new Error('simulated metadata transport timeout');
+    const writerOrder: string[] = [];
+    const timedOut = commitOtaActivationTransaction({ before, plan,
+      transport: { readOtadataSnapshot: async () => before, writeOtaSelectSector: async () => { writerOrder.push('writer-entered'); throw timeout; } },
+      confirm: async () => true, onConfirmationAccepted: accepted, onWriteStart: () => { writerOrder.push('progress-write-stage'); writeStarted(); } });
+    await expect(timedOut).rejects.toBe(timeout);
+    expect(accepted).toHaveBeenCalledOnce();
+    expect(writeStarted).toHaveBeenCalledOnce();
+    expect(writerOrder).toEqual(['writer-entered', 'progress-write-stage']);
   });
   it('plans emergency recovery as a first-valid-sector transaction and preserves a viable peer', () => {
     const live = analyzeOtaMetadata(snapshot([{ seq: 5, state: ESP_OTA_IMG_INVALID }, { seq: 4, state: ESP_OTA_IMG_ABORTED }]), { factoryPresent: true });

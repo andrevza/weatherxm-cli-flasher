@@ -72,12 +72,14 @@ export function formatProgressLine(snapshot: ProgressSnapshot, tty = false, widt
 export class OutputCoordinator {
   private activeTtyLine = false;
   private lastProgress = '';
+  private suspended = false;
 
   constructor(private readonly options: { write: (text: string) => void; tty: boolean; width?: () => number }) {}
 
   progress(text: string): void {
     if (text === this.lastProgress && (this.activeTtyLine || !this.options.tty)) return;
     this.lastProgress = text;
+    if (this.suspended) return;
     if (!this.options.tty) { this.options.write(`${text}\n`); return; }
     this.options.write(`\r\u001b[2K${text}`);
     this.activeTtyLine = true;
@@ -85,6 +87,7 @@ export class OutputCoordinator {
 
   finishProgress(text: string): void {
     this.lastProgress = '';
+    if (this.suspended) { this.activeTtyLine = false; return; }
     if (this.options.tty && this.activeTtyLine) this.options.write('\r\u001b[2K');
     this.activeTtyLine = false;
     const width = Math.max(20, this.options.width?.() ?? 100);
@@ -93,7 +96,7 @@ export class OutputCoordinator {
   }
 
   log(message: string): void {
-    const resume = this.options.tty && this.activeTtyLine;
+    const resume = !this.suspended && this.options.tty && this.activeTtyLine;
     if (resume) this.options.write('\r\u001b[2K');
     this.activeTtyLine = false;
     const clean = String(message).replaceAll('\r', '').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
@@ -106,6 +109,15 @@ export class OutputCoordinator {
       this.activeTtyLine = true;
     }
   }
+
+  suspend(): void {
+    if (this.suspended) return;
+    if (this.options.tty && this.activeTtyLine) this.options.write('\r\u001b[2K');
+    this.activeTtyLine = false;
+    this.suspended = true;
+  }
+
+  resume(): void { this.suspended = false; }
 }
 
 /** Progress reports use only completed bytes and share the diagnostic output coordinator. */
@@ -119,6 +131,8 @@ export class ProgressReporter {
   private lastRenderAt = 0;
   private lastRendered = '';
   private timer: ReturnType<typeof setInterval> | undefined;
+  private suspended = false;
+  private resumeTimer = false;
 
   constructor(private readonly options: {
     write?: (text: string) => void; coordinator?: OutputCoordinator; tty: boolean; now?: () => number;
@@ -184,6 +198,29 @@ export class ProgressReporter {
 
   close(): void { this.finishCurrent('complete', true); }
 
+  /** Stops terminal updates while readline owns the interactive terminal. */
+  suspend(): void {
+    if (this.suspended) return;
+    this.suspended = true;
+    this.resumeTimer = Boolean(this.timer);
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    this.options.coordinator?.suspend();
+  }
+
+  /** Restores progress after the prompt has completed; a fresh stage redraws cleanly. */
+  resume(): void {
+    if (!this.suspended) return;
+    this.suspended = false;
+    this.options.coordinator?.resume();
+    if (this.resumeTimer && this.current?.state === 'running') {
+      this.timer = setInterval(() => this.render(this.now(), true), this.options.intervalMs ?? 1000);
+      this.timer.unref?.();
+      this.render(this.now(), true);
+    }
+    this.resumeTimer = false;
+  }
+
   private finishCurrent(state: 'complete' | 'failed' | 'cancelled', render: boolean): void {
     if (!this.current) return;
     if (this.timer) clearInterval(this.timer);
@@ -202,7 +239,7 @@ export class ProgressReporter {
   }
 
   private render(now: number, heartbeat: boolean): void {
-    if (!this.current) return;
+    if (!this.current || this.suspended) return;
     const interval = this.options.intervalMs ?? 1000;
     const minimumUpdateInterval = this.options.tty ? 250 : interval;
     if (!heartbeat && now - this.lastRenderAt < minimumUpdateInterval) return;

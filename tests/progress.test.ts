@@ -157,4 +157,21 @@ describe('progress accounting and rendering', () => {
     expect(stderr.join('')).toContain('[esptool] connected\n');
     expect(stderr.join('')).not.toContain('\u001b');
   });
+
+  it('suspends active TTY progress without restoring over readline input, then resumes on a fresh stage', () => {
+    const output: string[] = [];
+    const coordinator = new OutputCoordinator({ write: (text) => output.push(text), tty: true, width: () => 100 });
+    const reporter = new ProgressReporter({ coordinator, tty: true, intervalMs: 10, now: () => 0 });
+    reporter.stage('Pre-confirmation verification', 100);
+    reporter.suspend();
+    reporter.log('Waiting for confirmation');
+    reporter.status('this progress update must stay hidden');
+    const duringPrompt = output.join('');
+    expect(duringPrompt).toContain('Waiting for confirmation\n');
+    expect(duringPrompt).not.toContain('this progress update must stay hidden');
+    reporter.resume();
+    reporter.stage('Writing OTA metadata sector', 4096);
+    expect(output.join('')).toContain('Writing OTA metadata sector');
+    reporter.finish('cancelled');
+  });
 });

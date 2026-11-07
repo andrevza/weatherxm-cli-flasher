@@ -331,8 +331,9 @@ export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0'
     if (plan.blockers.length) throw new Error(`Activation blocked: ${plan.blockers.join(' ')}`);
     options.progress?.log(`OTA ACTIVATION PLAN\nCurrent slot (metadata): ${prepared.analysis.selectedByMetadata}\nTarget slot: ${options.target}\nCurrent sequence: ${prepared.analysis.selectedSequence}\nProposed sequence: ${plan.proposedUpdate.sequence}\nTarget metadata sector address: 0x${plan.proposedUpdate.sectorAddress!.toString(16)}\nWrite length: 4096 bytes\nSource firmware SHA-256: VERIFIED\nSource Secure Boot signature: VERIFIED\nTarget on-chip MD5: MATCH\nRecovery on-chip MD5: MATCH\nDevice signer trust: ${prepared.trust.result}${plan.verification?.unknownTrustQualified ? ' (UNKNOWN qualified by same selected-device recovery image evidence)' : ''}\nTarget full physical SHA-256: ${prepared.physicalSha256 ? 'VERIFIED' : 'not calculated in FAST mode'}\nMetadata backup: VERIFIED\nApplication partitions, NVS, factory, bootloader, and partition table: UNCHANGED`);
     const destinationAddress = plan.proposedUpdate.sectorAddress!;
-    options.progress?.stage(`Writing OTA metadata sector at 0x${destinationAddress.toString(16)}`, 4096);
-    const committed = await commitOtaActivationTransaction({ before: raw, plan, transport, confirm: () => options.confirm(plan), signal: options.signal });
+    const committed = await commitOtaActivationTransaction({ before: raw, plan, transport, confirm: () => options.confirm(plan), signal: options.signal,
+      onConfirmationAccepted: () => options.progress?.stage('Revalidating OTA metadata after confirmation'),
+      onWriteStart: () => options.progress?.stage(`Writing OTA metadata sector at 0x${destinationAddress.toString(16)}`, 4096) });
     captureResetAfterOpen = true;
     options.progress?.bytes(4096, 4096);
     options.progress?.finish('complete', 'exact 4096-byte inactive metadata sector independently read back');
