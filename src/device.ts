@@ -18,6 +18,7 @@ import { getApplicationEraseRange } from './upstream/flasher/writeGuard.js';
 import { DEFAULT_MANIFEST_URL } from './catalog.js';
 import { getOfficialFirmware, type FirmwareProgress } from './firmwareStore.js';
 import type { ProgressReporter } from './progress.js';
+import { ConfirmationCancelledError, RegionVerificationMismatch, verifyInactiveBackupFreshness, type RegionVerificationRecord, type VerificationMode } from './verification.js';
 
 export const STAGE_ONLY_WXM_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb';
 
@@ -166,6 +167,7 @@ export type StageOnlyBackupDecision =
 
 export async function stageOnlyFirmware(options: DeviceOptions & {
   backupManifestPath?: string;
+  verificationMode?: VerificationMode;
   chooseBackup?: (details: { targetSlot: 'ota_0'; targetOffset: number; targetLength: number; existingFirmware: string | null }) => Promise<StageOnlyBackupDecision>;
   confirm: (summary: StageOnlySummary) => Promise<boolean>;
 }): Promise<{
@@ -174,8 +176,12 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
   firmwareSha256: string; actualSha256: string; expectedMd5: string; hardwareMd5Verified: true; bytesRead: number;
   targetRange: { start: number; end: number }; eraseRange: { start: number; end: number };
   backupSha256: string; otaMetadataUnchanged: true; activeApplicationUnchanged: true;
-  protectedRegionsUnchanged: true; automaticActivation: false;
+  protectedRegionsUnchanged: true; automaticActivation: false; verificationMode: VerificationMode;
+  backupFreshnessChecks: RegionVerificationRecord[];
 }> {
+  const verificationMode = options.verificationMode ?? 'fast';
+  const backupFreshnessChecks: RegionVerificationRecord[] = [];
+  options.progress?.log(`Verification mode: ${verificationMode.toUpperCase()}. Device-side MD5 is a routine equality check, not cryptographic authentication; firmware signature/SHA-256 and protected-region SHA-256 checks remain mandatory.`);
   options.progress?.stage('Retrieving and verifying official firmware', undefined, 'checking persistent cache and official manifest');
   const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL, {
     progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
@@ -230,11 +236,29 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     if (!backupManifestPath) throw new Error('STAGING BLOCKED — BACKUP REQUIRED: create a new backup or provide a verified backup manifest');
     const backup = await validateInactiveBackup(backupManifestPath, { label: 'ota_0', offset: target.offset, length: target.size });
     throwIfAborted(options.signal);
-    options.progress?.stage('Verifying backup freshness against live ota_0', target.size);
-    const liveBackupHash = await transport.hashRegionSha256(target.offset, target.size, (done, total) => options.progress?.bytes(done, total), options.signal);
+    const verifyBackupFreshness = async () => {
+      options.progress?.stage(verificationMode === 'fast' ? 'Checking ota_0 backup freshness with device-side MD5' : 'Checking ota_0 backup freshness with physical SHA-256 read', target.size);
+      try {
+        const result = await verifyInactiveBackupFreshness({ mode: verificationMode, address: target.offset, length: target.size,
+          expectedMd5: backup.backupMd5, expectedSha256: backup.manifest.sha256,
+          deviceMd5: () => transport.md5InactiveOta0(),
+          readSha256: () => transport.hashRegionSha256(target.offset, target.size, (done, total) => options.progress?.bytes(done, total), options.signal),
+          signal: options.signal,
+          onFallback: (reason) => {
+            options.progress?.log(`Fast verification unavailable (${reason}); falling back to a full physical SHA-256 read of ota_0.`);
+            options.progress?.stage('Fallback: reading complete ota_0 for physical SHA-256', target.size);
+          },
+        });
+        backupFreshnessChecks.push(result);
+        options.progress?.finish('complete', `${result.method}; ${result.algorithm} MATCH @ 0x${result.address.toString(16)} length ${result.length}; ${(result.elapsedMs / 1000).toFixed(1)}s`);
+        return true;
+      } catch (error) {
+        if (error instanceof RegionVerificationMismatch) throw new Error(`STAGING BLOCKED — BACKUP INVALID: ${error.message}`);
+        throw error;
+      }
+    };
+    await verifyBackupFreshness();
     throwIfAborted(options.signal);
-    options.progress?.finish('complete');
-    if (liveBackupHash.toLowerCase() !== backup.manifest.sha256.toLowerCase()) throw new Error('STAGING BLOCKED — BACKUP INVALID: live ota_0 no longer matches the verified backup');
 
     const otadataBefore = await transport.readOtadataSnapshot();
     if (otadataBefore.byteLength !== WG1200_CONSTANTS.OTADATA.size) throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: incomplete OTA metadata snapshot');
@@ -260,6 +284,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       backupFirmwareVersion: backup.manifest.firmwareVersion,
       backupSignatureStatus: backup.manifest.signatureVerification.status,
       eraseStart: eraseRange.start, eraseEnd: eraseRange.end, flashEncryption: security.flashEncryption.enabled === true,
+      verificationMode,
       metadataWillChange: false, autoActivation: false,
     };
     const confirmed = await options.confirm(summary);
@@ -276,7 +301,7 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
             fresh.otadata.targetSlot !== 'ota_0' || fresh.otadata.targetOffset !== target.offset) return false;
         const currentOtadata = await transport.readOtadataSnapshot();
         if (!Buffer.from(currentOtadata).equals(Buffer.from(otadataBefore))) return false;
-        if ((await transport.hashRegionSha256(target.offset, target.size)).toLowerCase() !== backup.manifest.sha256.toLowerCase()) return false;
+        await verifyBackupFreshness();
         if ((await transport.hashRegionSha256(0, WG1200_CONSTANTS.PARTITION_TABLE.offset)) !== bootloaderHash) return false;
         const valid = (await transport.verifyProtectedRegions(protectedSnapshots, 'ota_1', (name, done, total) => {
           options.progress?.event({ stage: `Rechecking ${name}`, completed: done, total });
@@ -338,10 +363,10 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
       expectedMd5: transaction.expectedMd5, hardwareMd5Verified: transaction.hardwareMd5Verified, bytesRead: transaction.bytesRead,
       targetRange: transaction.range, eraseRange: { start: eraseRange.start, end: eraseRange.end },
       backupSha256: backup.manifest.sha256, otaMetadataUnchanged: true, activeApplicationUnchanged: true,
-      protectedRegionsUnchanged: true, automaticActivation: false };
+      protectedRegionsUnchanged: true, automaticActivation: false, verificationMode, backupFreshnessChecks };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const kind = error instanceof Error && error.name === 'AbortError' ? 'operator_cancelled'
+    const kind = error instanceof Error && (error.name === 'AbortError' || error instanceof ConfirmationCancelledError) ? 'operator_cancelled'
       : message.includes('OPERATOR DECLINED') ? 'operator_declined'
       : /signature|signer|Secure Boot V2|digest slot/i.test(message) ? 'firmware_verification_failed'
       : writeStarted && /VERIFICATION|PROTECTED REGION|normal-boot reset/i.test(message) ? 'post_write_verification_failed'

@@ -53,6 +53,16 @@ describe('stage-only CLI guards', () => {
     const force = run('flash', 'weatherxm', '--stage-only', '--backup-manifest', '/tmp/backup.json', '--force');
     expect(force.status).not.toBe(0);
     expect(force.stderr).toContain('--yes, --force, --recover, --dry-run, and --monitor are not permitted');
+    const unsupportedMode = run('flash', 'weatherxm', '--verify-mode', 'mystery');
+    expect(unsupportedMode.status).not.toBe(0);
+    expect(unsupportedMode.stderr).toContain('--verify-mode must be fast or thorough');
+    const misplacedMode = run('flash', 'weatherxm', '--verify-mode', 'thorough');
+    expect(misplacedMode.status).not.toBe(0);
+    expect(misplacedMode.stderr).toContain('--verify-mode requires flash --stage-only');
+    const acceptedMode = run('flash', 'weatherxm', '--stage-only', '--verify-mode', 'thorough');
+    expect(acceptedMode.status).not.toBe(0);
+    expect(acceptedMode.stderr).toContain('flash requires --port');
+    expect(run('flash', '--help').stdout).toContain('--verify-mode fast|thorough');
   });
 
   it('does not accept a non-official manifest for the stage-only artifact', () => {

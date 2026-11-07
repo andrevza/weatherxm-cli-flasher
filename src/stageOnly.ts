@@ -24,18 +24,24 @@ export interface InactiveBackupManifest {
   tool: { version: string; gitCommit: string | null; sourceSha256: string | null };
 }
 
-export async function hashFileSha256(path: string): Promise<{ sha256: string; bytes: number }> {
-  const hash = createHash('sha256');
+export async function hashFileDigests(path: string): Promise<{ sha256: string; md5: string; bytes: number }> {
+  const sha256 = createHash('sha256');
+  const md5 = createHash('md5');
   let bytes = 0;
   for await (const chunk of createReadStream(path)) {
     const data = chunk as Buffer;
-    hash.update(data);
+    sha256.update(data);
+    md5.update(data);
     bytes += data.byteLength;
   }
-  return { sha256: hash.digest('hex'), bytes };
+  return { sha256: sha256.digest('hex'), md5: md5.digest('hex'), bytes };
+}
+export async function hashFileSha256(path: string): Promise<{ sha256: string; bytes: number }> {
+  const { sha256, bytes } = await hashFileDigests(path);
+  return { sha256, bytes };
 }
 
-export async function validateInactiveBackup(manifestPath: string, expected: { label: 'ota_0' | 'ota_1'; offset: number; length: number }): Promise<{ manifest: InactiveBackupManifest; backupPath: string }> {
+export async function validateInactiveBackup(manifestPath: string, expected: { label: 'ota_0' | 'ota_1'; offset: number; length: number }): Promise<{ manifest: InactiveBackupManifest; backupPath: string; backupMd5: string }> {
   let raw: unknown;
   try { raw = JSON.parse(await readFile(manifestPath, 'utf8')); }
   catch { throw new Error('STAGING BLOCKED — BACKUP INVALID: backup manifest is unreadable or malformed'); }
@@ -52,13 +58,13 @@ export async function validateInactiveBackup(manifestPath: string, expected: { l
     throw new Error('STAGING BLOCKED — BACKUP INVALID: manifest does not describe a verified backup of the exact target partition');
   }
   const backupPath = join(dirname(resolve(manifestPath)), value.backupFile);
-  let fileEvidence: { sha256: string; bytes: number };
-  try { fileEvidence = await hashFileSha256(backupPath); }
+  let fileEvidence: { sha256: string; md5: string; bytes: number };
+  try { fileEvidence = await hashFileDigests(backupPath); }
   catch { throw new Error('STAGING BLOCKED — BACKUP INVALID: backup image file is missing or unreadable'); }
   if (fileEvidence.bytes !== expected.length || fileEvidence.sha256.toLowerCase() !== value.sha256!.toLowerCase()) {
     throw new Error('STAGING BLOCKED — BACKUP INVALID: backup file length or SHA-256 does not match its manifest');
   }
-  return { manifest: value as InactiveBackupManifest, backupPath };
+  return { manifest: value as InactiveBackupManifest, backupPath, backupMd5: fileEvidence.md5 };
 }
 
 async function readExactly(handle: Awaited<ReturnType<typeof open>>, buffer: Buffer, position: number): Promise<void> {
@@ -164,6 +170,7 @@ export interface StageOnlySummary {
   backupFile: string; backupSha256: string; backupFirmwareVersion: string | null;
   backupSignatureStatus: 'valid' | 'invalid' | 'not-verified' | 'no-signature' | 'unsupported';
   eraseStart: number; eraseEnd: number; flashEncryption: boolean;
+  verificationMode: 'fast' | 'thorough';
   metadataWillChange: false; autoActivation: false;
 }
 

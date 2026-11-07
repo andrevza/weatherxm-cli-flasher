@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createInactiveBackup, runStageOnlyTransaction, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
+import { retryExactConfirmation } from '../src/verification.js';
 
 const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 const sha = (data: Uint8Array) => createHash('sha256').update(data).digest('hex');
@@ -68,6 +69,25 @@ describe('stage-only transaction', () => {
     expect(interrupted.mock.readOtadata).not.toHaveBeenCalled();
   });
 
+  it('retries a typo without repeating preflight and writes only after the complete phrase matches', async () => {
+    const { events, mock, input } = ops();
+    const phrase = `STAGE ota_0 WeatherXM 0.8.34 ${sha(bytes)}`;
+    const entries = ['partial sha', phrase];
+    input.confirm = vi.fn(() => retryExactConfirmation({ phrase, askPhrase: async () => entries.shift()!, askRetry: async () => 'retry' }));
+    await runStageOnlyTransaction(mock, input);
+    expect(events).toEqual(['revalidate', 'write', 'md5', 'sha256', 'protected', 'otadata', 'reset']);
+    expect(mock.writeApplication).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not revalidate or write after five incorrect confirmation phrases', async () => {
+    const { mock, input } = ops();
+    const phrase = `STAGE ota_0 WeatherXM 0.8.34 ${sha(bytes)}`;
+    input.confirm = vi.fn(() => retryExactConfirmation({ phrase, askPhrase: async () => `${phrase.slice(0, -1)}x`, askRetry: async () => 'retry' }));
+    await expect(runStageOnlyTransaction(mock, input)).rejects.toThrow(/OPERATOR CANCELLED/);
+    expect(mock.revalidate).not.toHaveBeenCalled();
+    expect(mock.writeApplication).not.toHaveBeenCalled();
+  });
+
   it('does not accept hardware MD5 or SHA-256 mismatch', async () => {
     const md5Fail = ops({ verifyHardwareMd5: vi.fn(async () => false) });
     await expect(runStageOnlyTransaction(md5Fail.mock, md5Fail.input)).rejects.toThrow(/hardware MD5 mismatch/);
@@ -119,7 +139,7 @@ describe('inactive OTA backup artifacts', () => {
     expect(manifest).toMatchObject({ partition: { label: 'ota_0', offset: 0x420000, length: 8 }, bytes: 8, sha256: sha(bytes), independentReadbackVerified: true, signatureVerification: { status: 'not-verified' } });
     expect(new Uint8Array(await readFile(output))).toEqual(bytes);
     const manifestPath = `${output}.manifest.json`;
-    await expect(validateInactiveBackup(manifestPath, { label: 'ota_0', offset: 0x420000, length: 8 })).resolves.toMatchObject({ manifest: { sha256: sha(bytes) }, backupPath: output });
+    await expect(validateInactiveBackup(manifestPath, { label: 'ota_0', offset: 0x420000, length: 8 })).resolves.toMatchObject({ manifest: { sha256: sha(bytes) }, backupPath: output, backupMd5: md5(bytes) });
     await expect(createInactiveBackup({ outputPath: output, label: 'ota_0', offset: 0x420000, length: 8,
       chip: { model: 'ESP32-S3', revision: null }, readChunks: chunks(), hashLivePartition: async () => sha(bytes),
       inspect: async () => ({ descriptor: null, signature: { status: 'not-verified' as const, imageLength: null, explanation: 'n/a' } }) })).rejects.toThrow(/refusing to overwrite/);

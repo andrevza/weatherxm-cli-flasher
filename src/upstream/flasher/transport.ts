@@ -935,6 +935,16 @@ export class Wg1200Transport {
     return compareHexHashes(chipMd5, expectedMd5);
   }
 
+  /** The stage-only fast path permits device-side MD5 only for the exact inactive ota_0 partition. */
+  public async md5InactiveOta0(): Promise<string> {
+    if (!this.loader) throw new Error('Not connected');
+    const target = WG1200_CONSTANTS.APP_OTA_0;
+    if (!this.loader.IS_STUB) throw new Error('ESP32-S3 RAM stub is unavailable for the supported 16-byte SPI_FLASH_MD5 response');
+    const digest = await this.loader.flashMd5sum(target.offset, target.size);
+    if (!/^[a-f0-9]{32}$/i.test(digest)) throw new Error('ESP32-S3 SPI_FLASH_MD5 returned an unexpected digest format');
+    return digest.toLowerCase();
+  }
+
   /** Independently streams the written application back from flash and checks its SHA-256. */
   public async verifyApplicationSha256(slotOffset: number, expectedSha256: string, length: number): Promise<boolean> {
     getApplicationEraseRange(slotOffset, length);
