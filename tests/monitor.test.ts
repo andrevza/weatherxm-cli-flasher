@@ -187,7 +187,7 @@ describe('passive serial monitor', () => {
   });
 
   it('saves the same timestamped plain text that it displays without allowing decoration into boot evidence', () => {
-    const rawEvidence = ['I (123) MAIN: booting', 'E (124) MAIN: sample failure'];
+    const rawEvidence = ['I (123) MAIN: booting', 'E (124) Guru Meditation Error: Core 0 panic'];
     const analysis = analyzeBootLogs(rawEvidence);
     const displayed: string[] = [];
     const saved: string[] = [];
