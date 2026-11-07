@@ -13,7 +13,7 @@ import { compareFirmware, firmwareInstallPolicy, type FirmwareComparison } from 
 import type { FirmwareEntry, VerifiedFirmware } from './upstream/flasher/manifest.js';
 import { assertFirmwareSecurityReady, FIRMWARE_SECURITY_BLOCK_REASON, firmwareSecurityReady } from './upstream/flasher/securityPolicy.js';
 import { compareSecureBootTrust, verifySecureBootV2Image, type SecureBootDeviceState, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
-import { createInactiveBackup, createPartitionBackup, validateInactiveBackup, runStageOnlyTransaction, StageOnlyVerificationFailure, type IntegrityAuditEntry, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
+import { compareImageBytes, createInactiveBackup, createPartitionBackup, validateInactiveBackup, runStageOnlyTransaction, StageOnlyVerificationFailure, type IntegrityAuditEntry, type StageOnlySummary, type InactiveBackupManifest } from './stageOnly.js';
 import { getApplicationEraseRange } from './upstream/flasher/writeGuard.js';
 import { DEFAULT_MANIFEST_URL } from './catalog.js';
 import { getOfficialFirmware, type FirmwareProgress } from './firmwareStore.js';
@@ -493,6 +493,67 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     options.progress?.close();
   }
   throw operationError ?? new Error('Stage-only operation ended without a result');
+}
+
+/** Thorough read-only comparison for diagnosing a previously staged OTA image; this function has no write calls. */
+export async function diagnoseOtaImage(options: DeviceOptions & { targetSlot: 'ota_0' | 'ota_1' }): Promise<{
+  outcome: 'READ-ONLY THOROUGH DIAGNOSTICS'; readOnly: true; flashWrites: 0; otaMetadataWrites: 0;
+  target: { slot: 'ota_0' | 'ota_1'; offset: number; imageLength: number };
+  firmware: { version: string; sha256: string; md5: string };
+  deviceMd5: { beforeRead: string; afterRead: string; stable: boolean; matchesExpected: boolean };
+  physicalReadback: { sha256: string; matchesExpected: boolean; bytesRead: number };
+  byteComparison: ReturnType<typeof compareImageBytes>;
+}> {
+  options.progress?.stage('Retrieving and verifying official firmware for read-only diagnostics');
+  const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL, {
+    progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
+  });
+  if (selected.entry.version !== '0.8.34' || selected.entry.sha256.toLowerCase() !== STAGE_ONLY_WXM_0834_SHA256 ||
+      selected.verified.data.byteLength !== 3674112) throw new Error('DIAGNOSTICS BLOCKED — official WeatherXM 0.8.34 reference image did not match the approved identity');
+  const image = selected.verified.data;
+  const expectedMd5 = md5Hex(image);
+  const expectedSha256 = createHash('sha256').update(image).digest('hex');
+  options.progress?.finish('complete', 'official image SHA-256 and Secure Boot signature verified');
+  const port = new NodeSerialPort(options.portPath,
+    options.traceSerial ? (message) => diagnostic(options.progress, `[serial] ${message}`) : undefined,
+    undefined, false, serialLifecycle(options), Boolean(options.verbose || options.traceSerial));
+  const { Wg1200Transport } = await import('./upstream/flasher/transport.js');
+  const transport = new Wg1200Transport(transportLogger(options), Boolean(options.verbose || options.traceSerial));
+  try {
+    options.progress?.stage('Connecting to ROM and initializing read-only flash reader');
+    const inspection = await transport.connect(port, options.baudRate ?? WG1200_CONSTANTS.BAUDRATE_FLASH);
+    options.progress?.finish('complete', 'ROM stub ready; diagnostics issue no flash writes');
+    assertSafeInspection(inspection, await exactLayoutErrors(transport));
+    const target = options.targetSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+    const discovered = inspection.partitions[options.targetSlot];
+    const expectedPartition = EXPECTED_WG1200_PARTITIONS[options.targetSlot];
+    if (!discovered || discovered.offset !== target.offset || discovered.size !== target.size ||
+        discovered.type !== expectedPartition.type || discovered.subtype !== expectedPartition.subtype) {
+      throw new Error('DIAGNOSTICS BLOCKED — target is not the exact discovered WG1200 OTA partition');
+    }
+    options.progress?.stage(`Repeat device-side MD5 before ${options.targetSlot} readback`);
+    const md5Before = await transport.md5FlashRegion(target.offset, image.byteLength);
+    options.progress?.finish('complete', md5Before === expectedMd5 ? 'MATCH' : 'MISMATCH');
+    options.progress?.stage(`Reading ${options.targetSlot} image for Thorough SHA-256 and byte comparison`, image.byteLength);
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of transport.readRegionChunks(target.offset, image.byteLength,
+      (done, total) => options.progress?.bytes(done, total), options.signal)) chunks.push(chunk);
+    const readback = Buffer.concat(chunks, image.byteLength);
+    const actualSha256 = createHash('sha256').update(readback).digest('hex');
+    const byteComparison = compareImageBytes(image, readback);
+    options.progress?.finish(byteComparison.equal ? 'complete' : 'failed', `${byteComparison.differingBytes} differing bytes`);
+    options.progress?.stage(`Repeat device-side MD5 after ${options.targetSlot} readback`);
+    const md5After = await transport.md5FlashRegion(target.offset, image.byteLength);
+    options.progress?.finish('complete', md5After === expectedMd5 ? 'MATCH' : 'MISMATCH');
+    return { outcome: 'READ-ONLY THOROUGH DIAGNOSTICS', readOnly: true, flashWrites: 0, otaMetadataWrites: 0,
+      target: { slot: options.targetSlot, offset: target.offset, imageLength: image.byteLength },
+      firmware: { version: selected.entry.version, sha256: expectedSha256, md5: expectedMd5 },
+      deviceMd5: { beforeRead: md5Before, afterRead: md5After, stable: md5Before === md5After, matchesExpected: md5Before === expectedMd5 && md5After === expectedMd5 },
+      physicalReadback: { sha256: actualSha256, matchesExpected: actualSha256 === expectedSha256, bytesRead: readback.byteLength }, byteComparison };
+  } finally {
+    options.progress?.stage('Returning gateway to normal boot');
+    await disconnectAndReport(transport, options.progress);
+  }
 }
 
 /** Read-only eFuse inspection; connection may reset the gateway and enter the ROM loader. */

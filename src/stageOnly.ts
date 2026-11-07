@@ -261,6 +261,38 @@ export interface IntegrityAuditEntry {
   status: 'UNCHANGED' | 'CHANGED' | 'UNVERIFIED';
 }
 
+/** Summarizes a read-only byte comparison without retaining or returning image contents. */
+export function compareImageBytes(expected: Uint8Array, actual: Uint8Array, sectorSize = 0x1000): {
+  equal: boolean; comparedBytes: number; differingBytes: number; firstDifference: number | null;
+  ranges: Array<{ start: number; end: number }>; rangesTruncated: boolean; affectedSectors: number[];
+} {
+  if (!Number.isSafeInteger(sectorSize) || sectorSize <= 0) throw new Error('sectorSize must be a positive integer');
+  const comparedBytes = Math.min(expected.byteLength, actual.byteLength);
+  let differingBytes = Math.abs(expected.byteLength - actual.byteLength);
+  let firstDifference: number | null = null; let openStart = -1; let rangesTruncated = false;
+  const ranges: Array<{ start: number; end: number }> = [];
+  const affected = new Set<number>();
+  for (let offset = 0; offset < comparedBytes; offset++) {
+    if (expected[offset] !== actual[offset]) {
+      differingBytes++;
+      firstDifference ??= offset;
+      if (openStart < 0) openStart = offset;
+      affected.add(Math.floor(offset / sectorSize));
+    } else if (openStart >= 0) {
+      if (ranges.length < 128) ranges.push({ start: openStart, end: offset }); else rangesTruncated = true;
+      openStart = -1;
+    }
+  }
+  if (openStart >= 0) { if (ranges.length < 128) ranges.push({ start: openStart, end: comparedBytes }); else rangesTruncated = true; }
+  if (expected.byteLength !== actual.byteLength) {
+    firstDifference ??= comparedBytes;
+    for (let offset = comparedBytes; offset < Math.max(expected.byteLength, actual.byteLength); offset++) affected.add(Math.floor(offset / sectorSize));
+    if (ranges.length < 128) ranges.push({ start: comparedBytes, end: Math.max(expected.byteLength, actual.byteLength) }); else rangesTruncated = true;
+  }
+  return { equal: differingBytes === 0, comparedBytes, differingBytes, firstDifference,
+    ranges, rangesTruncated, affectedSectors: [...affected].sort((a, b) => a - b) };
+}
+
 export class StageOnlyVerificationFailure extends Error {
   constructor(message: string, readonly targetVerification: { expectedMd5: string; actualMd5: string | null; result: 'MISMATCH' | 'UNVERIFIED' },
     readonly integrityAudit: IntegrityAuditEntry[]) { super(message); this.name = 'StageOnlyVerificationFailure'; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { backupDiscoveredPartition, backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyConfirmationPhrase, StageOnlyOperationError, stageOnlyFirmware, summarizeInspection } from './device.js';
+import { backupDiscoveredPartition, backupInactiveOta, checkExitCode, checkFirmware, checkFirmwareSecurity, diagnoseOtaImage, flashDevice, inspectDevice, readDeviceSecurity, serializeFirmwareCheckResult, stageOnlyConfirmationPhrase, StageOnlyOperationError, stageOnlyFirmware, summarizeInspection } from './device.js';
 import { catalogRows, DEFAULT_MANIFEST_URL, fetchCatalog } from './catalog.js';
 import { getOfficialFirmware } from './firmwareStore.js';
 import { compareBackupToFirmware, compareFirmwareFiles } from './firmwareCompare.js';
@@ -141,6 +141,9 @@ function parseArgs(argv: string[]): Args {
     if (out.stageOnly && (out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
       throw new Error('--stage-only requires flash weatherxm and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
     }
+    if (out.command === 'flash' && out.subcommand === 'diagnose' && (!['ota_0', 'ota_1'].includes(out.target ?? '') || out.stageOnly || out.dryRun || out.yes || out.force || out.recover || out.monitor || out.backupManifest || out.verifyMode)) {
+      throw new Error('flash diagnose requires --target ota_0|ota_1 and is read-only; write, stage, verification-mode, and monitor options are not supported');
+    }
     if (out.stageOnly && manifestProvided && out.manifest !== DEFAULT_MANIFEST_URL) throw new Error('--stage-only accepts only the pinned official WeatherXM firmware manifest');
     if (out.backupManifest && !out.stageOnly) throw new Error('--backup-manifest requires --stage-only');
     if (out.command === 'ota' && (!['status', 'backup', 'activate', 'restore'].includes(out.subcommand ?? '') || out.yes || out.force || out.recover || out.stageOnly || out.monitor || (out.subcommand === 'backup' && !out.outputFile) || (out.subcommand !== 'backup' && out.outputFile) || (out.subcommand === 'activate' && (!['ota_0', 'ota_1'].includes(out.target ?? '') || !out.metadataBackupManifest)) || (out.subcommand === 'restore' && (!out.metadataBackupManifest || out.target || out.dryRun)))) throw new Error('ota supports status, backup --output, activate --target and restore, both requiring --metadata-backup-manifest');
@@ -197,7 +200,7 @@ function help(command?: string, plain = false) {
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
-      flash: `USAGE\n  ${name} flash weatherxm --port <path> --stage-only [--verify-mode fast|thorough] [--backup-manifest <path>]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. Fast is the default: it verifies the target with device-side MD5 and audits preserved regions with MD5. Thorough adds full target SHA-256 readback and full protected-region SHA-256 checks. Both modes retain mandatory source SHA-256, Secure Boot V2 trust, backup validation and unchanged OTA metadata checks. A failed target check blocks activation, audits unchanged regions where possible, and never retries or rewrites automatically. Confirmation permits five exact-phrase attempts with retry or cancel; no write begins without the complete phrase.`,
+      flash: `USAGE\n  ${name} flash weatherxm --port <path> --stage-only [--verify-mode fast|thorough] [--backup-manifest <path>]\n  ${name} flash diagnose --target <ota_0|ota_1> --port <path> [--offline] [--json]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. Fast is the default: it verifies the target with device-side MD5 and audits preserved regions with MD5. Thorough adds full target SHA-256 readback and full protected-region SHA-256 checks. Both modes retain mandatory source SHA-256, Secure Boot V2 trust, backup validation and unchanged OTA metadata checks. A failed target check blocks activation, audits unchanged regions where possible, and never retries or rewrites automatically. flash diagnose is read-only: it repeats on-chip MD5, reads the selected signed image bytes, compares SHA-256 and reports differing byte offsets/sectors without writing. Confirmation permits five exact-phrase attempts with retry or cancel; no write begins without the complete phrase.`,
     };
     const detail = details[command];
     if (!detail) return process.stdout.write(`No command help is available for '${command}'. Run '${name} --help'.\n`);
@@ -534,6 +537,18 @@ async function main() {
     if (!args.subcommand) throw new Error('flash requires a firmware key; run `wg1200 firmware list`');
     if (!args.port) throw new Error('flash requires --port, for example --port /dev/ttyUSB0');
     const progress = createProgress(args);
+    if (args.subcommand === 'diagnose') {
+      const result = await diagnoseOtaImage({ portPath: args.port, baudRate: args.baud, targetSlot: args.target as 'ota_0' | 'ota_1',
+        traceSerial: args.traceSerial, verbose: args.verbose, progress, offline: args.offline, cacheDirectory: args.cacheDirectory });
+      progress.close();
+      const relative = result.byteComparison.firstDifference;
+      const report = { ...result, byteComparison: { ...result.byteComparison,
+        firstDifferenceFlashAddress: relative === null ? null : result.target.offset + relative,
+        affectedFlashSectors: result.byteComparison.affectedSectors.map((sector) => result.target.offset / 0x1000 + sector) } };
+      if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      else process.stdout.write(`${result.outcome}\nTarget: ${result.target.slot} @ 0x${result.target.offset.toString(16)} (${result.target.imageLength} bytes)\nDevice MD5 before/after readback: ${result.deviceMd5.beforeRead} / ${result.deviceMd5.afterRead} (${result.deviceMd5.stable ? 'STABLE' : 'CHANGED'}; ${result.deviceMd5.matchesExpected ? 'MATCH' : 'MISMATCH'})\nPhysical SHA-256: ${result.physicalReadback.sha256} (${result.physicalReadback.matchesExpected ? 'MATCH' : 'MISMATCH'})\nByte comparison: ${result.byteComparison.differingBytes} differing bytes; first difference ${relative === null ? 'none' : `partition +0x${relative.toString(16)} / flash 0x${(result.target.offset + relative).toString(16)}`}\nDifference ranges: ${result.byteComparison.ranges.map((range) => `[+0x${range.start.toString(16)}, +0x${range.end.toString(16)})`).join(', ') || 'none'}\nAffected flash sectors: ${report.byteComparison.affectedFlashSectors.map((sector) => `0x${sector.toString(16)}`).join(', ') || 'none'}\nFlash writes: 0; OTA metadata writes: 0\n`);
+      return;
+    }
     if (args.stageOnly) {
       const stageAbort = new AbortController();
       const removeStageInterrupt = bindAbortOnSigint(process, stageAbort);

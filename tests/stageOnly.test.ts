@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createInactiveBackup, createPartitionBackup, runStageOnlyTransaction, StageOnlyVerificationFailure, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
+import { compareImageBytes, createInactiveBackup, createPartitionBackup, runStageOnlyTransaction, StageOnlyVerificationFailure, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
 import { retryExactConfirmation } from '../src/verification.js';
 
 const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -17,6 +17,23 @@ async function tempDir() {
 }
 async function* oneChunk(data: Uint8Array) { yield data; }
 afterEach(async () => { await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
+
+describe('Thorough image comparison', () => {
+  it('reports every differing byte, first offset, contiguous ranges, and affected 4 KiB sectors', () => {
+    const expected = new Uint8Array(0x2000).fill(0xaa);
+    const actual = expected.slice(); actual[2] = 0; actual[3] = 0; actual[0x1001] = 0;
+    expect(compareImageBytes(expected, actual)).toEqual({ equal: false, comparedBytes: 0x2000, differingBytes: 3,
+      firstDifference: 2, ranges: [{ start: 2, end: 4 }, { start: 0x1001, end: 0x1002 }], rangesTruncated: false,
+      affectedSectors: [0, 1] });
+  });
+  it('reports length mismatches and makes range truncation explicit', () => {
+    expect(compareImageBytes(new Uint8Array([1, 2]), new Uint8Array([1])).firstDifference).toBe(1);
+    const expected = new Uint8Array(300).fill(0xaa); const actual = expected.slice();
+    for (let i = 0; i < actual.length; i += 2) actual[i] = 0;
+    expect(compareImageBytes(expected, actual).ranges).toHaveLength(128);
+    expect(compareImageBytes(expected, actual).rangesTruncated).toBe(true);
+  });
+});
 
 function ops(overrides: Partial<StageOnlyOperations> = {}) {
   const events: string[] = [];

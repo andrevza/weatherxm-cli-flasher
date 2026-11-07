@@ -19,6 +19,16 @@ describe('stage-only CLI guards', () => {
     expect(accepted('yes')).toBe(false);
     expect(accepted(displayed.replace('ota_0', 'ota_1'))).toBe(false);
   });
+  it('exposes Thorough diagnosis only for an exact OTA slot and rejects write-related options', () => {
+    const usage = run('flash', '--help');
+    expect(usage.status).toBe(0);
+    expect(usage.stdout).toContain('flash diagnose --target <ota_0|ota_1>');
+    const wrongTarget = run('flash', 'diagnose', '--target', 'factory', '--port', '/dev/null');
+    expect(wrongTarget.status).not.toBe(0);
+    expect(wrongTarget.stderr).toContain('flash diagnose requires --target ota_0|ota_1 and is read-only');
+    const stage = run('flash', 'diagnose', '--target', 'ota_0', '--stage-only', '--port', '/dev/null');
+    expect(stage.status).not.toBe(0);
+  });
   it('requests normal boot once and closes the serial transport after cancellation', async () => {
     const hardReset = vi.fn(async () => true);
     const disconnect = vi.fn(async (releaseReset: boolean) => ({ serialPortReleased: releaseReset === false }));
