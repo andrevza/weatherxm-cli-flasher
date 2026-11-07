@@ -170,11 +170,14 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
   if (input.antiRollbackConfig === 'unknown') blockers.push('Installed bootloader anti-rollback configuration is unknown.');
   blockers.push('Activation writer is intentionally unavailable until installed bootloader and return behavior are established.');
   const current = input.analysis.sectors[input.analysis.selectedSector ?? 0];
-  let proposedSeq = current?.sequence === null || current?.sequence === undefined ? null : (current.sequence + 1) >>> 0;
-  if (proposedSeq !== null) {
-    const targetIndex = input.target === 'ota_0' ? 0 : 1;
-    if (((proposedSeq - 1) >>> 0) % 2 !== targetIndex) proposedSeq = (proposedSeq + 1) >>> 0;
-  }
+  const targetIndex = input.target === 'ota_0' ? 0 : 1;
+  const currentSequence = current?.sequence;
+  // IDF 5.1.2 esp_rewrite_ota_data chooses the smallest sequence congruent
+  // to (subtype + 1) modulo ota_app_count that is >= the current sequence.
+  const sequenceResidue = (targetIndex + 1) % 2;
+  const multiplier = currentSequence === null || currentSequence === undefined ? null
+    : Math.max(0, Math.ceil((currentSequence - sequenceResidue) / 2));
+  const proposedSeq = multiplier === null ? null : (sequenceResidue + multiplier * 2) >>> 0;
   const selectedSector = input.analysis.selectedSector;
   return { outcome: 'ACTIVATION BLOCKED', dryRun: true, target: input.target, selectedByMetadata: input.analysis.selectedByMetadata,
     proposedUpdate: { sectorAddress: selectedSector === null ? null : input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,

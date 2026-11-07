@@ -31,6 +31,10 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
     expect(plan.outcome).toBe('ACTIVATION BLOCKED'); expect(plan.writeRanges).toEqual([]);
     expect(plan.proposedUpdate).toMatchObject({ sectorAddress: 0x14000, sequence: 5, priorSectorPreserved: true });
     expect(plan.blockers.join('\n')).toMatch(/running slot/); expect(plan.blockers.join('\n')).toMatch(/rollback configuration/);
+    const returnPlan = planOtaActivation({ analysis, target: 'ota_1', actualRunningSlot: 'ota_0', targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'disabled', antiRollbackConfig: 'disabled' });
+    expect(returnPlan.proposedUpdate).toMatchObject({ sequence: 4, sectorAddress: 0x14000 });
   });
 });
 
