@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { assertSafeInspection, exactLayoutErrors, type DeviceOptions } from './device.js';
+import { assertSafeInspection, exactLayoutErrors, loadSelectedFirmware, STAGE_ONLY_WXM_0834_SHA256, type DeviceOptions } from './device.js';
+import { DEFAULT_MANIFEST_URL } from './catalog.js';
 import { NodeSerialPort } from './nodeSerialPort.js';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
-import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, otaDeviceBinding, planOtaActivation, planOtaMetadataRestore, readOtaMetadataBackup } from './otaManagement.js';
+import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, otaDeviceBinding, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, readOtaMetadataBackup } from './otaManagement.js';
 import { compareSecureBootTrust, parseEsp32S3ImageBoundary } from './upstream/flasher/secureBoot.js';
 import { parseAppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { captureBootLogs } from './upstream/flasher/serialLog.js';
@@ -19,7 +20,7 @@ function logger(options: DeviceOptions) {
     } };
 }
 
-async function withOtaDevice<T>(options: DeviceOptions, body: (transport: any, inspection: any) => Promise<T>): Promise<T> {
+async function withOtaDevice<T>(options: DeviceOptions, body: (transport: any, inspection: any) => Promise<T>, deferResetAfterSuccess: () => boolean = () => false): Promise<T> {
   const lifecycle = (stage: string, state: 'start' | 'complete' | 'failed', detail?: string) => {
     if (state === 'start') options.progress?.log(`${stage}...`);
     else options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : 'FAILED'}${detail ? ` — ${detail}` : ''}`);
@@ -43,13 +44,14 @@ async function withOtaDevice<T>(options: DeviceOptions, body: (transport: any, i
     operationError = error;
     options.progress?.finish(options.signal?.aborted ? 'cancelled' : 'failed', error instanceof Error ? error.message : String(error));
   } finally {
-    options.progress?.stage('Returning gateway to normal boot');
+    const deferReset = deferResetAfterSuccess();
+    options.progress?.stage(deferReset ? 'Releasing ROM connection for captured normal-boot reset' : 'Returning gateway to normal boot');
     try {
-      const disconnected = await transport.disconnect();
+      const disconnected = await transport.disconnect(!deferReset);
       const cleanupState = disconnected.normalBootResetSucceeded === false ? 'failed' : 'complete';
       const cleanupDetail = disconnected.normalBootResetSucceeded === true ? 'normal-boot reset requested; serial connection released'
         : disconnected.normalBootResetSucceeded === false ? 'normal-boot reset was unavailable'
-          : 'serial connection released; reset was not required';
+          : deferReset ? 'ROM serial connection released; reset will start after boot-log receiver is ready' : 'serial connection released; reset was not required';
       options.progress?.finish(cleanupState, cleanupDetail);
     } catch (error) { cleanupError = error; options.progress?.finish('failed'); }
   }
@@ -79,6 +81,126 @@ function hashImage(data: Uint8Array, length: number, label: string, progress?: P
 }
 
 export type OtaStatusVerificationMode = 'fast' | 'thorough';
+
+type ActivationEvidence = { sourceImage: Uint8Array; sourceSha256: string; sourceMd5: string; sourceBoundary: ReturnType<typeof parseEsp32S3ImageBoundary>;
+  descriptor: NonNullable<ReturnType<typeof parseAppDescriptor>>; mode: OtaStatusVerificationMode };
+
+async function loadActivationEvidence(options: DeviceOptions & { verificationMode?: OtaStatusVerificationMode }): Promise<ActivationEvidence> {
+  options.progress?.stage('Retrieving and verifying approved WeatherXM firmware');
+  const selected = await loadSelectedFirmware('weatherxm', DEFAULT_MANIFEST_URL, {
+    progress: (event) => options.progress?.event(event), offline: options.offline, cacheDirectory: options.cacheDirectory,
+  });
+  const sourceImage = selected.verified.data;
+  const sourceSha256 = createHash('sha256').update(sourceImage).digest('hex');
+  const sourceBoundary = parseEsp32S3ImageBoundary(sourceImage);
+  const descriptor = parseAppDescriptor(sourceImage.subarray(0, 4096));
+  if (selected.entry.version.replace(/^v/i, '') !== '0.8.34' || selected.entry.sha256.toLowerCase() !== STAGE_ONLY_WXM_0834_SHA256 ||
+      sourceSha256 !== STAGE_ONLY_WXM_0834_SHA256 || sourceBoundary.status !== 'valid-signature' || !sourceBoundary.imageEvidence?.signatureValid ||
+      !descriptor || sourceBoundary.imageLength !== sourceImage.byteLength || selected.entry.bytes !== sourceImage.byteLength) {
+    throw new Error('Activation blocked: authenticated source is not the pinned, structurally valid WeatherXM 0.8.34 signed image');
+  }
+  options.progress?.finish('complete', 'pinned official SHA-256 and Secure Boot V2 image signature verified');
+  return { sourceImage, sourceSha256, sourceMd5: createHash('md5').update(sourceImage).digest('hex'), sourceBoundary, descriptor: descriptor!,
+    mode: options.verificationMode ?? 'fast' };
+}
+
+async function inspectActivationEvidence(transport: any, inspection: any, options: DeviceOptions & { target: 'ota_0' | 'ota_1'; metadataBackupManifest?: string }, evidence: ActivationEvidence) {
+  const raw = await readPartition(transport, WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size, 'Reading OTA metadata', options.progress, options.signal);
+  const analysis = analyzeOtaMetadata(raw, { factoryPresent: true });
+  if (analysis.sectors.some((sector) => sector.state !== 'ERASED' && !sector.crcValid)) {
+    throw new Error('Activation blocked: an OTA metadata sector has a corrupt sequence CRC; metadata is unchanged');
+  }
+  let backupVerified = false;
+  if (options.metadataBackupManifest && inspection.secureCert?.sha256) {
+    options.progress?.stage('Validating fresh device-bound metadata backup');
+    await (await import('./otaManagement.js')).validateOtaMetadataBackup(options.metadataBackupManifest, {
+      bytes: raw, deviceBinding: otaDeviceBinding(inspection.macAddress, inspection.secureCert.sha256) });
+    backupVerified = true;
+    options.progress?.finish('complete', 'backup identity binding, SHA-256, and exact live metadata match');
+  }
+  const security = await transport.readSecureBootConfiguration();
+  const trust = compareSecureBootTrust(evidence.sourceBoundary.imageEvidence!, security);
+  if (trust.result === 'UNTRUSTED' || trust.result === 'REVOKED' || trust.result === 'INCOMPATIBLE') {
+    throw new Error(`Activation blocked: explicit device Secure Boot result is ${trust.result} (${trust.securityVersionStatus})`);
+  }
+  if (security.secureBootV2.status === 'verified' && security.secureBootV2.state !== 'enabled') {
+    throw new Error('Activation blocked: Secure Boot V2 is explicitly disabled on the device');
+  }
+  if (security.secureVersion.value !== null && evidence.descriptor.secureVersion < security.secureVersion.value) {
+    throw new Error('Activation blocked: approved application security version is below the readable device eFuse floor');
+  }
+  const targetPart = options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  const recoverySlot = options.target === 'ota_0' ? 'ota_1' : 'ota_0';
+  const recoveryPart = recoverySlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
+  let targetImage: Uint8Array | null = null; let recoveryImage: Uint8Array | null = null;
+  let targetHeader: Uint8Array; let recoveryHeader: Uint8Array;
+  if (evidence.mode === 'thorough') {
+    targetImage = await readPartition(transport, targetPart.offset, targetPart.size, `Inspecting complete ${options.target} firmware`, options.progress, options.signal);
+    recoveryImage = await readPartition(transport, recoveryPart.offset, recoveryPart.size, `Inspecting complete ${recoverySlot} recovery firmware`, options.progress, options.signal);
+    targetHeader = targetImage.subarray(0, 4096); recoveryHeader = recoveryImage.subarray(0, 4096);
+  } else {
+    targetHeader = await readPartition(transport, targetPart.offset, 4096, `Reading ${options.target} application header`, options.progress, options.signal);
+    recoveryHeader = await readPartition(transport, recoveryPart.offset, 4096, `Reading ${recoverySlot} recovery header`, options.progress, options.signal);
+  }
+  const expectedHeader = evidence.sourceImage.subarray(0, 4096);
+  if (!Buffer.from(targetHeader).equals(Buffer.from(expectedHeader)) || !parseAppDescriptor(targetHeader)) {
+    throw new Error(`Activation blocked: ${options.target} header or descriptor differs from the authenticated source`);
+  }
+  if (!Buffer.from(recoveryHeader).equals(Buffer.from(expectedHeader)) || !parseAppDescriptor(recoveryHeader)) {
+    throw new Error(`Activation blocked: ${recoverySlot} recovery header or descriptor differs from the authenticated source`);
+  }
+  options.progress?.stage(`Checking ${options.target} on-chip MD5`);
+  const targetMd5 = await transport.md5FlashRegion(targetPart.offset, evidence.sourceImage.byteLength);
+  options.progress?.finish(targetMd5 === evidence.sourceMd5 ? 'complete' : 'failed', targetMd5 === evidence.sourceMd5 ? 'approved image range matches' : 'approved image range mismatch');
+  options.progress?.stage(`Checking ${recoverySlot} recovery on-chip MD5`);
+  const recoveryMd5 = await transport.md5FlashRegion(recoveryPart.offset, evidence.sourceImage.byteLength);
+  options.progress?.finish(recoveryMd5 === evidence.sourceMd5 ? 'complete' : 'failed', recoveryMd5 === evidence.sourceMd5 ? 'approved recovery image range matches' : 'recovery image mismatch');
+  const targetMd5Matches = targetMd5 === evidence.sourceMd5;
+  const recoveryMd5Matches = recoveryMd5 === evidence.sourceMd5;
+  if (!targetMd5Matches) throw new Error(`Activation blocked: ${options.target} on-chip MD5 does not match the authenticated source; metadata is unchanged`);
+  if (!recoveryMd5Matches) throw new Error(`Activation blocked: selected recovery slot ${recoverySlot} does not match the authenticated approved image; metadata is unchanged`);
+  let physicalSha256: string | null = null;
+  if (evidence.mode === 'thorough' && targetImage) {
+    const boundary = parseEsp32S3ImageBoundary(targetImage);
+    if (boundary.status !== 'valid-signature' || boundary.imageLength !== evidence.sourceImage.byteLength) throw new Error(`Activation blocked: physical target signature/structure check is ${boundary.status}`);
+    physicalSha256 = hashImage(targetImage, boundary.imageLength, `Calculating ${options.target} physical SHA-256`, options.progress);
+    if (physicalSha256 !== evidence.sourceSha256) throw new Error('Activation blocked: thorough physical SHA-256 differs from authenticated source');
+    const recoveryBoundary = parseEsp32S3ImageBoundary(recoveryImage!);
+    if (recoveryBoundary.status !== 'valid-signature' || recoveryBoundary.imageLength !== evidence.sourceImage.byteLength) throw new Error('Activation blocked: thorough recovery image signature/structure check failed');
+    const recoverySha = hashImage(recoveryImage!, recoveryBoundary.imageLength, `Calculating ${recoverySlot} physical SHA-256`, options.progress);
+    if (recoverySha !== evidence.sourceSha256) throw new Error('Activation blocked: thorough recovery SHA-256 differs from authenticated source');
+  }
+  const unknownTrustQualified = qualifiesUnknownSignerTrust({ signerTrust: trust.result, sourceSha256Verified: true,
+    sourceSignatureVerified: evidence.sourceBoundary.imageEvidence!.signatureValid, targetMd5Matches, recoveryMd5Matches,
+    selectedByMetadata: analysis.selectedByMetadata, recoverySlot, metadataBackupVerified: backupVerified });
+  const plan = planOtaActivation({ analysis, target: options.target, actualRunningSlot: null,
+    targetImageValid: evidence.sourceBoundary.status === 'valid-signature', otherImageValid: recoveryMd5Matches,
+    targetImageSha256: physicalSha256, expectedTargetSha256: evidence.sourceSha256, targetDigestMatches: targetMd5Matches,
+    targetSignatureTrusted: trust.result === 'TRUSTED', allowUnknownSignerTrust: unknownTrustQualified,
+    metadataBackupVerified: backupVerified,
+    verification: { mode: evidence.mode, sourceSha256Verified: true, sourceSignatureVerified: true,
+      targetOnChipMd5: targetMd5Matches ? 'match' : 'mismatch', recoveryOnChipMd5: recoveryMd5Matches ? 'match' : 'mismatch',
+      signerTrust: trust.result, unknownTrustQualified },
+    rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+  return { raw, analysis, backupVerified, security, trust, plan, descriptor: evidence.descriptor, physicalSha256,
+    targetMd5, recoveryMd5, recoverySlot };
+}
+
+async function resetNormalBootWithReceiver(port: NodeSerialPort, progress?: ProgressReporter): Promise<void> {
+  const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  progress?.stage('Resetting ESP32-S3 into normal boot');
+  await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+  progress?.finish('complete', 'reset lines released');
+  await wait(50);
+  progress?.stage('Asserting ESP32-S3 reset');
+  await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+  progress?.finish('complete', 'EN asserted through RTS; GPIO0 released through DTR');
+  await wait(120);
+  progress?.stage('Releasing ESP32-S3 reset');
+  await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+  progress?.finish('complete', 'EN released; serial boot capture already listening');
+  await wait(150);
+}
 
 export async function buildOtaStatusReport(input: { transport: any; inspection: any; verificationMode?: OtaStatusVerificationMode;
   progress?: ProgressReporter; signal?: AbortSignal }) {
@@ -153,7 +275,11 @@ export async function buildOtaStatusReport(input: { transport: any; inspection: 
         downloadMode: security.downloadMode },
       antiRollback: { status: 'unknown', source: 'not established by connected bootloader configuration' },
       rollback: { status: 'unknown', source: 'installed bootloader CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is not independently established' },
-      activation: { allowed: false, reasons: ['Actual running slot is not observed by ROM flash inspection.', 'Installed bootloader rollback and anti-rollback configuration are unknown.', 'Activation writer is intentionally unavailable pending installed bootloader and return-path evidence.'] } };
+      activation: { functionality: 'implemented', allowed: null,
+        inspectionLimitations: ['ROM inspection does not observe the application currently running; post-activation boot capture checks the loaded offset.'],
+        preflightRequirements: ['Fresh device-bound exact metadata backup', 'Pinned official signed source image', 'Target and selected recovery range on-chip MD5 match', 'Explicit transaction confirmation'],
+        confirmedBlockers: [], unknowns: ['Actual running slot before reset', 'Installed bootloader rollback behavior', 'Anti-rollback enforcement unless established from device evidence'],
+        note: 'Availability is determined by ota activate preflight; status does not claim a target is currently activatable.' } };
 }
 
 export async function readOtaStatus(options: DeviceOptions & { verificationMode?: OtaStatusVerificationMode }) {
@@ -175,41 +301,15 @@ export async function backupOtaMetadata(options: DeviceOptions & { outputPath: s
   });
 }
 
-export async function dryRunOtaActivation(options: DeviceOptions & { target: 'ota_0' | 'ota_1'; metadataBackupManifest?: string }) {
+export async function dryRunOtaActivation(options: DeviceOptions & { target: 'ota_0' | 'ota_1'; metadataBackupManifest?: string; verificationMode?: OtaStatusVerificationMode }) {
+  const evidence = await loadActivationEvidence(options);
   return withOtaDevice(options, async (transport, inspection) => {
-    const raw = await readPartition(transport, WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size, 'Reading OTA metadata', options.progress, options.signal);
-    const analysis = analyzeOtaMetadata(raw, { factoryPresent: true });
-    let backupVerified = false;
-    options.progress?.stage('Reading Secure Boot trust configuration');
-    const security = await transport.readSecureBootConfiguration();
-    options.progress?.finish('complete');
-    if (options.metadataBackupManifest) {
-      const { validateOtaMetadataBackup } = await import('./otaManagement.js');
-      try {
-        options.progress?.stage('Validating fresh metadata backup');
-        await validateOtaMetadataBackup(options.metadataBackupManifest, { bytes: raw,
-        deviceBinding: otaDeviceBinding(inspection.macAddress, inspection.secureCert.sha256) }); backupVerified = true; } catch { /* report as a closed gate */ }
-      options.progress?.finish('complete', backupVerified ? 'device-bound backup matches current metadata' : 'backup missing, stale, or invalid');
-    }
-    let targetImageValid = false; let targetImageSha256: string | null = null; let targetSignatureTrusted = false;
-    const targetPart = options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
-    const targetImage = await readPartition(transport, targetPart.offset, targetPart.size, `Inspecting ${options.target} firmware`, options.progress, options.signal);
-    options.progress?.stage(`Verifying ${options.target} image signature and structure`);
-    const boundary = parseEsp32S3ImageBoundary(targetImage);
-    targetImageValid = boundary.status === 'valid-signature';
-    options.progress?.finish('complete', `${boundary.status}: ${boundary.explanation}`);
-    if (boundary.imageLength) targetImageSha256 = hashImage(targetImage, boundary.imageLength, `Hashing ${options.target} signed image`, options.progress);
-    if (boundary.imageEvidence) targetSignatureTrusted = compareSecureBootTrust(boundary.imageEvidence, security).result === 'TRUSTED';
-    const otherPart = options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_1 : WG1200_CONSTANTS.APP_OTA_0;
-    const otherSlot = options.target === 'ota_0' ? 'ota_1' : 'ota_0';
-    const otherImage = await readPartition(transport, otherPart.offset, otherPart.size, `Inspecting ${otherSlot} firmware`, options.progress, options.signal);
-    options.progress?.stage(`Verifying ${otherSlot} image signature and structure`);
-    const otherBoundary = parseEsp32S3ImageBoundary(otherImage);
-    options.progress?.finish('complete', `${otherBoundary.status}: ${otherBoundary.explanation}`);
-    return planOtaActivation({ analysis, target: options.target, actualRunningSlot: null,
-      targetImageValid, otherImageValid: otherBoundary.status === 'valid-signature', targetImageSha256,
-      expectedTargetSha256: 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb',
-      targetSignatureTrusted, metadataBackupVerified: backupVerified, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    const result = await inspectActivationEvidence(transport, inspection, options, evidence);
+    return { ...result.plan, evidence: { sourceSha256: evidence.sourceSha256, sourceSha256Verified: true,
+      sourceSignature: 'VERIFIED', physicalTargetSha256: result.physicalSha256,
+      targetOnChipMd5: result.targetMd5, recoveryOnChipMd5: result.recoveryMd5,
+      deviceSignerTrust: result.trust.result, unknownTrustQualified: result.plan.verification?.unknownTrustQualified,
+      selectedRecoverySlot: result.recoverySlot, metadataBackupVerified: result.backupVerified } };
   });
 }
 
@@ -217,61 +317,48 @@ const WG1200_0834_SHA256 = 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900
 
 /** Performs a confirmed one-sector activation through the ESP32 ROM/stub transport. Never called by tests on physical hardware. */
 export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0' | 'ota_1'; metadataBackupManifest: string;
-  confirm: (plan: ReturnType<typeof planOtaActivation>) => Promise<boolean>; bootLogSeconds?: number }) {
+  confirm: (plan: ReturnType<typeof planOtaActivation>) => Promise<boolean>; bootLogSeconds?: number; verificationMode?: OtaStatusVerificationMode }) {
+  const evidence = await loadActivationEvidence(options);
+  let captureResetAfterOpen = false;
   const transaction = await withOtaDevice(options, async (transport, inspection) => {
     if (!inspection.secureCert?.sha256) throw new Error('Activation requires a verified Secure Certificate identity');
-    const raw = await readPartition(transport, WG1200_CONSTANTS.OTADATA.offset, WG1200_CONSTANTS.OTADATA.size, 'Revalidating OTA metadata', options.progress, options.signal);
-    const analysis = analyzeOtaMetadata(raw, { factoryPresent: true });
-    if (analysis.ambiguous || !analysis.selectedByMetadata || analysis.selectedSector === null || analysis.selectedSequence === null) {
+    const prepared = await inspectActivationEvidence(transport, inspection, options, evidence);
+    const raw = prepared.raw;
+    if (prepared.analysis.ambiguous || !prepared.analysis.selectedByMetadata || prepared.analysis.selectedSector === null || prepared.analysis.selectedSequence === null) {
       throw new Error('Activation blocked: OTA metadata has no unambiguous selectable record');
     }
-    const binding = otaDeviceBinding(inspection.macAddress, inspection.secureCert.sha256);
-    options.progress?.stage('Validating fresh device-bound metadata backup');
-    await (await import('./otaManagement.js')).validateOtaMetadataBackup(options.metadataBackupManifest, { bytes: raw, deviceBinding: binding });
-    options.progress?.finish('complete', 'backup SHA-256, identity binding, and exact live metadata match');
-
-    options.progress?.stage('Reading Secure Boot trust configuration');
-    const security = await transport.readSecureBootConfiguration();
-    options.progress?.finish('complete');
-    const part = options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
-    const image = await readPartition(transport, part.offset, part.size, `Verifying complete ${options.target} application`, options.progress, options.signal);
-    const boundary = parseEsp32S3ImageBoundary(image);
-    if (boundary.status !== 'valid-signature' || !boundary.imageEvidence) throw new Error(`Activation blocked: target image is not a valid signed image (${boundary.status})`);
-    const digest = hashImage(image, boundary.imageLength!, `Calculating ${options.target} SHA-256`, options.progress);
-    if (digest.toLowerCase() !== WG1200_0834_SHA256) throw new Error('Activation blocked: target image differs from the independently verified WeatherXM 0.8.34 image');
-    const trust = compareSecureBootTrust(boundary.imageEvidence, security);
-    if (trust.result !== 'TRUSTED') throw new Error(`Activation blocked: Secure Boot signer trust is ${trust.result}`);
-    const descriptor = parseAppDescriptor(image.subarray(0, 4096));
-    if (!descriptor || (security.secureVersion.value !== null && descriptor.secureVersion < security.secureVersion.value)) {
-      throw new Error('Activation blocked: target descriptor is invalid or below the readable eFuse security version');
-    }
-    const otherPart = options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_1 : WG1200_CONSTANTS.APP_OTA_0;
-    const other = await readPartition(transport, otherPart.offset, otherPart.size, 'Validating alternate OTA application', options.progress, options.signal);
-    const otherBoundary = parseEsp32S3ImageBoundary(other);
-    const plan = planOtaActivation({ analysis, target: options.target, actualRunningSlot: null, targetImageValid: true,
-      otherImageValid: otherBoundary.status === 'valid-signature', targetImageSha256: digest, expectedTargetSha256: WG1200_0834_SHA256,
-      targetSignatureTrusted: true, metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    const plan = prepared.plan;
     if (plan.blockers.length) throw new Error(`Activation blocked: ${plan.blockers.join(' ')}`);
-    options.progress?.log(`OTA ACTIVATION PLAN\nCurrent slot (metadata): ${analysis.selectedByMetadata}\nTarget slot: ${options.target}\nCurrent sequence: ${analysis.selectedSequence}\nProposed sequence: ${plan.proposedUpdate.sequence}\nTarget metadata sector address: 0x${plan.proposedUpdate.sectorAddress!.toString(16)}\nWrite length: 4096 bytes\nTarget image SHA-256: VERIFIED\nSecure Boot signer: TRUSTED\nMetadata backup: VERIFIED\nApplication partitions, NVS, factory, bootloader, and partition table: UNCHANGED`);
+    options.progress?.log(`OTA ACTIVATION PLAN\nCurrent slot (metadata): ${prepared.analysis.selectedByMetadata}\nTarget slot: ${options.target}\nCurrent sequence: ${prepared.analysis.selectedSequence}\nProposed sequence: ${plan.proposedUpdate.sequence}\nTarget metadata sector address: 0x${plan.proposedUpdate.sectorAddress!.toString(16)}\nWrite length: 4096 bytes\nSource firmware SHA-256: VERIFIED\nSource Secure Boot signature: VERIFIED\nTarget on-chip MD5: MATCH\nRecovery on-chip MD5: MATCH\nDevice signer trust: ${prepared.trust.result}${plan.verification?.unknownTrustQualified ? ' (UNKNOWN qualified by same selected-device recovery image evidence)' : ''}\nTarget full physical SHA-256: ${prepared.physicalSha256 ? 'VERIFIED' : 'not calculated in FAST mode'}\nMetadata backup: VERIFIED\nApplication partitions, NVS, factory, bootloader, and partition table: UNCHANGED`);
     const destinationAddress = plan.proposedUpdate.sectorAddress!;
     options.progress?.stage(`Writing OTA metadata sector at 0x${destinationAddress.toString(16)}`, 4096);
     const committed = await commitOtaActivationTransaction({ before: raw, plan, transport, confirm: () => options.confirm(plan), signal: options.signal });
+    captureResetAfterOpen = true;
     options.progress?.bytes(4096, 4096);
     options.progress?.finish('complete', 'exact 4096-byte inactive metadata sector independently read back');
-    return { target: options.target, address: committed.address, sequence: committed.sequence, metadata: committed.metadata, firmwareVersion: descriptor.version };
-  });
-  const port = new NodeSerialPort(options.portPath, undefined, undefined, true);
+    return { target: options.target, address: committed.address, sequence: committed.sequence, metadata: committed.metadata, firmwareVersion: prepared.descriptor.version,
+      verificationMode: evidence.mode, sourceSha256: evidence.sourceSha256, sourceSignatureVerified: true, physicalSha256: prepared.physicalSha256,
+      targetOnChipMd5: prepared.targetMd5, recoveryOnChipMd5: prepared.recoveryMd5, signerTrust: prepared.trust.result,
+      unknownTrustQualified: plan.verification?.unknownTrustQualified };
+  }, () => captureResetAfterOpen);
+  const port = new NodeSerialPort(options.portPath,
+    options.traceSerial ? (message) => options.progress?.log(`[serial] ${message}`) : undefined,
+    undefined, true, (stage, state, detail) => options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : state === 'failed' ? 'FAILED' : '...' }${detail ? ` — ${detail}` : ''}`),
+    Boolean(options.verbose || options.traceSerial));
   options.progress?.stage('Capturing bootloader and application startup');
   const boot = await captureBootLogs(port, (options.bootLogSeconds ?? 15) * 1000, undefined,
-    { slotOffset: options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion });
+    { slotOffset: options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion },
+    async () => { await resetNormalBootWithReceiver(port, options.progress); });
   options.progress?.finish(boot.expectedSlotObserved === true ? 'complete' : 'failed', boot.applicationStarted ? 'requested slot and application startup observed' : 'boot selection or application startup not fully observed');
-  return { outcome: 'OTA ACTIVATION COMPLETE', metadataUpdated: true, bootSelectionVerified: boot.expectedSlotObserved === true,
+  const bootVerified = boot.expectedSlotObserved === true && boot.secureBootVerified;
+  return { outcome: bootVerified ? 'OTA METADATA UPDATED; SECURE BOOT SELECTION VERIFIED' : 'OTA METADATA UPDATED; BOOT UNVERIFIED', metadataUpdated: true, bootSelectionVerified: boot.expectedSlotObserved === true,
     applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction, boot: { secureBootVerified: boot.secureBootVerified,
       bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines, bootVersion: boot.bootVersion, lines: boot.lines } };
 }
 
 export async function restoreOtaMetadata(options: DeviceOptions & { metadataBackupManifest: string;
   confirm: (plan: ReturnType<typeof planOtaMetadataRestore>) => Promise<boolean>; bootLogSeconds?: number }) {
+  let captureResetAfterOpen = false;
   const transaction = await withOtaDevice(options, async (transport, inspection) => {
     if (!inspection.secureCert?.sha256) throw new Error('Emergency metadata recovery requires a verified Secure Certificate identity');
     const binding = otaDeviceBinding(inspection.macAddress, inspection.secureCert.sha256);
@@ -305,12 +392,17 @@ export async function restoreOtaMetadata(options: DeviceOptions & { metadataBack
     options.progress?.bytes(4096, 4096); options.progress?.finish('complete', 'one recovery record independently read back; peer sector preserved');
     const after = analyzeOtaMetadata(await transport.readOtadataSnapshot(), { factoryPresent: true });
     if (after.selectedByMetadata !== target || after.selectedSequence !== plan.sequence) throw new Error('Emergency recovery readback did not select the backed-up recovery slot');
+    captureResetAfterOpen = true;
     return { target, sequence: plan.sequence, address: WG1200_CONSTANTS.OTADATA.offset + sector * 4096, metadata: after, firmwareVersion: descriptor!.version };
-  });
-  const port = new NodeSerialPort(options.portPath, undefined, undefined, true);
+  }, () => captureResetAfterOpen);
+  const port = new NodeSerialPort(options.portPath,
+    options.traceSerial ? (message) => options.progress?.log(`[serial] ${message}`) : undefined,
+    undefined, true, (stage, state, detail) => options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : state === 'failed' ? 'FAILED' : '...' }${detail ? ` — ${detail}` : ''}`),
+    Boolean(options.verbose || options.traceSerial));
   options.progress?.stage('Capturing recovery bootloader and application startup');
   const boot = await captureBootLogs(port, (options.bootLogSeconds ?? 15) * 1000, undefined,
-    { slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion });
+    { slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion },
+    async () => { await resetNormalBootWithReceiver(port, options.progress); });
   options.progress?.finish(boot.expectedSlotObserved === true ? 'complete' : 'failed', boot.applicationStarted ? 'recovery application startup observed' : 'recovery boot not fully observed');
   return { outcome: 'OTA METADATA RECOVERY COMPLETE', metadataUpdated: true, bootSelectionVerified: boot.expectedSlotObserved === true,
     applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction,

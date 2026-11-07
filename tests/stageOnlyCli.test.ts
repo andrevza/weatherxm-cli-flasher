@@ -68,7 +68,7 @@ describe('stage-only CLI guards', () => {
     expect(unsupportedMode.stderr).toContain('--verify-mode must be fast or thorough');
     const misplacedMode = run('flash', 'weatherxm', '--verify-mode', 'thorough');
     expect(misplacedMode.status).not.toBe(0);
-    expect(misplacedMode.stderr).toContain('--verify-mode requires flash --stage-only');
+    expect(misplacedMode.stderr).toContain('--verify-mode requires flash --stage-only, ota status, or ota activate');
     const acceptedMode = run('flash', 'weatherxm', '--stage-only', '--verify-mode', 'thorough');
     expect(acceptedMode.status).not.toBe(0);
     expect(acceptedMode.stderr).toContain('flash requires --port');
@@ -115,7 +115,7 @@ describe('stage-only CLI guards', () => {
     expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('--metadata-backup-manifest');
     const arbitrary = run('ota', 'activate', '--target', '0x13000', '--port', '/dev/null', '--dry-run');
     expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('activate --target');
-    expect(run('ota', '--help').stdout).toContain('transaction-specific confirmation');
+    expect(run('ota', '--help').stdout).toContain('A transaction-specific interactive confirmation is required');
     const restore = run('ota', 'restore', '--port', '/dev/null');
     expect(restore.status).not.toBe(0); expect(restore.stderr).toContain('--metadata-backup-manifest');
     expect(run('ota', '--help').stdout).toContain('ota restore');
@@ -146,6 +146,13 @@ describe('stage-only CLI guards', () => {
     const result = run('ota', 'status', '--verify-mode', mode, '--port', '/dev/null', '--json');
     expect(result.status).not.toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'OTA OPERATION FAILED' });
+    expect(result.stderr).not.toContain('--verify-mode requires');
+  });
+
+  it.each(['fast', 'thorough'])('accepts ota activate --verify-mode %s', (mode) => {
+    const result = run('ota', 'activate', '--target', 'ota_0', '--metadata-backup-manifest', '/tmp/backup.json',
+      '--verify-mode', mode, '--port', '/dev/null', '--dry-run');
+    expect(result.status).not.toBe(0);
     expect(result.stderr).not.toContain('--verify-mode requires');
   });
 });

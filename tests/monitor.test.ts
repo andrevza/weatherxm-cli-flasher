@@ -196,4 +196,34 @@ describe('boot log evidence', () => {
     expect(result.bootObserved).toBe(false);
     expect(result.expectedSlotObserved).toBeNull();
   });
+
+  it('still requests normal boot when log capture is disabled after a metadata commit', async () => {
+    const port = { readable: null as ReadableStream<Uint8Array> | null, open: vi.fn(async () => { port.readable = new ReadableStream<Uint8Array>(); }), close: vi.fn(async () => {}) };
+    const reset = vi.fn(async () => {});
+    const result = await captureBootLogs(port, 0, undefined, expected, reset);
+    expect(port.open).toHaveBeenCalledOnce();
+    expect(reset).toHaveBeenCalledOnce();
+    expect(port.close).toHaveBeenCalledOnce();
+    expect(result.expectedSlotObserved).toBeNull();
+  });
+
+  it('starts the boot receiver before pulsing reset and captures the resulting boot text', async () => {
+    const events: string[] = [];
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const port = {
+      readable: null as ReadableStream<Uint8Array> | null,
+      async open() { events.push('open'); this.readable = new ReadableStream<Uint8Array>({ start(value) { controller = value; } }); },
+      async close() { events.push('close'); },
+    };
+    const resultPromise = captureBootLogs(port, 20, undefined, expected, async () => {
+      events.push('reset');
+      controller!.enqueue(new TextEncoder().encode('I boot: Loaded app from partition at offset 0x420000\r\nI secure_boot_v2: Signature verified successfully\r\n'));
+    });
+    const result = await resultPromise;
+    expect(events[0]).toBe('open');
+    expect(events[1]).toBe('reset');
+    expect(result.expectedSlotObserved).toBe(true);
+    expect(result.secureBootVerified).toBe(true);
+    expect(result.lines.join('\n')).toContain('Signature verified successfully');
+  });
 });

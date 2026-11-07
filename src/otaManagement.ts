@@ -161,13 +161,25 @@ export interface OtaActivationPlan {
   expectedTargetSha256: string | null;
   proposedUpdate: { sectorAddress: number | null; length: 4096; sequence: number | null; sequenceCrc32: string | null; state: 'VALID'; priorSectorPreserved: true };
   writeRanges: Array<{ start: number; end: number }>;
+  verification?: { mode: 'fast' | 'thorough'; sourceSha256Verified: boolean; sourceSignatureVerified: boolean;
+    targetOnChipMd5: 'match' | 'mismatch' | 'unknown'; recoveryOnChipMd5: 'match' | 'mismatch' | 'unknown';
+    signerTrust: 'TRUSTED' | 'UNKNOWN' | 'UNTRUSTED' | 'REVOKED' | 'INCOMPATIBLE'; unknownTrustQualified: boolean };
   blockers: string[];
+}
+
+/** A narrow exception for unreadable host eFuse trust evidence; never covers explicit negative results. */
+export function qualifiesUnknownSignerTrust(input: { signerTrust: 'TRUSTED' | 'UNKNOWN' | 'UNTRUSTED' | 'REVOKED' | 'INCOMPATIBLE';
+  sourceSha256Verified: boolean; sourceSignatureVerified: boolean; targetMd5Matches: boolean; recoveryMd5Matches: boolean;
+  selectedByMetadata: string | null; recoverySlot: string; metadataBackupVerified: boolean }): boolean {
+  return input.signerTrust === 'UNKNOWN' && input.sourceSha256Verified && input.sourceSignatureVerified && input.targetMd5Matches &&
+    input.recoveryMd5Matches && input.selectedByMetadata === input.recoverySlot && input.metadataBackupVerified;
 }
 
 /** Derives the one-sector IDF 5.1.2 boot-selection transaction from live metadata. */
 export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target: 'ota_0' | 'ota_1'; actualRunningSlot: string | null;
   targetImageValid: boolean; otherImageValid: boolean; targetImageSha256: string | null; expectedTargetSha256: string | null;
-  targetSignatureTrusted: boolean; metadataBackupVerified: boolean; rollbackConfig: 'enabled' | 'disabled' | 'unknown'; antiRollbackConfig: 'enabled' | 'disabled' | 'unknown' }): OtaActivationPlan {
+  targetSignatureTrusted: boolean; allowUnknownSignerTrust?: boolean; targetDigestMatches?: boolean; metadataBackupVerified: boolean;
+  verification?: OtaActivationPlan['verification']; rollbackConfig: 'enabled' | 'disabled' | 'unknown'; antiRollbackConfig: 'enabled' | 'disabled' | 'unknown' }): OtaActivationPlan {
   const blockers: string[] = [];
   if (input.actualRunningSlot === input.target) blockers.push('Requested target is already the observed running slot; no activation plan is needed.');
   if (input.analysis.selectedByMetadata === input.target) blockers.push('Requested target is already selected by OTA metadata; no metadata update is needed.');
@@ -175,8 +187,9 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
   if (!input.targetImageValid) blockers.push('Target application image validation failed or is unavailable.');
   if (!input.otherImageValid) blockers.push('Other OTA application image validation failed or is unavailable.');
   if (!input.expectedTargetSha256) blockers.push('No exact approved application digest is available for the requested target.');
-  else if (!input.targetImageSha256 || input.targetImageSha256.toLowerCase() !== input.expectedTargetSha256.toLowerCase()) blockers.push('Target image digest does not match the approved artifact.');
-  if (!input.targetSignatureTrusted) blockers.push('Target Secure Boot signature is not verified as trusted by this device.');
+  else if (input.targetDigestMatches === false || (input.targetDigestMatches === undefined &&
+      (!input.targetImageSha256 || input.targetImageSha256.toLowerCase() !== input.expectedTargetSha256.toLowerCase()))) blockers.push('Target image digest does not match the approved artifact.');
+  if (!input.targetSignatureTrusted && !input.allowUnknownSignerTrust) blockers.push('Target Secure Boot signer trust is not verified by this device.');
   if (!input.metadataBackupVerified) blockers.push('A fresh exact OTA metadata backup bound to this device is missing or invalid.');
   if (input.rollbackConfig === 'enabled') blockers.push('Rollback is enabled; application confirmation/rollback behavior must be reviewed before activation.');
   if (input.antiRollbackConfig === 'enabled') blockers.push('Anti-rollback is enabled; target security version must be established before activation.');
@@ -195,7 +208,7 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
     expectedTargetSha256: input.expectedTargetSha256,
     proposedUpdate: { sectorAddress: selectedSector === null ? null : input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
       length: 4096, sequence: proposedSeq, sequenceCrc32: proposedSeq === null ? null : `0x${calculateOtaSeqCrc32(proposedSeq).toString(16).padStart(8, '0')}`,
-      state: 'VALID', priorSectorPreserved: true },
+      state: 'VALID', priorSectorPreserved: true }, verification: input.verification,
     writeRanges: selectedSector === null ? [] : [{ start: input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
       end: input.analysis.partition.offset + (selectedSector === 0 ? 2 : 1) * 4096 }], blockers };
 }

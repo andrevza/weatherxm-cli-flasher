@@ -179,11 +179,26 @@ export async function captureBootLogs(
   durationMs = 15000,
   onLine?: (line: string) => void,
   expected: { slotOffset?: number; firmwareVersion?: string } = {},
+  resetAfterListenerReady?: () => Promise<void>,
 ): Promise<BootLogAnalysis> {
   if (!port) {
     return analyzeBootLogs([], expected);
   }
-  if (durationMs <= 0) return analyzeBootLogs([], expected);
+  if (durationMs <= 0) {
+    if (resetAfterListenerReady) {
+      const lines: string[] = [];
+      try {
+        if (!port.readable) await port.open({ baudRate: 115200 });
+        await resetAfterListenerReady();
+        await port.close();
+      } catch (error) {
+        lines.push(`[Normal-boot reset failed: ${error instanceof Error ? error.message : String(error)}]`);
+        try { await port.close(); } catch { /* best effort */ }
+      }
+      return analyzeBootLogs(lines, expected);
+    }
+    return analyzeBootLogs([], expected);
+  }
   const lines: string[] = [];
 
   try {
@@ -198,9 +213,10 @@ export async function captureBootLogs(
     let buffer = '';
     const deadline = Date.now() + durationMs;
     const sanitizer = new LogSanitizer();
+    let readPromise = reader.read();
+    if (resetAfterListenerReady) await resetAfterListenerReady();
 
     while (Date.now() < deadline) {
-      const readPromise = reader.read();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise = new Promise<{ value?: string; done: boolean }>((resolve) => {
         timer = setTimeout(() => resolve({ done: true }), Math.max(1, deadline - Date.now()));
@@ -208,6 +224,7 @@ export async function captureBootLogs(
       const res = await Promise.race([readPromise, timeoutPromise]);
       if (timer) clearTimeout(timer);
       if (res.done) break;
+      readPromise = reader.read();
 
       if (res.value) {
         buffer += res.value;

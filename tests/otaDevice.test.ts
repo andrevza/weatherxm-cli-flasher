@@ -30,6 +30,9 @@ describe('OTA status verification modes', () => {
     expect(readRegionChunks).not.toHaveBeenCalled();
     expect(result.metadata.sectors.map((sector) => sector.crcValid)).toEqual([true, false]);
     expect(result.antiRollback.status).toBe('unknown');
+    expect(result.activation).toMatchObject({ functionality: 'implemented', allowed: null });
+    expect(result.activation.unknowns).toContain('Installed bootloader rollback behavior');
+    expect(JSON.stringify(result.activation)).not.toContain('writer is intentionally unavailable');
     expect(result.slots.ota_0).toMatchObject({ offset: WG1200_CONSTANTS.APP_OTA_0.offset, sha256: null, descriptor: null, securityVersion: null,
         imageVerification: { method: 'descriptor-and-metadata-only', fullSha256Verified: false, signatureVerified: null,
         trustedBaselineMatched: null, deviceMd5BaselineMatched: null } });

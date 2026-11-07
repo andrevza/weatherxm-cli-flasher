@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, validateOtaMetadataBackup } from '../src/otaManagement.js';
+import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, qualifiesUnknownSignerTrust, validateOtaMetadataBackup } from '../src/otaManagement.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
 import { ProgressReporter } from '../src/progress.js';
 
@@ -51,6 +51,29 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
       targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
       metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
     expect(toZero.proposedUpdate).toMatchObject({ sequence: 7, sectorAddress: 0x14000 });
+  });
+  it('permits only explicitly qualified UNKNOWN signer trust while keeping invalid trust blocked', () => {
+    const analysis = analyzeOtaMetadata(snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    const base = { analysis, target: 'ota_0' as const, actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: null, expectedTargetSha256: 'a'.repeat(64), targetDigestMatches: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown' as const, antiRollbackConfig: 'unknown' as const };
+    const unknown = planOtaActivation({ ...base, targetSignatureTrusted: false, allowUnknownSignerTrust: true });
+    expect(unknown.blockers).toEqual([]);
+    expect(planOtaActivation({ ...base, targetSignatureTrusted: false }).blockers).toContain('Target Secure Boot signer trust is not verified by this device.');
+    expect(planOtaActivation({ ...base, targetSignatureTrusted: false, allowUnknownSignerTrust: false }).blockers).toContain('Target Secure Boot signer trust is not verified by this device.');
+  });
+  it('qualifies UNKNOWN signer evidence only with the authenticated source, matching target and recovery, selected recovery metadata, and current backup', () => {
+    const evidence = { signerTrust: 'UNKNOWN' as const, sourceSha256Verified: true, sourceSignatureVerified: true,
+      targetMd5Matches: true, recoveryMd5Matches: true, selectedByMetadata: 'ota_1', recoverySlot: 'ota_1', metadataBackupVerified: true };
+    expect(qualifiesUnknownSignerTrust(evidence)).toBe(true);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, signerTrust: 'REVOKED' })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, signerTrust: 'UNTRUSTED' })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, signerTrust: 'INCOMPATIBLE' })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, sourceSignatureVerified: false })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, targetMd5Matches: false })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, recoveryMd5Matches: false })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, selectedByMetadata: 'ota_0' })).toBe(false);
+    expect(qualifiesUnknownSignerTrust({ ...evidence, metadataBackupVerified: false })).toBe(false);
   });
   it('commits only the planned 4096-byte sector, validates selected slot, and leaves bytes unchanged on cancellation', async () => {
     const before = snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]);

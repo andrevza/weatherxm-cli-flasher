@@ -127,7 +127,7 @@ function parseArgs(argv: string[]): Args {
     if (out.dryRun && !(out.command === 'flash' || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--dry-run is supported only by flash and ota activate');
     if (out.stageOnly && out.command !== 'flash') throw new Error('--stage-only is supported only by flash');
     if (out.verifyMode && !['fast', 'thorough'].includes(out.verifyMode)) throw new Error('--verify-mode must be fast or thorough');
-    if (out.verifyMode && !out.stageOnly && !(out.command === 'ota' && out.subcommand === 'status')) throw new Error('--verify-mode requires flash --stage-only or ota status');
+    if (out.verifyMode && !out.stageOnly && !(out.command === 'ota' && ['status', 'activate'].includes(out.subcommand ?? ''))) throw new Error('--verify-mode requires flash --stage-only, ota status, or ota activate');
     if (out.backupManifest && out.command !== 'flash') throw new Error('--backup-manifest is supported only by flash --stage-only');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
     if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
@@ -137,7 +137,7 @@ function parseArgs(argv: string[]): Args {
     if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
-    if (bootLogProvided && out.command !== 'flash') throw new Error('--boot-log-seconds is supported only by flash');
+    if (bootLogProvided && out.command !== 'flash' && !(out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? ''))) throw new Error('--boot-log-seconds is supported only by flash, ota activate, or ota restore');
     if (out.stageOnly && (out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
       throw new Error('--stage-only requires flash weatherxm and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
     }
@@ -157,8 +157,8 @@ function parseArgs(argv: string[]): Args {
     if (out.firmwareFile && !(out.command === 'firmware' && out.subcommand === 'compare')) throw new Error('--firmware-file is supported only by firmware compare');
     if (out.firmwareKey && !(out.command === 'firmware' && out.subcommand === 'compare')) throw new Error('--firmware is supported only by firmware compare');
     if (out.expectedSha256 && !(out.command === 'firmware' && out.subcommand === 'compare' && out.firmwareFile)) throw new Error('--expected-sha256 requires firmware compare --firmware-file');
-    if (out.offline && !(['firmware', 'flash', 'check'].includes(out.command))) throw new Error('--offline is supported only by firmware, check, and flash commands');
-    if (out.cacheDirectory && !(['firmware', 'flash', 'check'].includes(out.command))) throw new Error('--cache-dir is supported only by firmware, check, and flash commands');
+    if (out.offline && !(['firmware', 'flash', 'check'].includes(out.command) || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--offline is supported only by firmware, check, flash, and ota activate commands');
+    if (out.cacheDirectory && !(['firmware', 'flash', 'check'].includes(out.command) || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--cache-dir is supported only by firmware, check, flash, and ota activate commands');
     if (out.command === 'firmware' && !['list', 'download', 'compare'].includes(out.subcommand ?? '')) throw new Error('firmware supports list, download, and compare');
     if (out.command === 'firmware' && out.subcommand === 'download' && !['weatherxm', 'meshtastic'].includes(out.target ?? '')) throw new Error('firmware download requires weatherxm or meshtastic');
     if (out.command === 'firmware' && out.subcommand === 'compare' && (!out.backupPath || (Boolean(out.firmwareKey) === Boolean(out.firmwareFile)))) throw new Error('firmware compare requires --backup and exactly one of --firmware <key> or --firmware-file <path>');
@@ -196,7 +196,7 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--json] [--redact]\n\nActivation verifies the full signed target image and exact current metadata backup, then requires an interactive transaction-specific confirmation before writing one 4 KiB sector. Emergency restore verifies a historic device-bound backup and its recovery app, then writes one new VALID selection record first while preserving the peer sector; it does not blindly replay 8 KiB. Both commands capture normal boot logs and report selection separately from application startup. Rollback and anti-rollback configuration may remain unknown; no automatic return is performed. Create a fresh metadata backup before each activation.`,
+      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--verify-mode fast|thorough] [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--json] [--redact]\n\nActivation defaults to Fast: it authenticates the pinned official source image, then compares its exact image-length MD5 with both the target and selected recovery slot. Thorough additionally reads both full OTA partitions and verifies physical image SHA-256 and signatures. Unknown host signer trust is qualified only when the verified selected recovery slot and current device-bound metadata backup match; explicit invalid, revoked, untrusted, or incompatible results block. A transaction-specific interactive confirmation is required before writing one 4 KiB metadata sector. Bootloader Secure Boot and selected offset are reported separately after reset; metadata update alone is not boot success. Emergency restore verifies a historic device-bound backup and recovery app, then writes one new VALID selection record while preserving its peer sector. Create a fresh metadata backup before each activation.`,
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
@@ -364,13 +364,14 @@ async function main() {
         if (!recovery.bootSelectionVerified || !recovery.applicationStarted) process.exitCode = 1;
       } else if (args.dryRun) {
         report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
-          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest, progress, signal: cancellation.signal });
+          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest, verificationMode: args.verifyMode ?? 'fast',
+          offline: args.offline, cacheDirectory: args.cacheDirectory, progress, signal: cancellation.signal });
         progress.log('ACTIVATION DRY RUN COMPLETE — NO FLASH WRITES PERFORMED');
       } else {
         if (!stdin.isTTY || !stdout.isTTY) throw new Error('OTA ACTIVATION BLOCKED: explicit confirmation requires an interactive terminal');
         report = await activateOtaSlot({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal,
-          bootLogSeconds: args.bootLogSeconds, confirm: async (plan) => {
+          bootLogSeconds: args.bootLogSeconds, verificationMode: args.verifyMode ?? 'fast', offline: args.offline, cacheDirectory: args.cacheDirectory, confirm: async (plan) => {
             const phrase = `ACTIVATE ${plan.target} SEQUENCE ${plan.proposedUpdate.sequence}`;
             progress.log(`Type exactly: ${phrase}`);
             return retryExactConfirmation({ phrase,
@@ -379,10 +380,11 @@ async function main() {
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no metadata write has started.`),
             });
           } });
-        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean };
+        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean } };
         progress.log(activation.bootSelectionVerified ? 'BOOT SELECTION VERIFIED' : 'BOOT SELECTION NOT VERIFIED');
+        progress.log(activation.boot.secureBootVerified ? 'SECURE BOOT SIGNATURE VERIFIED BY BOOTLOADER' : 'SECURE BOOT VERIFICATION NOT OBSERVED');
         progress.log(activation.applicationStarted ? 'APPLICATION STARTED' : 'APPLICATION START NOT OBSERVED');
-        if (!activation.bootSelectionVerified || !activation.applicationStarted) process.exitCode = 1;
+        if (!activation.bootSelectionVerified || !activation.applicationStarted || !activation.boot.secureBootVerified) process.exitCode = 1;
       }
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } catch (error) {
