@@ -84,7 +84,7 @@ export async function dryRunOtaActivation(options: DeviceOptions & { target: 'ot
     const otherBoundary = parseEsp32S3ImageBoundary(otherImage);
     return planOtaActivation({ analysis, target: options.target, actualRunningSlot: null,
       targetImageValid, otherImageValid: otherBoundary.status === 'valid-signature', targetImageSha256,
-      expectedTargetSha256: 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb',
+      expectedTargetSha256: options.target === 'ota_0' ? 'bb5af75dfe1b5df7d973110d834c8b7c26af983acc0ff2728900b3ca88dc19eb' : null,
       targetSignatureTrusted, metadataBackupVerified: backupVerified, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
   });
 }

@@ -148,6 +148,7 @@ function cryptoRandomTag(): string { return randomUUID(); }
 
 export interface OtaActivationPlan {
   outcome: 'ACTIVATION BLOCKED'; dryRun: true; target: 'ota_0' | 'ota_1'; selectedByMetadata: OtaMetadataAnalysis['selectedByMetadata'];
+  expectedTargetSha256: string | null;
   proposedUpdate: { sectorAddress: number | null; length: 4096; sequence: number | null; sequenceCrc32: string | null; state: 'NEW or UNDEFINED (installed rollback config unknown)'; priorSectorPreserved: true };
   writeRanges: Array<{ start: number; end: number }>;
   blockers: string[];
@@ -155,7 +156,7 @@ export interface OtaActivationPlan {
 
 /** Planning is deliberately read-only; no writer is exposed for OTA activation. */
 export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target: 'ota_0' | 'ota_1'; actualRunningSlot: string | null;
-  targetImageValid: boolean; otherImageValid: boolean; targetImageSha256: string | null; expectedTargetSha256: string;
+  targetImageValid: boolean; otherImageValid: boolean; targetImageSha256: string | null; expectedTargetSha256: string | null;
   targetSignatureTrusted: boolean; metadataBackupVerified: boolean; rollbackConfig: 'enabled' | 'disabled' | 'unknown'; antiRollbackConfig: 'enabled' | 'disabled' | 'unknown' }): OtaActivationPlan {
   const blockers: string[] = [];
   if (input.actualRunningSlot === null) blockers.push('Actual running slot is unobserved; metadata selection is not proof of a running application.');
@@ -163,7 +164,8 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
   if (!input.analysis.selectedByMetadata || input.analysis.ambiguous) blockers.push('OTA metadata is ambiguous or has no valid selectable record.');
   if (!input.targetImageValid) blockers.push('Target application image validation failed or is unavailable.');
   if (!input.otherImageValid) blockers.push('Other OTA application image validation failed or is unavailable.');
-  if (!input.targetImageSha256 || input.targetImageSha256.toLowerCase() !== input.expectedTargetSha256.toLowerCase()) blockers.push('Target image digest does not match the approved artifact.');
+  if (!input.expectedTargetSha256) blockers.push('No exact approved application digest is available for the requested target.');
+  else if (!input.targetImageSha256 || input.targetImageSha256.toLowerCase() !== input.expectedTargetSha256.toLowerCase()) blockers.push('Target image digest does not match the approved artifact.');
   if (!input.targetSignatureTrusted) blockers.push('Target Secure Boot signature is not verified as trusted by this device.');
   if (!input.metadataBackupVerified) blockers.push('A fresh exact OTA metadata backup bound to this device is missing or invalid.');
   if (input.rollbackConfig === 'unknown') blockers.push('Installed bootloader rollback configuration is unknown.');
@@ -180,6 +182,7 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
   const proposedSeq = multiplier === null ? null : (sequenceResidue + multiplier * 2) >>> 0;
   const selectedSector = input.analysis.selectedSector;
   return { outcome: 'ACTIVATION BLOCKED', dryRun: true, target: input.target, selectedByMetadata: input.analysis.selectedByMetadata,
+    expectedTargetSha256: input.expectedTargetSha256,
     proposedUpdate: { sectorAddress: selectedSector === null ? null : input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
       length: 4096, sequence: proposedSeq, sequenceCrc32: proposedSeq === null ? null : `0x${calculateOtaSeqCrc32(proposedSeq).toString(16).padStart(8, '0')}`,
       state: 'NEW or UNDEFINED (installed rollback config unknown)', priorSectorPreserved: true },
