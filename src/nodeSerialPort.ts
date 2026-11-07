@@ -44,7 +44,10 @@ export class NodeSerialPort {
   async open(options: { baudRate?: number }): Promise<void> {
     if (this.port?.isOpen) return;
     const baudRate = options.baudRate ?? 115200;
-    const serialOptions = { path: this.path, baudRate, autoOpen: false as const, ...(this.passive ? { hupcl: false } : {}) };
+    // Keep the modem lines stable when the ROM transport closes its descriptor.
+    // HUPCL can deassert DTR/RTS on close and create an unintended board reset;
+    // the CLI controls reset explicitly through setSignals().
+    const serialOptions = { path: this.path, baudRate, autoOpen: false as const, hupcl: false };
     this.log(`open path=${this.path} baud=${baudRate} dataBits=8 parity=none stopBits=1 flowControl=none`);
     const stage = `Opening serial port ${this.path}`;
     this.lifecycle?.(stage, 'start');

@@ -45,10 +45,11 @@ async function makeTransport() {
 
 describe('NodeSerialPort transport contract', () => {
   it('reports serial-open lifecycle only after the actual port open succeeds', async () => {
-    const port = new FakePort(); const lifecycle: string[] = [];
-    const adapter = new NodeSerialPort('/dev/fake', undefined, (() => port) as unknown as SerialPortFactory, false,
+    const port = new FakePort(); const lifecycle: string[] = []; let receivedOptions: Record<string, unknown> | undefined;
+    const adapter = new NodeSerialPort('/dev/fake', undefined, ((options: Record<string, unknown>) => { receivedOptions = options; return port; }) as unknown as SerialPortFactory, false,
       (stage, state) => lifecycle.push(`${stage}:${state}`));
     await adapter.open({ baudRate: 115200 });
+    expect(receivedOptions).toMatchObject({ autoOpen: false, hupcl: false, baudRate: 115200 });
     expect(lifecycle).toEqual(['Opening serial port /dev/fake:start', 'Opening serial port /dev/fake:complete']);
     await adapter.close();
   });

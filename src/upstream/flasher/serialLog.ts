@@ -12,6 +12,9 @@ export interface BootLogAnalysis {
   bootVersion?: string;
   secureBootVerified: boolean;
   applicationStarted: boolean;
+  captureError?: string;
+  health: { littlefsMounted: boolean; nvsInitialized: boolean; wifiConnected: boolean; dhcpAddress: boolean; httpServerStarted: boolean;
+    internetConnected: boolean; mqttConnected: boolean; weatherPacketReceived: boolean; stationReceptionComplete: boolean; stationActive: boolean };
 }
 
 export function analyzeBootLogs(lines: string[], expected: { slotOffset?: number; firmwareVersion?: string } = {}): BootLogAnalysis {
@@ -28,23 +31,35 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
   let secureBootVerified = false;
   const bootFailureLines: string[] = [];
   let appStarted = false;
+  const health = { littlefsMounted: false, nvsInitialized: false, wifiConnected: false, dhcpAddress: false, httpServerStarted: false,
+    internetConnected: false, mqttConnected: false, weatherPacketReceived: false, stationReceptionComplete: false, stationActive: false };
   for (const line of lines) {
     const clean = line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
     const lower = clean.toLowerCase();
-    if (/signature verified successfully/i.test(clean)) secureBootVerified = true;
+    if (/secure_boot_v2[^\r\n]*signature verified successfully/i.test(clean)) secureBootVerified = true;
     const version = clean.match(/App version:\s*([^\s,;]+)/i)?.[1];
     if (version) {
       bootVersion ??= version;
       expectedFirmwareObserved = expected.firmwareVersion ? version === expected.firmwareVersion : null;
     }
-    const partitionOffset = clean.match(/(?:loaded app from partition at offset|partition at offset)\s*(0x[0-9a-f]+|[0-9a-f]+)/i)?.[1];
+    const partitionOffset = clean.match(/loaded app from partition at offset\s*(0x[0-9a-f]+|[0-9a-f]+)/i)?.[1];
     if (partitionOffset) {
       observedSlot = Number.parseInt(partitionOffset.replace(/^0x/i, ''), 16);
       bootObserved = true;
     }
     if (/esp-idf|boot:|rst:|configsip|entry 0x|load:0x|secure_boot_v2|app version:/i.test(clean)) bootObserved = true;
     if (/\bapp_main\b|application started|starting application|app startup complete/i.test(clean)) appStarted = true;
-    if (/guru meditation|assert failed|panic(?:'ed)?|abort\(\)|invalid image|no bootable app|boot failed|watchdog reset/i.test(clean)) {
+    health.littlefsMounted ||= /littlefs.*mount(?:ed| successful)|mount(?:ed| successful).*littlefs/i.test(clean);
+    health.nvsInitialized ||= /nvs.*(?:initiali[sz]ed|loaded|init(?:ialized)? successfully)/i.test(clean);
+    health.wifiConnected ||= /wi-?fi connected successfully|wifi connected|got ip:/i.test(clean);
+    health.dhcpAddress ||= /got ip:|dhcp.*(?:bound|address)/i.test(clean);
+    health.httpServerStarted ||= /http server.*(?:started|listening)|server started on port/i.test(clean);
+    health.internetConnected ||= /internet connectivity.*success|internet connected/i.test(clean);
+    health.mqttConnected ||= /mqtt.*connected successfully|connected to mqtt|mqtt connected/i.test(clean);
+    health.weatherPacketReceived ||= /weather[- ]station.*packet received|valid ws\d+ weather packet/i.test(clean);
+    health.stationReceptionComplete ||= /weather[- ]station reception.*100%|reception reached 100%/i.test(clean);
+    health.stationActive ||= /station status\s*[:=]\s*active_ok/i.test(clean);
+    if (/guru meditation|assert failed|panic(?:'ed)?|abort\(\)|invalid image|invalid signature|signature verification failed|no bootable app|boot failed|watchdog reset/i.test(clean)) {
       bootFailureLines.push(clean);
       bootObserved = true;
     }
@@ -63,6 +78,7 @@ function detectBootEvidence(lines: string[], expected: { slotOffset?: number; fi
     bootVersion,
     secureBootVerified,
     applicationStarted: appStarted,
+    health,
   };
 }
 
@@ -180,6 +196,7 @@ export async function captureBootLogs(
   onLine?: (line: string) => void,
   expected: { slotOffset?: number; firmwareVersion?: string } = {},
   resetAfterListenerReady?: () => Promise<void>,
+  onCaptureStarted?: () => void,
 ): Promise<BootLogAnalysis> {
   if (!port) {
     return analyzeBootLogs([], expected);
@@ -211,10 +228,13 @@ export async function captureBootLogs(
     const reader = textDecoder.readable.getReader();
 
     let buffer = '';
-    const deadline = Date.now() + durationMs;
     const sanitizer = new LogSanitizer();
     let readPromise = reader.read();
     if (resetAfterListenerReady) await resetAfterListenerReady();
+    // The requested capture interval begins only after the intentional reset
+    // sequence has released EN. Reset assertion and settling are setup time.
+    onCaptureStarted?.();
+    const deadline = Date.now() + durationMs;
 
     while (Date.now() < deadline) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -232,7 +252,7 @@ export async function captureBootLogs(
         buffer = splitLines.pop() ?? '';
 
         for (const rawLine of splitLines) {
-          const cleanLine = sanitizer.sanitizeLine(rawLine.trim());
+          const cleanLine = sanitizer.sanitizeLine(rawLine.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').trim());
           if (cleanLine !== null && cleanLine.length > 0) {
             lines.push(cleanLine);
             if (onLine) onLine(cleanLine);
@@ -243,7 +263,7 @@ export async function captureBootLogs(
     }
 
     if (buffer.trim().length) {
-      const cleanLine = sanitizer.sanitizeLine(buffer.trim());
+      const cleanLine = sanitizer.sanitizeLine(buffer.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').trim());
       if (cleanLine !== null) {
         lines.push(cleanLine);
         onLine?.(cleanLine);
@@ -258,7 +278,10 @@ export async function captureBootLogs(
       // Ignore close errors
     }
   } catch (err: any) {
-    lines.push(`[Log capture completed or port closed: ${err.message ?? err}]`);
+    try { await port.close(); } catch { /* preserve the capture failure */ }
+    const failed = analyzeBootLogs(lines, expected);
+    failed.captureError = `Boot log capture failed: ${err instanceof Error ? err.message : String(err)}`;
+    return failed;
   }
 
   return analyzeBootLogs(lines, expected);

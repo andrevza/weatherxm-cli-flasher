@@ -226,4 +226,61 @@ describe('boot log evidence', () => {
     expect(result.secureBootVerified).toBe(true);
     expect(result.lines.join('\n')).toContain('Signature verified successfully');
   });
+
+  it('starts the full capture interval only after reset release and announces live capture afterward', async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const events: string[] = [];
+    const port = {
+      readable: null as ReadableStream<Uint8Array> | null,
+      async open() { this.readable = new ReadableStream<Uint8Array>({ start(value) { controller = value; } }); },
+      async close() { events.push('close'); },
+    };
+    const started = Date.now();
+    const liveLines: string[] = [];
+    const result = await captureBootLogs(port, 30, (line) => liveLines.push(line), expected, async () => {
+      events.push('reset-start');
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      controller!.enqueue(new TextEncoder().encode('I boot: Loaded app from partition at offset 0x420000\r\n'));
+      events.push('reset-release');
+    }, () => events.push('capture-start'));
+    expect(events.slice(0, 3)).toEqual(['reset-start', 'reset-release', 'capture-start']);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(60);
+    expect(result.expectedSlotObserved).toBe(true);
+    expect(liveLines).toEqual(['I boot: Loaded app from partition at offset 0x420000']);
+  });
+
+  it('surfaces serial capture errors without converting missing evidence into a boot failure', async () => {
+    const port = {
+      readable: null as ReadableStream<Uint8Array> | null,
+      async open() { throw new Error('USB adapter disappeared'); },
+      async close() {},
+    };
+    const result = await captureBootLogs(port, 20, undefined, expected);
+    expect(result.captureError).toContain('USB adapter disappeared');
+    expect(result.bootFailureObserved).toBe(false);
+    expect(result.expectedSlotObserved).toBeNull();
+  });
+
+  it('requires bootloader Secure Boot V2 and the explicit loaded-app offset markers', () => {
+    expect(analyzeBootLogs(['secure boot verification succeeded', 'I boot: partition at offset 0x420000'], expected))
+      .toMatchObject({ secureBootVerified: false, expectedSlotObserved: null });
+    expect(analyzeBootLogs(['I secure_boot_v2: Signature verified successfully!', 'I boot: Loaded app from partition at offset 0x820000'], expected))
+      .toMatchObject({ secureBootVerified: true, expectedSlotObserved: false });
+  });
+
+  it('records optional service health without requiring it for successful boot evidence', () => {
+    const result = analyzeBootLogs([
+      'I secure_boot_v2: Signature verified successfully!',
+      'I boot: Loaded app from partition at offset 0x420000',
+      'I app_init: App version: 0.8.35-gabc1234',
+      'I main_task: Calling app_main()',
+      'I WiFi: Got IP: 192.0.2.25',
+      'I MQTT: connected successfully',
+    ], expected);
+    expect(result).toMatchObject({ secureBootVerified: true, expectedSlotObserved: true, expectedFirmwareObserved: true, applicationStarted: true });
+    expect(result.health).toMatchObject({ wifiConnected: true, dhcpAddress: true, mqttConnected: true, httpServerStarted: false });
+    const withoutMqtt = analyzeBootLogs(result.lines.slice(0, 4), expected);
+    expect(withoutMqtt.applicationStarted).toBe(true);
+    expect(withoutMqtt.health.mqttConnected).toBe(false);
+  });
 });

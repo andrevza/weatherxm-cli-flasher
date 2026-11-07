@@ -199,7 +199,36 @@ async function resetNormalBootWithReceiver(port: NodeSerialPort, progress?: Prog
   progress?.stage('Releasing ESP32-S3 reset');
   await port.setSignals({ dataTerminalReady: false, requestToSend: false });
   progress?.finish('complete', 'EN released; serial boot capture already listening');
-  await wait(150);
+}
+
+async function captureOtaBoot(portPath: string, expected: { slotOffset: number; firmwareVersion: string }, seconds: number,
+  progress: ProgressReporter | undefined) {
+  const lifecycle = (stage: string, state: 'start' | 'complete' | 'failed', detail?: string) => {
+    if (state === 'start') progress?.log(`${stage}...`);
+    else progress?.log(`${stage} ${state === 'complete' ? 'DONE' : 'FAILED'}${detail ? ` — ${detail}` : ''}`);
+  };
+  // The flash-protocol transport must release its stream reader before the
+  // UART monitor can own the receive stream. The descriptor is reopened with
+  // HUPCL disabled so closing it cannot implicitly pulse the board reset.
+  const port = new NodeSerialPort(portPath, undefined, undefined, true, lifecycle);
+  progress?.stage('Preparing serial boot monitor');
+  try {
+    const boot = await captureBootLogs(port, seconds * 1000, (line) => progress?.log(line), expected,
+      async () => { await resetNormalBootWithReceiver(port, progress); },
+      () => {
+        progress?.stage(`Capturing live boot output (${seconds} seconds)`);
+        progress?.log('--- WG1200 BOOT LOG ---');
+        progress?.suspend();
+      });
+    progress?.resume();
+    progress?.finish(boot.captureError ? 'failed' : 'complete', boot.captureError ?? `captured ${seconds} seconds after reset release`);
+    progress?.log('--- BOOT CAPTURE COMPLETE ---');
+    return boot;
+  } catch (error) {
+    progress?.resume();
+    progress?.finish('failed', error instanceof Error ? error.message : String(error));
+    throw error;
+  }
 }
 
 export async function buildOtaStatusReport(input: { transport: any; inspection: any; verificationMode?: OtaStatusVerificationMode;
@@ -342,19 +371,18 @@ export async function activateOtaSlot(options: DeviceOptions & { target: 'ota_0'
       targetOnChipMd5: prepared.targetMd5, recoveryOnChipMd5: prepared.recoveryMd5, signerTrust: prepared.trust.result,
       unknownTrustQualified: plan.verification?.unknownTrustQualified };
   }, () => captureResetAfterOpen);
-  const port = new NodeSerialPort(options.portPath,
-    options.traceSerial ? (message) => options.progress?.log(`[serial] ${message}`) : undefined,
-    undefined, true, (stage, state, detail) => options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : state === 'failed' ? 'FAILED' : '...' }${detail ? ` — ${detail}` : ''}`),
-    Boolean(options.verbose || options.traceSerial));
-  options.progress?.stage('Capturing bootloader and application startup');
-  const boot = await captureBootLogs(port, (options.bootLogSeconds ?? 15) * 1000, undefined,
-    { slotOffset: options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion },
-    async () => { await resetNormalBootWithReceiver(port, options.progress); });
-  options.progress?.finish(boot.expectedSlotObserved === true ? 'complete' : 'failed', boot.applicationStarted ? 'requested slot and application startup observed' : 'boot selection or application startup not fully observed');
+  const boot = await captureOtaBoot(options.portPath, {
+    slotOffset: options.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset,
+    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress);
   const bootVerified = boot.expectedSlotObserved === true && boot.secureBootVerified;
-  return { outcome: bootVerified ? 'OTA METADATA UPDATED; SECURE BOOT SELECTION VERIFIED' : 'OTA METADATA UPDATED; BOOT UNVERIFIED', metadataUpdated: true, bootSelectionVerified: boot.expectedSlotObserved === true,
-    applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction, boot: { secureBootVerified: boot.secureBootVerified,
-      bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines, bootVersion: boot.bootVersion, lines: boot.lines } };
+  const applicationVerified = boot.applicationStarted && boot.expectedFirmwareObserved === true && !boot.bootFailureObserved;
+  const bootValidationFailed = boot.bootFailureObserved || boot.expectedSlotObserved === false || boot.expectedFirmwareObserved === false;
+  return { outcome: bootVerified && applicationVerified && !boot.captureError ? 'OTA ACTIVATION COMPLETE'
+    : bootValidationFailed ? 'OTA METADATA UPDATED; BOOT VALIDATION FAILED' : 'OTA METADATA UPDATED; BOOT UNVERIFIED', metadataUpdated: true,
+    bootSelectionVerified: boot.expectedSlotObserved === true, applicationStarted: boot.applicationStarted,
+    bootValidationFailed, applicationHealth: 'unverified', transaction, boot: { secureBootVerified: boot.secureBootVerified,
+      bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines, bootVersion: boot.bootVersion,
+      expectedFirmwareObserved: boot.expectedFirmwareObserved, applicationVerified, health: boot.health, captureError: boot.captureError ?? null, lines: boot.lines } };
 }
 
 export async function restoreOtaMetadata(options: DeviceOptions & { metadataBackupManifest: string;
@@ -396,16 +424,14 @@ export async function restoreOtaMetadata(options: DeviceOptions & { metadataBack
     captureResetAfterOpen = true;
     return { target, sequence: plan.sequence, address: WG1200_CONSTANTS.OTADATA.offset + sector * 4096, metadata: after, firmwareVersion: descriptor!.version };
   }, () => captureResetAfterOpen);
-  const port = new NodeSerialPort(options.portPath,
-    options.traceSerial ? (message) => options.progress?.log(`[serial] ${message}`) : undefined,
-    undefined, true, (stage, state, detail) => options.progress?.log(`${stage} ${state === 'complete' ? 'DONE' : state === 'failed' ? 'FAILED' : '...' }${detail ? ` — ${detail}` : ''}`),
-    Boolean(options.verbose || options.traceSerial));
-  options.progress?.stage('Capturing recovery bootloader and application startup');
-  const boot = await captureBootLogs(port, (options.bootLogSeconds ?? 15) * 1000, undefined,
-    { slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset, firmwareVersion: transaction.firmwareVersion },
-    async () => { await resetNormalBootWithReceiver(port, options.progress); });
-  options.progress?.finish(boot.expectedSlotObserved === true ? 'complete' : 'failed', boot.applicationStarted ? 'recovery application startup observed' : 'recovery boot not fully observed');
-  return { outcome: 'OTA METADATA RECOVERY COMPLETE', metadataUpdated: true, bootSelectionVerified: boot.expectedSlotObserved === true,
-    applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction,
-    boot: { secureBootVerified: boot.secureBootVerified, bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines, lines: boot.lines } };
+  const boot = await captureOtaBoot(options.portPath, {
+    slotOffset: transaction.target === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0.offset : WG1200_CONSTANTS.APP_OTA_1.offset,
+    firmwareVersion: transaction.firmwareVersion }, options.bootLogSeconds ?? 15, options.progress);
+  const bootValidationFailed = boot.bootFailureObserved || boot.expectedSlotObserved === false || boot.expectedFirmwareObserved === false;
+  return { outcome: boot.expectedSlotObserved && boot.secureBootVerified && boot.applicationStarted && !boot.bootFailureObserved
+    ? 'OTA METADATA RECOVERY COMPLETE' : bootValidationFailed ? 'OTA METADATA UPDATED; BOOT VALIDATION FAILED' : 'OTA METADATA UPDATED; BOOT UNVERIFIED', metadataUpdated: true,
+    bootValidationFailed,
+    bootSelectionVerified: boot.expectedSlotObserved === true, applicationStarted: boot.applicationStarted, applicationHealth: 'unverified', transaction,
+    boot: { secureBootVerified: boot.secureBootVerified, bootFailureObserved: boot.bootFailureObserved, bootFailureLines: boot.bootFailureLines,
+      bootVersion: boot.bootVersion, expectedFirmwareObserved: boot.expectedFirmwareObserved, health: boot.health, captureError: boot.captureError ?? null, lines: boot.lines } };
 }

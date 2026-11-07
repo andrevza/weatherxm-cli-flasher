@@ -10,6 +10,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import packageMetadata from '../package.json';
 import { createWriteStream } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
 import { finished } from 'node:stream/promises';
 import { analyzeBootLogs } from './upstream/flasher/serialLog.js';
 import { monitorSerial, type MonitorLevel, writeMonitorOutput } from './monitor.js';
@@ -23,7 +25,7 @@ import { activateOtaSlot, backupOtaMetadata, dryRunOtaActivation, readOtaStatus,
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; target?: string; firmwareKey?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; verbose: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; verifyMode?: VerificationMode; backupManifest?: string; metadataBackupManifest?: string; backupPath?: string; firmwareFile?: string; expectedSha256?: string; firmwareVersion?: string; offline: boolean; cacheDirectory?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; firmwareKey?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; verbose: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; verifyMode?: VerificationMode; backupManifest?: string; metadataBackupManifest?: string; backupPath?: string; firmwareFile?: string; expectedSha256?: string; firmwareVersion?: string; offline: boolean; cacheDirectory?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; bootLogOutput?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -111,9 +113,10 @@ function parseArgs(argv: string[]): Args {
     else if (arg === '--timestamp') out.timestamp = true;
     else if (arg === '--level') out.level = argv[++i] as MonitorLevel;
     else if (arg === '--output') out.outputFile = argv[++i];
+    else if (arg === '--boot-log-output') out.bootLogOutput = argv[++i];
     else if (arg === '--raw') out.raw = true;
     else if (arg === '--no-color') out.noColor = true;
-    else if (arg === '--boot-log-seconds') { out.bootLogSeconds = Number(argv[++i]); bootLogProvided = true; }
+    else if (arg === '--boot-log-seconds' || arg === '--boot-capture-seconds') { out.bootLogSeconds = Number(argv[++i]); bootLogProvided = true; }
     else if (arg === '--help' || arg === '-h') helpRequested = true;
     else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
     else positional.push(arg);
@@ -138,6 +141,7 @@ function parseArgs(argv: string[]): Args {
     if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
+    if (out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? '') && out.bootLogSeconds < 15) throw new Error('OTA activation and restoration boot capture must be at least 15 seconds');
     if (bootLogProvided && out.command !== 'flash' && !(out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? ''))) throw new Error('--boot-log-seconds is supported only by flash, ota activate, or ota restore');
     if (out.stageOnly && (out.subcommand !== 'weatherxm' || out.yes || out.force || out.recover || out.dryRun || out.monitor)) {
       throw new Error('--stage-only requires flash weatherxm and interactive confirmation; --yes, --force, --recover, --dry-run, and --monitor are not permitted');
@@ -164,6 +168,7 @@ function parseArgs(argv: string[]): Args {
     if (out.command === 'firmware' && out.subcommand === 'download' && !['weatherxm', 'meshtastic'].includes(out.target ?? '')) throw new Error('firmware download requires weatherxm or meshtastic');
     if (out.command === 'firmware' && out.subcommand === 'compare' && (!out.backupPath || (Boolean(out.firmwareKey) === Boolean(out.firmwareFile)))) throw new Error('firmware compare requires --backup and exactly one of --firmware <key> or --firmware-file <path>');
     if (out.outputFile && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
+    if (out.bootLogOutput && !(out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? ''))) throw new Error('--boot-log-output is supported only by ota activate and ota restore');
     if (out.command === 'monitor' && out.json) throw new Error('--json is not supported by the continuous monitor command');
   }
   return out;
@@ -197,7 +202,7 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--verify-mode fast|thorough] [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--json] [--redact]\n\nActivation defaults to Fast: it authenticates the pinned official source image, then compares its exact image-length MD5 with both the target and selected recovery slot. Thorough additionally reads both full OTA partitions and verifies physical image SHA-256 and signatures. Unknown host signer trust is qualified only when the verified selected recovery slot and current device-bound metadata backup match; explicit invalid, revoked, untrusted, or incompatible results block. A transaction-specific interactive confirmation is required before writing one 4 KiB metadata sector. Bootloader Secure Boot and selected offset are reported separately after reset; metadata update alone is not boot success. Emergency restore verifies a historic device-bound backup and recovery app, then writes one new VALID selection record while preserving its peer sector. Create a fresh metadata backup before each activation.`,
+      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--verify-mode fast|thorough] [--boot-capture-seconds <15|30|60>] [--boot-log-output <file>] [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--boot-capture-seconds <15|30|60>] [--boot-log-output <file>] [--json] [--redact]\n\nActivation defaults to Fast: it authenticates the pinned official source image, then compares its exact image-length MD5 with both the target and selected recovery slot. Thorough additionally reads both full OTA partitions and verifies physical image SHA-256 and signatures. Unknown host signer trust is qualified only when the verified selected recovery slot and current device-bound metadata backup match; explicit invalid, revoked, untrusted, or incompatible results block. A transaction-specific interactive confirmation is required before writing one 4 KiB metadata sector. After commit, a live 15-second normal-boot capture reports Secure Boot V2, loaded offset and application version/startup independently; --boot-capture-seconds accepts longer captures, and --boot-log-output saves the captured lines. Emergency restore verifies a historic device-bound backup and recovery app, then writes one new VALID selection record while preserving its peer sector. Create a fresh metadata backup before each activation.`,
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
@@ -359,10 +364,19 @@ async function main() {
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no flash write has started.`),
             });
           } });
-        const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean };
+        const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; bootFailureObserved: boolean; captureError?: string | null; lines: string[]; health: { wifiConnected: boolean; mqttConnected: boolean } } };
+        if (args.bootLogOutput) {
+          const text = `${recovery.boot.lines.join('\n')}\n`;
+          await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
+          progress.log(`Boot log saved to ${resolvePath(args.bootLogOutput)}`);
+        }
         progress.log(recovery.bootSelectionVerified ? 'RECOVERY BOOT SELECTION VERIFIED' : 'RECOVERY BOOT SELECTION NOT VERIFIED');
         progress.log(recovery.applicationStarted ? 'RECOVERY APPLICATION STARTED' : 'RECOVERY APPLICATION START NOT OBSERVED');
-        if (!recovery.bootSelectionVerified || !recovery.applicationStarted) process.exitCode = 1;
+        progress.log(`Wi-Fi: ${recovery.boot.health.wifiConnected ? 'CONNECTED' : 'NOT OBSERVED'}; MQTT: ${recovery.boot.health.mqttConnected ? 'CONNECTED' : 'NOT OBSERVED'}`);
+        if (!recovery.boot.secureBootVerified) progress.log('SECURE BOOT VERIFICATION NOT OBSERVED');
+        if (recovery.boot.bootFailureObserved) progress.log('APPLICATION FAILURE OBSERVED IN BOOT LOG');
+        if (recovery.boot.captureError) progress.log(recovery.boot.captureError);
+        if (!recovery.bootSelectionVerified || !recovery.applicationStarted || !recovery.boot.secureBootVerified || recovery.boot.bootFailureObserved || recovery.boot.captureError) process.exitCode = 1;
       } else if (args.dryRun) {
         report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest, verificationMode: args.verifyMode ?? 'fast',
@@ -380,11 +394,21 @@ async function main() {
               onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no metadata write has started.`),
             });
           } });
-        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean } };
+        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean; boot: { secureBootVerified: boolean; expectedFirmwareObserved: boolean | null; bootFailureObserved: boolean; bootVersion?: string; captureError?: string | null; lines: string[]; health: { wifiConnected: boolean; mqttConnected: boolean } } };
+        if (args.bootLogOutput) {
+          const text = `${activation.boot.lines.join('\n')}\n`;
+          await writeFile(resolvePath(args.bootLogOutput), args.redact ? redactOutput(text) : text, { encoding: 'utf8' });
+          progress.log(`Boot log saved to ${resolvePath(args.bootLogOutput)}`);
+        }
         progress.log(activation.bootSelectionVerified ? 'BOOT SELECTION VERIFIED' : 'BOOT SELECTION NOT VERIFIED');
         progress.log(activation.boot.secureBootVerified ? 'SECURE BOOT SIGNATURE VERIFIED BY BOOTLOADER' : 'SECURE BOOT VERIFICATION NOT OBSERVED');
         progress.log(activation.applicationStarted ? 'APPLICATION STARTED' : 'APPLICATION START NOT OBSERVED');
-        if (!activation.bootSelectionVerified || !activation.applicationStarted || !activation.boot.secureBootVerified) process.exitCode = 1;
+        progress.log(`APPLICATION VERSION ${activation.boot.expectedFirmwareObserved === true ? 'VERIFIED' : activation.boot.expectedFirmwareObserved === false ? 'MISMATCH' : 'NOT OBSERVED'}${activation.boot.bootVersion ? ` (${activation.boot.bootVersion})` : ''}`);
+        progress.log(`Wi-Fi: ${activation.boot.health.wifiConnected ? 'CONNECTED' : 'NOT OBSERVED'}; MQTT: ${activation.boot.health.mqttConnected ? 'CONNECTED' : 'NOT OBSERVED'}`);
+        if (activation.boot.bootFailureObserved) progress.log('APPLICATION FAILURE OBSERVED IN BOOT LOG');
+        if (activation.boot.captureError) progress.log(activation.boot.captureError);
+        if (!activation.bootSelectionVerified || !activation.applicationStarted || !activation.boot.secureBootVerified ||
+            activation.boot.expectedFirmwareObserved !== true || activation.boot.bootFailureObserved || activation.boot.captureError) process.exitCode = 1;
       }
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } catch (error) {

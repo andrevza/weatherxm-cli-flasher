@@ -121,6 +121,17 @@ describe('stage-only CLI guards', () => {
     expect(run('ota', '--help').stdout).toContain('ota restore');
   });
 
+  it('accepts configurable OTA boot capture durations but enforces the 15-second minimum', () => {
+    const common = ['ota', 'activate', '--target', 'ota_0', '--metadata-backup-manifest', '/tmp/backup.json', '--port', '/dev/null', '--dry-run', '--offline'];
+    const tooShort = run(...common, '--boot-capture-seconds', '14');
+    expect(tooShort.status).not.toBe(0);
+    expect(tooShort.stderr).toContain('boot capture must be at least 15 seconds');
+    const extended = run(...common, '--boot-capture-seconds', '30');
+    expect(extended.status).not.toBe(0);
+    expect(extended.stderr).not.toContain('boot capture must be at least 15 seconds');
+    expect(extended.stderr).toContain('offline');
+  });
+
   it('keeps JSON stdout parseable while progress and diagnostics stay on redirected stderr', () => {
     const result = run('firmware', 'download', 'weatherxm', '--manifest', 'http://127.0.0.1:1/manifest.json', '--cache-dir', '/tmp/wg1200-empty-json-cache', '--json');
     expect(result.status).not.toBe(0);
