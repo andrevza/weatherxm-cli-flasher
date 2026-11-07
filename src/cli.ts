@@ -18,7 +18,7 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 import { bindAbortOnSigint } from './interrupt.js';
 import type { VerificationMode } from './verification.js';
 import { ConfirmationCancelledError, retryExactConfirmation } from './verification.js';
-import { backupOtaMetadata, dryRunOtaActivation, readOtaStatus } from './otaDevice.js';
+import { activateOtaSlot, backupOtaMetadata, dryRunOtaActivation, readOtaStatus, restoreOtaMetadata } from './otaDevice.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
@@ -143,8 +143,8 @@ function parseArgs(argv: string[]): Args {
     }
     if (out.stageOnly && manifestProvided && out.manifest !== DEFAULT_MANIFEST_URL) throw new Error('--stage-only accepts only the pinned official WeatherXM firmware manifest');
     if (out.backupManifest && !out.stageOnly) throw new Error('--backup-manifest requires --stage-only');
-    if (out.command === 'ota' && (!['status', 'backup', 'activate'].includes(out.subcommand ?? '') || out.yes || out.force || out.recover || out.stageOnly || out.monitor || (out.subcommand === 'backup' && !out.outputFile) || (out.subcommand !== 'backup' && out.outputFile) || (out.subcommand === 'activate' && (!['ota_0', 'ota_1'].includes(out.target ?? '') || !out.dryRun)))) throw new Error('ota supports read-only status, backup --output, and fail-closed activate --target ota_0|ota_1 --dry-run only');
-    if (out.metadataBackupManifest && !(out.command === 'ota' && out.subcommand === 'activate')) throw new Error('--metadata-backup-manifest requires ota activate');
+    if (out.command === 'ota' && (!['status', 'backup', 'activate', 'restore'].includes(out.subcommand ?? '') || out.yes || out.force || out.recover || out.stageOnly || out.monitor || (out.subcommand === 'backup' && !out.outputFile) || (out.subcommand !== 'backup' && out.outputFile) || (out.subcommand === 'activate' && (!['ota_0', 'ota_1'].includes(out.target ?? '') || !out.metadataBackupManifest)) || (out.subcommand === 'restore' && (!out.metadataBackupManifest || out.target || out.dryRun)))) throw new Error('ota supports status, backup --output, activate --target and restore, both requiring --metadata-backup-manifest');
+    if (out.metadataBackupManifest && !(out.command === 'ota' && ['activate', 'restore'].includes(out.subcommand ?? ''))) throw new Error('--metadata-backup-manifest requires ota activate or ota restore');
     if (out.command === 'ota' && out.subcommand === 'status' && (out.target || out.dryRun)) throw new Error('ota status does not accept --target or --dry-run');
     if (out.command === 'backup' && (!(['inactive', 'active'].includes(out.subcommand ?? '') || (out.subcommand === 'partition' && Boolean(out.target))) || !out.outputFile || out.yes || out.force || out.recover || out.dryRun || out.stageOnly || out.monitor || out.timestamp || out.level || out.raw || out.noColor)) {
       throw new Error('backup requires `backup <active|inactive> --port <path> --output <file>` or `backup partition <name> --port <path> --output <file>`; it never overwrites existing files');
@@ -193,7 +193,7 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
-      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --dry-run [--metadata-backup-manifest <path>] [--json]\n\nOTA status defaults to fast descriptor-and-metadata inspection. Use --verify-mode thorough to read both complete OTA images and verify local SHA-256 and Secure Boot V2 signatures. Fast mode does not verify full-image integrity or signatures. Status and backup are read-only. Activation is dry-run only and always fail-closed until installed bootloader rollback configuration and return behavior are proven. A ROM inspection cannot establish the application actually running.`,
+      ota: `USAGE\n  ${name} ota status --port <path> [--verify-mode fast|thorough] [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --metadata-backup-manifest <path> [--dry-run] [--json] [--redact]\n  ${name} ota restore --port <path> --metadata-backup-manifest <path> [--json] [--redact]\n\nActivation verifies the full signed target image and exact current metadata backup, then requires an interactive transaction-specific confirmation before writing one 4 KiB sector. Emergency restore verifies a historic device-bound backup and its recovery app, then writes one new VALID selection record first while preserving the peer sector; it does not blindly replay 8 KiB. Both commands capture normal boot logs and report selection separately from application startup. Rollback and anti-rollback configuration may remain unknown; no automatic return is performed. Create a fresh metadata backup before each activation.`,
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
@@ -342,11 +342,44 @@ async function main() {
         report = await backupOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           outputPath: args.outputFile, progress, signal: cancellation.signal });
         progress.log('OTA METADATA BACKUP VERIFIED');
-      } else {
+      } else if (args.subcommand === 'restore') {
+        if (!stdin.isTTY || !stdout.isTTY) throw new Error('EMERGENCY OTA RECOVERY BLOCKED: explicit high-risk confirmation requires an interactive terminal');
+        report = await restoreOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
+          metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal, bootLogSeconds: args.bootLogSeconds,
+          confirm: async (plan) => {
+            const phrase = `RESTORE OTA TARGET ${plan.target} SEQUENCE ${plan.sequence}`;
+            progress.log(`High-risk recovery. Type exactly: ${phrase}`);
+            return retryExactConfirmation({ phrase,
+              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Confirm emergency metadata recovery (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
+              askRetry: async () => { const rl = createInterface({ input: stdin, output: stdout }); try { const v = (await rl.question('1) Retry  2) Cancel [1]: ', { signal: cancellation.signal })).trim(); return v === '' || v === '1' ? 'retry' : 'cancel'; } finally { rl.close(); } },
+              onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no flash write has started.`),
+            });
+          } });
+        const recovery = report as { bootSelectionVerified: boolean; applicationStarted: boolean };
+        progress.log(recovery.bootSelectionVerified ? 'RECOVERY BOOT SELECTION VERIFIED' : 'RECOVERY BOOT SELECTION NOT VERIFIED');
+        progress.log(recovery.applicationStarted ? 'RECOVERY APPLICATION STARTED' : 'RECOVERY APPLICATION START NOT OBSERVED');
+        if (!recovery.bootSelectionVerified || !recovery.applicationStarted) process.exitCode = 1;
+      } else if (args.dryRun) {
         report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
           target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest, progress, signal: cancellation.signal });
-        progress.log('ACTIVATION PLAN COMPLETE — BLOCKED; NO FLASH WRITES PERFORMED');
-        process.exitCode = 1;
+        progress.log('ACTIVATION DRY RUN COMPLETE — NO FLASH WRITES PERFORMED');
+      } else {
+        if (!stdin.isTTY || !stdout.isTTY) throw new Error('OTA ACTIVATION BLOCKED: explicit confirmation requires an interactive terminal');
+        report = await activateOtaSlot({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, traceSerial: args.traceSerial,
+          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest!, progress, signal: cancellation.signal,
+          bootLogSeconds: args.bootLogSeconds, confirm: async (plan) => {
+            const phrase = `ACTIVATE ${plan.target} SEQUENCE ${plan.proposedUpdate.sequence}`;
+            progress.log(`Type exactly: ${phrase}`);
+            return retryExactConfirmation({ phrase,
+              askPhrase: async (attempt, expected) => { if (attempt > 1) progress.log(`Required confirmation: ${expected}`); const rl = createInterface({ input: stdin, output: stdout }); try { return await rl.question('Confirm OTA metadata update (or type CANCEL): ', { signal: cancellation.signal }); } finally { rl.close(); } },
+              askRetry: async () => { const rl = createInterface({ input: stdin, output: stdout }); try { const v = (await rl.question('1) Retry  2) Cancel [1]: ', { signal: cancellation.signal })).trim(); return v === '' || v === '1' ? 'retry' : 'cancel'; } finally { rl.close(); } },
+              onMismatch: (attempt, max) => progress.log(`Confirmation mismatch (${attempt}/${max}); no metadata write has started.`),
+            });
+          } });
+        const activation = report as { bootSelectionVerified: boolean; applicationStarted: boolean };
+        progress.log(activation.bootSelectionVerified ? 'BOOT SELECTION VERIFIED' : 'BOOT SELECTION NOT VERIFIED');
+        progress.log(activation.applicationStarted ? 'APPLICATION STARTED' : 'APPLICATION START NOT OBSERVED');
+        if (!activation.bootSelectionVerified || !activation.applicationStarted) process.exitCode = 1;
       }
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     } catch (error) {

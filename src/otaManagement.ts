@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
 import { link, mkdir, open, readFile, unlink } from 'node:fs/promises';
 import { WG1200_CONSTANTS } from './upstream/flasher/constants.js';
-import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_NEW, ESP_OTA_IMG_PENDING_VERIFY, ESP_OTA_IMG_UNDEFINED, ESP_OTA_IMG_VALID } from './upstream/flasher/otadata.js';
+import { buildTransactionalOtadataSector, calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_NEW, ESP_OTA_IMG_PENDING_VERIFY, ESP_OTA_IMG_UNDEFINED, ESP_OTA_IMG_VALID } from './upstream/flasher/otadata.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
 import type { ProgressReporter } from './progress.js';
 
@@ -157,20 +157,20 @@ export async function createOtaMetadataBackup(input: {
 function cryptoRandomTag(): string { return randomUUID(); }
 
 export interface OtaActivationPlan {
-  outcome: 'ACTIVATION BLOCKED'; dryRun: true; target: 'ota_0' | 'ota_1'; selectedByMetadata: OtaMetadataAnalysis['selectedByMetadata'];
+  outcome: 'OTA ACTIVATION PLAN'; dryRun: true; target: 'ota_0' | 'ota_1'; selectedByMetadata: OtaMetadataAnalysis['selectedByMetadata'];
   expectedTargetSha256: string | null;
-  proposedUpdate: { sectorAddress: number | null; length: 4096; sequence: number | null; sequenceCrc32: string | null; state: 'NEW or UNDEFINED (installed rollback config unknown)'; priorSectorPreserved: true };
+  proposedUpdate: { sectorAddress: number | null; length: 4096; sequence: number | null; sequenceCrc32: string | null; state: 'VALID'; priorSectorPreserved: true };
   writeRanges: Array<{ start: number; end: number }>;
   blockers: string[];
 }
 
-/** Planning is deliberately read-only; no writer is exposed for OTA activation. */
+/** Derives the one-sector IDF 5.1.2 boot-selection transaction from live metadata. */
 export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target: 'ota_0' | 'ota_1'; actualRunningSlot: string | null;
   targetImageValid: boolean; otherImageValid: boolean; targetImageSha256: string | null; expectedTargetSha256: string | null;
   targetSignatureTrusted: boolean; metadataBackupVerified: boolean; rollbackConfig: 'enabled' | 'disabled' | 'unknown'; antiRollbackConfig: 'enabled' | 'disabled' | 'unknown' }): OtaActivationPlan {
   const blockers: string[] = [];
-  if (input.actualRunningSlot === null) blockers.push('Actual running slot is unobserved; metadata selection is not proof of a running application.');
-  else if (input.actualRunningSlot === input.target) blockers.push('Requested target is already the observed running slot; no activation plan is needed.');
+  if (input.actualRunningSlot === input.target) blockers.push('Requested target is already the observed running slot; no activation plan is needed.');
+  if (input.analysis.selectedByMetadata === input.target) blockers.push('Requested target is already selected by OTA metadata; no metadata update is needed.');
   if (!input.analysis.selectedByMetadata || input.analysis.ambiguous) blockers.push('OTA metadata is ambiguous or has no valid selectable record.');
   if (!input.targetImageValid) blockers.push('Target application image validation failed or is unavailable.');
   if (!input.otherImageValid) blockers.push('Other OTA application image validation failed or is unavailable.');
@@ -178,9 +178,8 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
   else if (!input.targetImageSha256 || input.targetImageSha256.toLowerCase() !== input.expectedTargetSha256.toLowerCase()) blockers.push('Target image digest does not match the approved artifact.');
   if (!input.targetSignatureTrusted) blockers.push('Target Secure Boot signature is not verified as trusted by this device.');
   if (!input.metadataBackupVerified) blockers.push('A fresh exact OTA metadata backup bound to this device is missing or invalid.');
-  if (input.rollbackConfig === 'unknown') blockers.push('Installed bootloader rollback configuration is unknown.');
-  if (input.antiRollbackConfig === 'unknown') blockers.push('Installed bootloader anti-rollback configuration is unknown.');
-  blockers.push('Activation writer is intentionally unavailable until installed bootloader and return behavior are established.');
+  if (input.rollbackConfig === 'enabled') blockers.push('Rollback is enabled; application confirmation/rollback behavior must be reviewed before activation.');
+  if (input.antiRollbackConfig === 'enabled') blockers.push('Anti-rollback is enabled; target security version must be established before activation.');
   const current = input.analysis.sectors[input.analysis.selectedSector ?? 0];
   const targetIndex = input.target === 'ota_0' ? 0 : 1;
   const currentSequence = current?.sequence;
@@ -191,17 +190,57 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
     : Math.max(0, Math.ceil((currentSequence - sequenceResidue) / 2));
   const proposedSeq = multiplier === null ? null : (sequenceResidue + multiplier * 2) >>> 0;
   const selectedSector = input.analysis.selectedSector;
-  return { outcome: 'ACTIVATION BLOCKED', dryRun: true, target: input.target, selectedByMetadata: input.analysis.selectedByMetadata,
+  if (currentSequence === 0xffffffff || currentSequence === 0xfffffffe) blockers.push('OTA sequence is at the unsupported wrap boundary.');
+  return { outcome: 'OTA ACTIVATION PLAN', dryRun: true, target: input.target, selectedByMetadata: input.analysis.selectedByMetadata,
     expectedTargetSha256: input.expectedTargetSha256,
     proposedUpdate: { sectorAddress: selectedSector === null ? null : input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
       length: 4096, sequence: proposedSeq, sequenceCrc32: proposedSeq === null ? null : `0x${calculateOtaSeqCrc32(proposedSeq).toString(16).padStart(8, '0')}`,
-      state: 'NEW or UNDEFINED (installed rollback config unknown)', priorSectorPreserved: true },
-    writeRanges: [], blockers };
+      state: 'VALID', priorSectorPreserved: true },
+    writeRanges: selectedSector === null ? [] : [{ start: input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
+      end: input.analysis.partition.offset + (selectedSector === 0 ? 2 : 1) * 4096 }], blockers };
+}
+
+/** Shared one-sector commit path. Its injected transport keeps all write tests deterministic and hardware-free. */
+export async function commitOtaActivationTransaction(input: {
+  before: Uint8Array; plan: OtaActivationPlan;
+  transport: { readOtadataSnapshot(): Promise<Uint8Array>; writeOtaSelectSector(address: number, bytes: Uint8Array, sequence: number, before: Uint8Array): Promise<void> };
+  confirm(): Promise<boolean>; signal?: AbortSignal;
+}): Promise<{ metadata: OtaMetadataAnalysis; address: number; sequence: number; bytesWritten: 4096 }> {
+  if (input.plan.blockers.length) throw new Error(`Activation blocked: ${input.plan.blockers.join(' ')}`);
+  const { sectorAddress: address, sequence } = input.plan.proposedUpdate;
+  if (address === null || sequence === null ||
+      input.plan.writeRanges.length !== 1 || input.plan.writeRanges[0]!.start !== address || input.plan.writeRanges[0]!.end !== address + 4096) {
+    throw new Error('Activation plan has an invalid or non-sector write range');
+  }
+  if (!(await input.confirm())) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
+  if (input.signal?.aborted) throw new Error('OTA activation cancelled before metadata write; flash is unchanged');
+  const live = await input.transport.readOtadataSnapshot();
+  if (live.byteLength !== input.before.byteLength || !live.every((byte, index) => byte === input.before[index])) {
+    throw new Error('OTA metadata changed after confirmation; refusing activation');
+  }
+  const sectorIndex = address === WG1200_CONSTANTS.OTADATA.offset ? 0 : address === WG1200_CONSTANTS.OTADATA.offset + 4096 ? 1 : -1;
+  if (sectorIndex < 0) throw new Error('Activation address is outside the two OTA metadata sectors');
+  const payload = buildTransactionalOtadataSector(sequence, sectorIndex as 0 | 1);
+  await input.transport.writeOtaSelectSector(address, payload.sectorData, sequence, input.before);
+  const metadata = analyzeOtaMetadata(await input.transport.readOtadataSnapshot(), { factoryPresent: true });
+  if (metadata.selectedByMetadata !== input.plan.target || metadata.selectedSequence !== sequence) {
+    throw new Error('Metadata readback did not select the requested OTA slot and sequence');
+  }
+  return { metadata, address, sequence, bytesWritten: 4096 };
 }
 
 export async function validateOtaMetadataBackup(manifestPath: string, expected: {
   bytes: Uint8Array; deviceBinding: OtaMetadataBackupManifest['deviceBinding'];
 }): Promise<{ manifest: OtaMetadataBackupManifest; backupPath: string }> {
+  const result = await readOtaMetadataBackup(manifestPath, expected.deviceBinding);
+  if (!Buffer.from(result.bytes).equals(Buffer.from(expected.bytes))) throw new Error('OTA metadata backup is corrupt or stale; its exact bytes do not match current otadata');
+  return { manifest: result.manifest, backupPath: result.backupPath };
+}
+
+/** Verifies backup structure, device binding, file length and SHA-256 without requiring it to match current flash. */
+export async function readOtaMetadataBackup(manifestPath: string, deviceBinding: OtaMetadataBackupManifest['deviceBinding']): Promise<{
+  manifest: OtaMetadataBackupManifest; backupPath: string; bytes: Uint8Array;
+}> {
   let manifest: OtaMetadataBackupManifest;
   try { manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as OtaMetadataBackupManifest; }
   catch { throw new Error('OTA metadata backup manifest is unreadable or malformed'); }
@@ -209,12 +248,34 @@ export async function validateOtaMetadataBackup(manifestPath: string, expected: 
       manifest.partition.offset !== WG1200_CONSTANTS.OTADATA.offset || manifest.partition.length !== WG1200_CONSTANTS.OTADATA.size ||
       manifest.bytes !== WG1200_CONSTANTS.OTADATA.size || manifest.independentReadbackVerified !== true ||
       !/^[a-f0-9]{64}$/i.test(manifest.sha256 ?? '') || basename(manifest.backupFile ?? '') !== manifest.backupFile ||
-      JSON.stringify(manifest.deviceBinding) !== JSON.stringify(expected.deviceBinding)) throw new Error('OTA metadata backup manifest does not bind a verified backup to this exact device and partition');
+      JSON.stringify(manifest.deviceBinding) !== JSON.stringify(deviceBinding)) throw new Error('OTA metadata backup manifest does not bind a verified backup to this exact device and partition');
   const backupPath = resolve(dirname(resolve(manifestPath)), manifest.backupFile);
   let bytes: Buffer;
   try { bytes = await readFile(backupPath); } catch { throw new Error('OTA metadata backup data file is missing or unreadable'); }
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  if (bytes.byteLength !== WG1200_CONSTANTS.OTADATA.size || sha256 !== manifest.sha256.toLowerCase() ||
-      !Buffer.from(bytes).equals(Buffer.from(expected.bytes))) throw new Error('OTA metadata backup is corrupt or stale; its exact bytes do not match current otadata');
-  return { manifest, backupPath };
+  if (bytes.byteLength !== WG1200_CONSTANTS.OTADATA.size || sha256 !== manifest.sha256.toLowerCase()) throw new Error('OTA metadata backup is corrupt or stale (wrong length or SHA-256)');
+  return { manifest, backupPath, bytes };
+}
+
+/** Plans interruption-aware emergency repair from the slot selected by the device-bound backup. */
+export function planOtaMetadataRestore(live: OtaMetadataAnalysis, backup: OtaMetadataAnalysis, recoveryImageValid: boolean): {
+  target: 'ota_0' | 'ota_1' | null; sequence: number | null; sectorAddress: number | null; writeLength: 4096;
+  method: 'single-sector-valid-record-preserving-peer'; blockers: string[];
+} {
+  const blockers: string[] = [];
+  const target = backup.selectedByMetadata === 'ota_0' || backup.selectedByMetadata === 'ota_1' ? backup.selectedByMetadata : null;
+  if (backup.ambiguous || target === null || backup.selectedSequence === null) blockers.push('Backup does not identify an unambiguous OTA recovery application.');
+  if (!recoveryImageValid) blockers.push('The recovery application selected by the backup is not currently valid and trusted.');
+  const maxSequence = Math.max(-1, ...live.sectors.filter((s) => s.crcValid && s.sequence !== null).map((s) => s.sequence!));
+  let sequence: number | null = null;
+  let sectorAddress: number | null = null;
+  if (target !== null) {
+    const residue = (target === 'ota_0' ? 1 : 2);
+    sequence = residue;
+    while (sequence <= maxSequence && sequence < 0xfffffffd) sequence += 2;
+    if (sequence > 0xfffffffd) { sequence = null; blockers.push('OTA sequence is too close to unsigned wrap; recovery requires manual vendor review.'); }
+    const writeSector = live.selectedSector === null ? 0 : 1 - live.selectedSector;
+    sectorAddress = live.partition.offset + writeSector * live.partition.sectorSize;
+  }
+  return { target, sequence, sectorAddress, writeLength: 4096, method: 'single-sector-valid-record-preserving-peer', blockers };
 }

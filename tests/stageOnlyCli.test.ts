@@ -96,16 +96,19 @@ describe('stage-only CLI guards', () => {
     expect(verboseHelp.stdout).toContain('--verbose           Show coordinated ROM and transport diagnostics');
   });
 
-  it('exposes read-only OTA commands and never accepts a non-dry-run activation', () => {
+  it('exposes OTA activation only with an explicit device-bound backup manifest', () => {
     const status = run('ota', 'status');
     expect(status.status).not.toBe(0); expect(status.stderr).toContain('ota status requires --port');
     const backup = run('ota', 'backup', '--output', '/tmp/otadata.bin');
     expect(backup.status).not.toBe(0); expect(backup.stderr).toContain('ota backup requires --port');
     const activate = run('ota', 'activate', '--target', 'ota_0', '--port', '/dev/null');
-    expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('fail-closed activate');
+    expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('--metadata-backup-manifest');
     const arbitrary = run('ota', 'activate', '--target', '0x13000', '--port', '/dev/null', '--dry-run');
-    expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('fail-closed activate');
-    expect(run('ota', '--help').stdout).toContain('dry-run only');
+    expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('activate --target');
+    expect(run('ota', '--help').stdout).toContain('transaction-specific confirmation');
+    const restore = run('ota', 'restore', '--port', '/dev/null');
+    expect(restore.status).not.toBe(0); expect(restore.stderr).toContain('--metadata-backup-manifest');
+    expect(run('ota', '--help').stdout).toContain('ota restore');
   });
 
   it('keeps JSON stdout parseable while progress and diagnostics stay on redirected stderr', () => {

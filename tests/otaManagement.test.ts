@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { analyzeOtaMetadata, createOtaMetadataBackup, planOtaActivation, validateOtaMetadataBackup } from '../src/otaManagement.js';
+import { analyzeOtaMetadata, commitOtaActivationTransaction, createOtaMetadataBackup, planOtaActivation, planOtaMetadataRestore, validateOtaMetadataBackup } from '../src/otaManagement.js';
 import { calculateOtaSeqCrc32, ESP_OTA_IMG_ABORTED, ESP_OTA_IMG_INVALID, ESP_OTA_IMG_VALID } from '../src/upstream/flasher/otadata.js';
 import { ProgressReporter } from '../src/progress.js';
 
@@ -24,19 +24,61 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
     const erased = analyzeOtaMetadata(new Uint8Array(8192).fill(0xff), { factoryPresent: true });
     expect(erased.selectedByMetadata).toBe('factory'); expect(erased.ambiguous).toBe(false);
   });
-  it('always blocks activation when running slot/configuration evidence is missing and plans no writes', () => {
+  it('derives the alternating single-sector activation sequence without claiming a running slot', () => {
     const analysis = analyzeOtaMetadata(snapshot([{ seq: 4, state: ESP_OTA_IMG_VALID }, { seq: 3, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
     const plan = planOtaActivation({ analysis, target: 'ota_0', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
       targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
       metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
-    expect(plan.outcome).toBe('ACTIVATION BLOCKED'); expect(plan.writeRanges).toEqual([]);
-    expect(plan.proposedUpdate).toMatchObject({ sectorAddress: 0x14000, sequence: 5, priorSectorPreserved: true });
-    expect(plan.blockers.join('\n')).toMatch(/running slot/); expect(plan.blockers.join('\n')).toMatch(/rollback configuration/);
-    const returnPlan = planOtaActivation({ analysis, target: 'ota_1', actualRunningSlot: 'ota_0', targetImageValid: true, otherImageValid: true,
+    expect(plan.outcome).toBe('OTA ACTIVATION PLAN'); expect(plan.writeRanges).toEqual([{ start: 0x14000, end: 0x15000 }]);
+    expect(plan.proposedUpdate).toMatchObject({ sectorAddress: 0x14000, sequence: 5, state: 'VALID', priorSectorPreserved: true });
+    expect(plan.blockers).toEqual([]);
+    const returnAnalysis = analyzeOtaMetadata(snapshot([{ seq: 5, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    const returnPlan = planOtaActivation({ analysis: returnAnalysis, target: 'ota_1', actualRunningSlot: 'ota_0', targetImageValid: true, otherImageValid: true,
       targetImageSha256: 'a'.repeat(64), expectedTargetSha256: null, targetSignatureTrusted: true,
       metadataBackupVerified: true, rollbackConfig: 'disabled', antiRollbackConfig: 'disabled' });
-    expect(returnPlan.proposedUpdate).toMatchObject({ sequence: 4, sectorAddress: 0x14000 });
+    expect(returnPlan.proposedUpdate).toMatchObject({ sequence: 6, sectorAddress: 0x14000 });
     expect(returnPlan.blockers.join('\n')).toMatch(/No exact approved application digest/);
+  });
+  it('plans sequence 5 to ota_0 and sequence 6 to ota_1 while alternating metadata sectors', () => {
+    const five = analyzeOtaMetadata(snapshot([{ seq: 5, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    const toOne = planOtaActivation({ analysis: five, target: 'ota_1', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    expect(five.selectedByMetadata).toBe('ota_0');
+    expect(toOne.proposedUpdate).toMatchObject({ sequence: 6, sectorAddress: 0x14000 });
+    const six = analyzeOtaMetadata(snapshot([{ seq: 6, state: ESP_OTA_IMG_VALID }, { seq: 5, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    const toZero = planOtaActivation({ analysis: six, target: 'ota_0', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    expect(toZero.proposedUpdate).toMatchObject({ sequence: 7, sectorAddress: 0x14000 });
+  });
+  it('commits only the planned 4096-byte sector, validates selected slot, and leaves bytes unchanged on cancellation', async () => {
+    const before = snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]);
+    const analysis = analyzeOtaMetadata(before, { factoryPresent: true });
+    const plan = planOtaActivation({ analysis, target: 'ota_0', actualRunningSlot: null, targetImageValid: true, otherImageValid: true,
+      targetImageSha256: 'a'.repeat(64), expectedTargetSha256: 'a'.repeat(64), targetSignatureTrusted: true,
+      metadataBackupVerified: true, rollbackConfig: 'unknown', antiRollbackConfig: 'unknown' });
+    let live = Uint8Array.from(before); const writes: Array<{ address: number; bytes: Uint8Array }> = [];
+    const transport = { readOtadataSnapshot: async () => live, writeOtaSelectSector: async (address: number, bytes: Uint8Array) => {
+      writes.push({ address, bytes: Uint8Array.from(bytes) }); const offset = address - 0x13000; live = Uint8Array.from(live); live.set(bytes, offset);
+    } };
+    await expect(commitOtaActivationTransaction({ before, plan, transport, confirm: async () => false })).rejects.toThrow(/cancelled/);
+    expect(writes).toHaveLength(0); expect(live).toEqual(before);
+    const committed = await commitOtaActivationTransaction({ before, plan, transport, confirm: async () => true });
+    expect(writes).toHaveLength(1); expect(writes[0]).toMatchObject({ address: 0x13000 });
+    expect(writes[0]!.bytes).toHaveLength(4096); expect(committed).toMatchObject({ address: 0x13000, sequence: 5, bytesWritten: 4096,
+      metadata: { selectedByMetadata: 'ota_0', selectedSequence: 5 } });
+    expect(live.subarray(4096)).toEqual(before.subarray(4096));
+    expect(new DataView(writes[0]!.bytes.buffer).getUint32(24, true)).toBe(ESP_OTA_IMG_VALID);
+    expect(new DataView(writes[0]!.bytes.buffer).getUint32(28, true)).toBe(calculateOtaSeqCrc32(5));
+  });
+  it('plans emergency recovery as a first-valid-sector transaction and preserves a viable peer', () => {
+    const live = analyzeOtaMetadata(snapshot([{ seq: 5, state: ESP_OTA_IMG_INVALID }, { seq: 4, state: ESP_OTA_IMG_ABORTED }]), { factoryPresent: true });
+    const backup = analyzeOtaMetadata(snapshot([{ seq: 3, state: ESP_OTA_IMG_VALID }, { seq: 4, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    const plan = planOtaMetadataRestore(live, backup, true);
+    expect(plan).toMatchObject({ target: 'ota_1', sequence: 6, sectorAddress: 0x13000, writeLength: 4096,
+      method: 'single-sector-valid-record-preserving-peer', blockers: [] });
+    expect(planOtaMetadataRestore(live, backup, false).blockers).toContain('The recovery application selected by the backup is not currently valid and trusted.');
   });
 });
 

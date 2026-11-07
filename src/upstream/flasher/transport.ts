@@ -1121,6 +1121,26 @@ export class Wg1200Transport {
     this.logger.log(`Otadata sector ${sector} successfully verified with sequence ${parsed.seq}.`);
   }
 
+  /** Emergency metadata repair writes one verified boot-selection sector while preserving its peer. */
+  public async writeOtaRecoverySector(targetAddress: number, sectorBytes: Uint8Array, expectedSeq: number, beforeOtadata: Uint8Array): Promise<void> {
+    if (!this.loader) throw new Error('Not connected');
+    const { sector, address } = assertAllowedOtaSelectWrite(targetAddress, sectorBytes.byteLength);
+    if (beforeOtadata.byteLength !== WG1200_CONSTANTS.OTADATA.size || sectorBytes.byteLength !== 4096) throw new Error('Recovery requires an 8 KiB snapshot and one 4 KiB sector');
+    const expected = buildOtadataSector(expectedSeq);
+    if (!sectorBytes.every((byte, index) => byte === expected[index])) throw new Error('Recovery payload must be the exact VALID sequence/CRC sector');
+    const live = await this.readOtadataSnapshot();
+    if (!live.every((byte, index) => byte === beforeOtadata[index])) throw new Error('OTA metadata changed before emergency recovery; refusing write');
+    await this.loader.writeFlash({ fileArray: [{ data: sectorBytes, address }], flashSize: '16MB', flashMode: 'dio', flashFreq: '80m', eraseAll: false, compress: false });
+    const after = await this.readOtadataSnapshot();
+    const start = sector * 4096;
+    const peer = (1 - sector) * 4096;
+    const parsed = parseOtadataSector(after.subarray(start, start + 4096));
+    if (!parsed.valid || parsed.seq !== expectedSeq || !after.subarray(start, start + 4096).every((byte, index) => byte === sectorBytes[index]) ||
+        !after.subarray(peer, peer + 4096).every((byte, index) => byte === beforeOtadata[peer + index])) {
+      throw new Error('Emergency OTA metadata sector failed readback or peer-preservation verification');
+    }
+  }
+
   /**
    * Resets both otadata sectors (0x13000 - 0x14FFF) to 0xFF.
    * Directs ESP32-S3 ROM bootloader to rollback and boot the immutable factory partition (0x020000).
