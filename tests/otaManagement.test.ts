@@ -79,6 +79,8 @@ describe('OTA diagnostics and fail-closed activation planning', () => {
     expect(plan).toMatchObject({ target: 'ota_1', sequence: 6, sectorAddress: 0x13000, writeLength: 4096,
       method: 'single-sector-valid-record-preserving-peer', blockers: [] });
     expect(planOtaMetadataRestore(live, backup, false).blockers).toContain('The recovery application selected by the backup is not currently valid and trusted.');
+    const nearWrap = analyzeOtaMetadata(snapshot([{ seq: 0xfffffffd, state: ESP_OTA_IMG_VALID }, { seq: 0xfffffffb, state: ESP_OTA_IMG_VALID }]), { factoryPresent: true });
+    expect(planOtaMetadataRestore(nearWrap, backup, true).blockers.join('\n')).toMatch(/unsigned wrap/);
   });
 });
 

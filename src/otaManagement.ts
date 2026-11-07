@@ -190,7 +190,7 @@ export function planOtaActivation(input: { analysis: OtaMetadataAnalysis; target
     : Math.max(0, Math.ceil((currentSequence - sequenceResidue) / 2));
   const proposedSeq = multiplier === null ? null : (sequenceResidue + multiplier * 2) >>> 0;
   const selectedSector = input.analysis.selectedSector;
-  if (currentSequence === 0xffffffff || currentSequence === 0xfffffffe) blockers.push('OTA sequence is at the unsupported wrap boundary.');
+  if (currentSequence !== null && currentSequence !== undefined && currentSequence >= 0xfffffffd) blockers.push('OTA sequence is at the unsupported wrap boundary.');
   return { outcome: 'OTA ACTIVATION PLAN', dryRun: true, target: input.target, selectedByMetadata: input.analysis.selectedByMetadata,
     expectedTargetSha256: input.expectedTargetSha256,
     proposedUpdate: { sectorAddress: selectedSector === null ? null : input.analysis.partition.offset + (selectedSector === 0 ? 1 : 0) * 4096,
@@ -273,7 +273,7 @@ export function planOtaMetadataRestore(live: OtaMetadataAnalysis, backup: OtaMet
     const residue = (target === 'ota_0' ? 1 : 2);
     sequence = residue;
     while (sequence <= maxSequence && sequence < 0xfffffffd) sequence += 2;
-    if (sequence > 0xfffffffd) { sequence = null; blockers.push('OTA sequence is too close to unsigned wrap; recovery requires manual vendor review.'); }
+    if (sequence <= maxSequence || sequence >= 0xfffffffd) { sequence = null; blockers.push('OTA sequence is too close to unsigned wrap; recovery requires manual vendor review.'); }
     const writeSector = live.selectedSector === null ? 0 : 1 - live.selectedSector;
     sectorAddress = live.partition.offset + writeSector * live.partition.sectorSize;
   }
