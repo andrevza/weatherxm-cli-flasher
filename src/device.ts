@@ -669,7 +669,7 @@ export async function runOtaWriteTransaction(transport: OtaWriteOperations, inpu
   return { flashVerified: true, otaMetadataVerified: true, protectedPartitionsVerified: true, deviceReleased: resetResult !== false };
 }
 
-function assertSafeInspection(result: Wg1200Inspection, exactErrors: string[]) {
+export function assertSafeInspection(result: Wg1200Inspection, exactErrors: string[]) {
   const errors = [
     ...(!result.isEsp32S3 ? [`chip is ${result.chipName}, expected ESP32-S3`] : []),
     ...(!result.is16Mb ? [`flash is ${result.flashSizeMb} MiB, expected 16 MiB`] : []),
@@ -680,7 +680,7 @@ function assertSafeInspection(result: Wg1200Inspection, exactErrors: string[]) {
   if (!result.isValidWg1200 || errors.length) throw new Error(`Device validation failed: ${errors.join('; ')}`);
 }
 
-async function exactLayoutErrors(transport: Wg1200Transport): Promise<string[]> {
+export async function exactLayoutErrors(transport: Wg1200Transport): Promise<string[]> {
   const tableBytes = await transport.readRegion(WG1200_CONSTANTS.PARTITION_TABLE.offset, WG1200_CONSTANTS.PARTITION_TABLE.size);
   return validateExactPartitionLayout(parsePartitionTableWithMetadata(tableBytes), tableBytes);
 }

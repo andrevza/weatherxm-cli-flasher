@@ -96,6 +96,18 @@ describe('stage-only CLI guards', () => {
     expect(verboseHelp.stdout).toContain('--verbose           Show coordinated ROM and transport diagnostics');
   });
 
+  it('exposes read-only OTA commands and never accepts a non-dry-run activation', () => {
+    const status = run('ota', 'status');
+    expect(status.status).not.toBe(0); expect(status.stderr).toContain('ota status requires --port');
+    const backup = run('ota', 'backup', '--output', '/tmp/otadata.bin');
+    expect(backup.status).not.toBe(0); expect(backup.stderr).toContain('ota backup requires --port');
+    const activate = run('ota', 'activate', '--target', 'ota_0', '--port', '/dev/null');
+    expect(activate.status).not.toBe(0); expect(activate.stderr).toContain('fail-closed activate');
+    const arbitrary = run('ota', 'activate', '--target', '0x13000', '--port', '/dev/null', '--dry-run');
+    expect(arbitrary.status).not.toBe(0); expect(arbitrary.stderr).toContain('fail-closed activate');
+    expect(run('ota', '--help').stdout).toContain('dry-run only');
+  });
+
   it('keeps JSON stdout parseable while progress and diagnostics stay on redirected stderr', () => {
     const result = run('firmware', 'download', 'weatherxm', '--offline', '--cache-dir', '/tmp/wg1200-empty-json-cache', '--json');
     expect(result.status).not.toBe(0);

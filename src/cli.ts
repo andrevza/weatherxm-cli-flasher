@@ -18,10 +18,11 @@ import { redactOutput, standaloneRedactionFixture } from './redaction.js';
 import { bindAbortOnSigint } from './interrupt.js';
 import type { VerificationMode } from './verification.js';
 import { ConfirmationCancelledError, retryExactConfirmation } from './verification.js';
+import { backupOtaMetadata, dryRunOtaActivation, readOtaStatus } from './otaDevice.js';
 
 declare const __BUILD_METADATA__: { packageVersion: string; builtAt: string; sourceSha256: string; gitCommit: string | null; gitTag: string | null; gitDirty: boolean } | undefined;
 
-type Args = { command: string; subcommand?: string; target?: string; firmwareKey?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; verbose: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; verifyMode?: VerificationMode; backupManifest?: string; backupPath?: string; firmwareFile?: string; expectedSha256?: string; firmwareVersion?: string; offline: boolean; cacheDirectory?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
+type Args = { command: string; subcommand?: string; target?: string; firmwareKey?: string; helpTarget?: string; port?: string; baud: number; manifest: string; json: boolean; redact: boolean; verbose: boolean; yes: boolean; recover: boolean; force: boolean; dryRun: boolean; stageOnly: boolean; verifyMode?: VerificationMode; backupManifest?: string; metadataBackupManifest?: string; backupPath?: string; firmwareFile?: string; expectedSha256?: string; firmwareVersion?: string; offline: boolean; cacheDirectory?: string; traceSerial: boolean; monitor: boolean; boot: boolean; timestamp: boolean; level?: MonitorLevel; outputFile?: string; raw: boolean; noColor: boolean; bootLogSeconds: number; };
 const applicationName = 'WeatherXM WG1200 Flasher';
 
 type SimpleVersionInfo = { application: string; version: string };
@@ -73,10 +74,13 @@ function parseArgs(argv: string[]): Args {
   let helpRequested = false;
   let manifestProvided = false;
   let bootLogProvided = false;
+  let optionTarget: string | undefined;
   const out: Args = { command: '', baud: 115200, manifest: DEFAULT_MANIFEST_URL, json: false, redact: false, verbose: false, yes: false, recover: false, force: false, dryRun: false, stageOnly: false, offline: false, traceSerial: false, monitor: false, boot: false, timestamp: false, raw: false, noColor: false, bootLogSeconds: 15 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--port' || arg === '-p') out.port = argv[++i];
+    else if (arg === '--target') optionTarget = argv[++i];
+    else if (arg === '--metadata-backup-manifest') out.metadataBackupManifest = argv[++i];
     else if (arg === '--baud') out.baud = Number(argv[++i]);
     else if (arg === '--manifest') { out.manifest = argv[++i]; manifestProvided = true; }
     else if (arg === '--json') out.json = true;
@@ -116,21 +120,21 @@ function parseArgs(argv: string[]): Args {
   out.command = helpRequested ? 'help' : positional[0] || 'help';
   if (helpRequested) out.helpTarget = positional[0];
   out.subcommand = positional[1];
-  out.target = positional[2];
+  out.target = optionTarget ?? positional[2];
   if (!Number.isInteger(out.baud) || out.baud < 1200 || out.baud > 2000000) throw new Error('Baud rate must be an integer from 1200 to 2000000');
   if (!helpRequested) {
     if (out.force && out.command !== 'flash') throw new Error('--force is supported only by flash');
-    if (out.dryRun && out.command !== 'flash') throw new Error('--dry-run is supported only by flash');
+    if (out.dryRun && !(out.command === 'flash' || (out.command === 'ota' && out.subcommand === 'activate'))) throw new Error('--dry-run is supported only by flash and ota activate');
     if (out.stageOnly && out.command !== 'flash') throw new Error('--stage-only is supported only by flash');
     if (out.verifyMode && !['fast', 'thorough'].includes(out.verifyMode)) throw new Error('--verify-mode must be fast or thorough');
     if (out.verifyMode && !out.stageOnly) throw new Error('--verify-mode requires flash --stage-only');
     if (out.backupManifest && out.command !== 'flash') throw new Error('--backup-manifest is supported only by flash --stage-only');
     if ((out.yes || out.recover) && out.command !== 'flash') throw new Error('--yes and --recover are supported only by flash');
     if (manifestProvided && !['firmware', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--manifest is supported only by firmware list, check, flash, and security check');
-    if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security'].includes(out.command)) throw new Error('--trace-serial requires a device command');
+    if (out.traceSerial && !['info', 'verify', 'status', 'check', 'flash', 'security', 'ota'].includes(out.command)) throw new Error('--trace-serial requires a device command');
     if (out.monitor && !['info', 'verify', 'status', 'check', 'flash'].includes(out.command)) throw new Error('--monitor requires a device operation');
     if (out.boot && out.command !== 'monitor') throw new Error('--boot is supported only by monitor');
-    if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
+    if ((out.timestamp || out.level || out.outputFile || out.raw || out.noColor) && out.command !== 'monitor' && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && !out.monitor) throw new Error('Monitor formatting options require monitor or --monitor');
     if (out.level && !['error', 'warn', 'info', 'debug', 'verbose'].includes(out.level)) throw new Error('--level must be error, warn, info, debug, or verbose');
     if (!Number.isInteger(out.bootLogSeconds) || out.bootLogSeconds < 0 || out.bootLogSeconds > 3600) throw new Error('--boot-log-seconds must be an integer from 0 to 3600');
     if (bootLogProvided && out.command !== 'flash') throw new Error('--boot-log-seconds is supported only by flash');
@@ -139,6 +143,9 @@ function parseArgs(argv: string[]): Args {
     }
     if (out.stageOnly && manifestProvided && out.manifest !== DEFAULT_MANIFEST_URL) throw new Error('--stage-only accepts only the pinned official WeatherXM firmware manifest');
     if (out.backupManifest && !out.stageOnly) throw new Error('--backup-manifest requires --stage-only');
+    if (out.command === 'ota' && (!['status', 'backup', 'activate'].includes(out.subcommand ?? '') || out.yes || out.force || out.recover || out.stageOnly || out.monitor || (out.subcommand === 'backup' && !out.outputFile) || (out.subcommand !== 'backup' && out.outputFile) || (out.subcommand === 'activate' && (!['ota_0', 'ota_1'].includes(out.target ?? '') || !out.dryRun)))) throw new Error('ota supports read-only status, backup --output, and fail-closed activate --target ota_0|ota_1 --dry-run only');
+    if (out.metadataBackupManifest && !(out.command === 'ota' && out.subcommand === 'activate')) throw new Error('--metadata-backup-manifest requires ota activate');
+    if (out.command === 'ota' && out.subcommand === 'status' && (out.target || out.dryRun)) throw new Error('ota status does not accept --target or --dry-run');
     if (out.command === 'backup' && (!(['inactive', 'active'].includes(out.subcommand ?? '') || (out.subcommand === 'partition' && Boolean(out.target))) || !out.outputFile || out.yes || out.force || out.recover || out.dryRun || out.stageOnly || out.monitor || out.timestamp || out.level || out.raw || out.noColor)) {
       throw new Error('backup requires `backup <active|inactive> --port <path> --output <file>` or `backup partition <name> --port <path> --output <file>`; it never overwrites existing files');
     }
@@ -152,7 +159,7 @@ function parseArgs(argv: string[]): Args {
     if (out.command === 'firmware' && !['list', 'download', 'compare'].includes(out.subcommand ?? '')) throw new Error('firmware supports list, download, and compare');
     if (out.command === 'firmware' && out.subcommand === 'download' && !['weatherxm', 'meshtastic'].includes(out.target ?? '')) throw new Error('firmware download requires weatherxm or meshtastic');
     if (out.command === 'firmware' && out.subcommand === 'compare' && (!out.backupPath || (Boolean(out.firmwareKey) === Boolean(out.firmwareFile)))) throw new Error('firmware compare requires --backup and exactly one of --firmware <key> or --firmware-file <path>');
-    if (out.outputFile && out.command !== 'backup' && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
+    if (out.outputFile && out.command !== 'backup' && !(out.command === 'ota' && out.subcommand === 'backup') && out.command !== 'monitor' && !out.monitor) throw new Error('--output is supported by backup or monitor');
     if (out.command === 'monitor' && out.json) throw new Error('--json is not supported by the continuous monitor command');
   }
   return out;
@@ -186,6 +193,7 @@ function help(command?: string, plain = false) {
       status: `USAGE\n  ${name} status --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial] [--monitor]\n\nShows active firmware and OTA boot state. Read-only; resets the gateway.`,
       check: `USAGE\n  ${name} check <weatherxm|meshtastic> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial] [--monitor]\n\nDownloads and validates the selected image, then compares its descriptor with the installed firmware. Never writes flash. All check outcomes exit 0; operational failures exit nonzero.`,
       monitor: `USAGE\n  ${name} monitor --port <path> [--baud <rate>] [--boot] [--redact] [--timestamp] [--level <severity>] [--output <file>] [--raw] [--no-color]\n\nWithout --boot, receives serial output in receive-only mode without toggling DTR/RTS. --boot installs the receive handler, then uses RTS to pulse EN while DTR keeps GPIO0 released for normal application boot. The serial connection remains open. Ctrl+C closes it.`,
+      ota: `USAGE\n  ${name} ota status --port <path> [--json] [--redact]\n  ${name} ota backup --port <path> --output <file> [--json]\n  ${name} ota activate --target <ota_0|ota_1> --port <path> --dry-run [--metadata-backup-manifest <path>] [--json]\n\nStatus and backup are read-only. Activation is dry-run only and always fail-closed until installed bootloader rollback configuration and return behavior are proven. A ROM inspection cannot establish the application actually running.`,
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
@@ -200,6 +208,7 @@ function help(command?: string, plain = false) {
   output += commandRow('info', 'Show device and hardware information');
   output += commandRow('verify', 'Validate device identity and partitions');
   output += commandRow('status', 'Show firmware and OTA boot state');
+  output += commandRow('ota status|backup|activate', 'Inspect OTA metadata; activation is blocked and dry-run only');
   output += commandRow('check <firmware>', 'Check available firmware; read-only');
   output += commandRow('monitor', 'Passively stream serial console output');
   output += commandRow('backup active|inactive', 'Stream and verify a complete OTA application partition');
@@ -316,6 +325,24 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.command === 'help') return help(args.helpTarget, args.json);
   if (args.command === 'monitor') { await runMonitor(args); return; }
+  if (args.command === 'ota') {
+    if (!args.port) throw new Error(`ota ${args.subcommand} requires --port, for example --port /dev/ttyUSB0`);
+    const progress = createProgress(args);
+    try {
+      let report: unknown;
+      if (args.subcommand === 'status') report = await readOtaStatus({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, progress });
+      else if (args.subcommand === 'backup') {
+        if (!args.outputFile) throw new Error('ota backup requires --output <file>');
+        report = await backupOtaMetadata({ portPath: args.port, baudRate: args.baud, verbose: args.verbose, outputPath: args.outputFile, progress });
+      } else {
+        report = await dryRunOtaActivation({ portPath: args.port, baudRate: args.baud, verbose: args.verbose,
+          target: args.target as 'ota_0' | 'ota_1', metadataBackupManifest: args.metadataBackupManifest });
+        process.exitCode = 1;
+      }
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    } finally { progress.close(); }
+    return;
+  }
   if (args.command === 'backup') {
     if (!args.port) throw new Error('backup requires --port, for example --port /dev/ttyUSB0');
     if (!args.outputFile) throw new Error('backup inactive requires --output <file>');

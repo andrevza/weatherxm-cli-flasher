@@ -714,6 +714,44 @@ settings remain unverified.
 
 ### ROM serial recovery boundary
 
+### Controlled OTA activation tooling status
+
+The CLI now provides `ota status`, `ota backup`, and a dry-run-only
+`ota activate --target <ota_0|ota_1>`. `ota status` reads the complete 8 KiB
+metadata partition and both 4 MiB OTA application slots, reports ESP-IDF
+v5.1.2-model CRC/state/sequence selection, descriptors, signed image extent,
+signature and device signer trust. It explicitly labels the running slot as
+unobserved because a ROM flash reader cannot call the application API
+`esp_ota_get_running_partition()`. Capture `monitor --boot --redact` and use
+the bootloader's `Loaded app from partition at offset ...` line for physical
+boot-slot evidence.
+
+`ota backup --output <path>` creates an exact, mode-0600 8192-byte `otadata`
+snapshot plus a device-bound mode-0600 manifest, and compares a second full
+physical read. It never overwrites either artifact and has no restore command.
+An application partition backup is not a substitute for this metadata backup.
+
+The activation planner reports the peer metadata sector and proposed sequence
+as a source-model illustration, but reports no write ranges and includes an
+unconditional blocker because no activation writer is enabled. Do not use a
+manual metadata edit or restore as an improvised return method. A safe return
+to `ota_1` cannot be issued by this CLI: first boot evidence, deployed
+bootloader selection/rollback/anti-rollback settings, the app's OTA-valid
+confirmation behavior, and the exact recovery semantics remain unverified.
+If the target fails, preserve the device state and serial transcript, confirm
+ROM downloader access using the established read-only procedure, and use a
+vendor-approved or separately reviewed recovery procedure with the backed-up
+metadata and verified original image. Do not claim automatic rollback.
+
+For an operator-assisted validation plan after those missing facts are
+independently established, capture these milestones separately: (1) metadata
+write completion, (2) independent metadata readback, (3) reset requested,
+(4) bootloader `Loaded app from partition` offset, (5) application startup,
+and (6) service health. Check the local WeatherXM HTTP API, receive LoRa
+station packets, and observe MQTT/ThingsBoard activity where available. Since
+both OTA slots can contain the same build, version/build output is not slot
+proof. No milestone should be reported as a later one.
+
 Maintainer-supplied prior read-only checks establish that UART ROM serial
 access, eFuse reads, RAM-stub flash inspection, and ordinary app startup worked
 on this unit; the new boot transcript establishes normal ROM-to-bootloader
