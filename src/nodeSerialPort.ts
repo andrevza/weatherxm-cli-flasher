@@ -22,6 +22,7 @@ export class NodeSerialPort {
   private port?: SerialPortLike;
   private dtr = false;
   private rts = false;
+  private signalsInitialized = false;
   private baudRate = 115200;
   constructor(
     private readonly path: string,
@@ -29,6 +30,7 @@ export class NodeSerialPort {
     private readonly portFactory?: SerialPortFactory,
     private readonly passive = false,
     private readonly lifecycle?: SerialLifecycle,
+    private readonly detailedSignalTransitions = false,
   ) {}
 
   private log(message: string): void {
@@ -62,6 +64,9 @@ export class NodeSerialPort {
           reject(err);
         } else resolve();
       }));
+      // Opening a native serial descriptor may alter modem lines, so the first
+      // requested state after every open must always be applied explicitly.
+      this.signalsInitialized = false;
       this.lifecycle?.(stage, 'complete');
     } catch (error) {
       this.lifecycle?.(stage, 'failed', error instanceof Error ? error.message : String(error));
@@ -132,13 +137,15 @@ export class NodeSerialPort {
     this.log(`signals dtr=${this.dtr} rts=${this.rts}`);
     if (!port?.isOpen) return;
     const changed = previousDtr !== this.dtr || previousRts !== this.rts;
+    if (!changed && this.signalsInitialized) return;
     const stage = 'Applying RTS/DTR reset signals';
-    if (changed) this.lifecycle?.(stage, 'start');
+    if (changed && this.detailedSignalTransitions) this.lifecycle?.(stage, 'start');
     try {
       await new Promise<void>((resolve, reject) => port.set({ dtr: this.dtr, rts: this.rts }, (err: Error | null) => err ? reject(err) : resolve()));
-      if (changed) this.lifecycle?.(stage, 'complete');
+      this.signalsInitialized = true;
+      if (changed && this.detailedSignalTransitions) this.lifecycle?.(stage, 'complete');
     } catch (error) {
-      if (changed) this.lifecycle?.(stage, 'failed', error instanceof Error ? error.message : String(error));
+      if (changed && this.detailedSignalTransitions) this.lifecycle?.(stage, 'failed', error instanceof Error ? error.message : String(error));
       throw error;
     }
   }

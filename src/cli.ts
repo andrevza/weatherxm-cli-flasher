@@ -197,7 +197,7 @@ function help(command?: string, plain = false) {
       backup: `USAGE\n  ${name} backup <active|inactive> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n  ${name} backup partition <name> --port <path> --output <file> [--baud <rate>] [--json] [--redact] [--verbose]\n\nPartition backups support only exact discovered WG1200 allowlisted partitions. Full dumps may contain credentials, certificates or device-specific data; protect both file and manifest before sharing. Files use restrictive permissions, are independently SHA-256 verified and are never overwritten. These dumps are separate from ordinary OTA application backups and do not establish restore capability.`,
       firmware: `USAGE\n  ${name} firmware list [--manifest <url>] [--json] [--redact]\n  ${name} firmware download <weatherxm|meshtastic> [--version <version>] [--offline] [--json] [--verbose]\n  ${name} firmware compare --backup <path> (--firmware <key>|--firmware-file <path>) [--json]\n\nDownloads complete official images into ~/.cache/weatherxm-flash/firmware/ after hash, descriptor and Secure Boot V2 signature validation. Firmware comparison verifies the full-partition backup manifest and compares parsed application image bytes.`,
       security: `USAGE\n  ${name} security --port <path> [--baud <rate>] [--json] [--redact] [--trace-serial]\n  ${name} security check <firmware> --port <path> [--baud <rate>] [--manifest <url>] [--json] [--redact] [--trace-serial]\n\nReads ESP32-S3 Secure Boot V2 eFuse state, or verifies a candidate image and compares it with readable device trust state. Read-only; enters the ROM loader and resets the gateway. Anti-rollback enforcement and app health are reported separately.`,
-      flash: `USAGE\n  ${name} flash weatherxm --port <path> --stage-only [--verify-mode fast|thorough] [--backup-manifest <path>]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. It prompts to create or reuse a verified inactive-slot backup. Fast is the default routine backup-freshness check and uses device-side SPI_FLASH_MD5; Thorough uses a complete physical SHA-256 read. Unsupported or failed device MD5 falls back to full SHA-256; a digest mismatch blocks staging. Both modes retain mandatory firmware SHA-256, Secure Boot V2 trust, full protected-region SHA-256 snapshots, independent post-write SHA-256 readback, and unchanged OTA metadata checks. Confirmation permits five exact-phrase attempts with retry or cancel; no write begins without the complete phrase.`,
+      flash: `USAGE\n  ${name} flash weatherxm --port <path> --stage-only [--verify-mode fast|thorough] [--backup-manifest <path>]\n\nNormal firmware installation remains blocked. Stage-only supports official WeatherXM 0.8.34 into ota_0 while ota_1 is live. Fast is the default: it verifies the target with device-side MD5 and audits preserved regions with MD5. Thorough adds full target SHA-256 readback and full protected-region SHA-256 checks. Both modes retain mandatory source SHA-256, Secure Boot V2 trust, backup validation and unchanged OTA metadata checks. A failed target check blocks activation, audits unchanged regions where possible, and never retries or rewrites automatically. Confirmation permits five exact-phrase attempts with retry or cancel; no write begins without the complete phrase.`,
     };
     const detail = details[command];
     if (!detail) return process.stdout.write(`No command help is available for '${command}'. Run '${name} --help'.\n`);
@@ -537,21 +537,8 @@ async function main() {
     if (args.stageOnly) {
       const stageAbort = new AbortController();
       const removeStageInterrupt = bindAbortOnSigint(process, stageAbort);
-      let selectedVerificationMode: VerificationMode;
-      try {
-        if (args.verifyMode) selectedVerificationMode = args.verifyMode;
-        else {
-          if (!stdin.isTTY || !stdout.isTTY) throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: use --verify-mode fast|thorough in a noninteractive terminal');
-          const modePrompt = createInterface({ input: stdin, output: stdout });
-          try {
-            const choice = (await modePrompt.question('Verification mode: 1) Fast (device-side MD5 for backup freshness; default)  2) Thorough (full flash SHA-256) [1]: ', { signal: stageAbort.signal })).trim();
-            if (choice === '' || choice === '1') selectedVerificationMode = 'fast';
-            else if (choice === '2') selectedVerificationMode = 'thorough';
-            else throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: choose 1 for Fast or 2 for Thorough');
-          } finally { modePrompt.close(); }
-        }
-      } catch (error) { removeStageInterrupt(); throw error; }
-      progress.log(`Verification mode: ${selectedVerificationMode.toUpperCase()}. Stage-only always retains firmware SHA-256/signature/trust checks, full protected-region SHA-256 snapshots, and independent post-write SHA-256 readback.`);
+      const selectedVerificationMode: VerificationMode = args.verifyMode ?? 'fast';
+      progress.log(`Verification mode: ${selectedVerificationMode.toUpperCase()}. Source SHA-256, Secure Boot signature and signer trust are mandatory. Fast uses device-side MD5 for target and preserved regions; Thorough adds full target SHA-256 readback.`);
       const chooseBackup = async (details: { targetSlot: 'ota_0'; targetOffset: number; targetLength: number; existingFirmware: string | null }) => {
         if (!stdin.isTTY || !stdout.isTTY) throw new Error('STAGING BLOCKED — OPERATOR CONFIRMATION REQUIRED: backup choice requires an interactive terminal');
         const defaultPath = join(homedir(), 'wg1200-stage-backups', `ota0-before-stage-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}.bin`);
@@ -605,7 +592,7 @@ async function main() {
           backupManifestPath: args.backupManifest, chooseBackup, confirm: confirmStage, progress, offline: args.offline, cacheDirectory: args.cacheDirectory, signal: stageAbort.signal,
           verificationMode: selectedVerificationMode });
         if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-        else process.stdout.write(`${result.outcome}\nVerification mode: ${result.verificationMode.toUpperCase()}\nProtected-region verification: ${result.protectedVerificationMode.toUpperCase()}\nBackup freshness checks:\n${result.backupFreshnessChecks.map((check) => `  ${check.algorithm} via ${check.method}: MATCH @ 0x${check.address.toString(16)} length ${check.length} (${(check.elapsedMs / 1000).toFixed(1)}s)`).join('\n')}\nProtected-region checks:\n${result.protectedRegionChecks.map((check) => `  ${check.name} ${check.algorithm} ${check.snapshot} -> ${check.postWrite} via ${check.method} @ 0x${check.address.toString(16)} length ${check.length}`).join('\n')}\nFirmware Secure Boot V2 signature and device signer trust: VERIFIED\nFirmware SHA-256: VERIFIED\nPost-write independent SHA-256: VERIFIED via full physical flash readback (${result.bytesRead} bytes)\nHardware MD5: VERIFIED (${result.expectedMd5})\nReadback SHA-256: ${result.actualSha256}\nTarget range: [0x${result.targetRange.start.toString(16)}, 0x${result.targetRange.end.toString(16)})\nErase range: [0x${result.eraseRange.start.toString(16)}, 0x${result.eraseRange.end.toString(16)})\nOTA metadata unchanged: YES\nActive ota_1 unchanged: YES\nProtected regions unchanged: YES\nAutomatic activation: NO\n`);
+        else process.stdout.write(`${result.outcome}\nVerification mode: ${result.verificationMode.toUpperCase()}\nBackup freshness checks:\n${result.backupFreshnessChecks.map((check) => `  ${check.algorithm} via ${check.method}: MATCH @ 0x${check.address.toString(16)} length ${check.length} (${(check.elapsedMs / 1000).toFixed(1)}s)`).join('\n')}\nUnchanged-region integrity audit:\n${result.protectedRegionChecks.map((check) => `  ${check.name}: ${check.status}${check.status === 'UNCHANGED' ? ` — ${check.algorithm} MATCH` : ''} @ 0x${check.offset.toString(16)} length ${check.length}`).join('\n')}\nFirmware Secure Boot V2 signature and device signer trust: VERIFIED\nFirmware source SHA-256: VERIFIED\nPost-write ESP32 MD5: ${result.actualMd5 === result.expectedMd5 ? 'MATCH' : 'MISMATCH'} (expected ${result.expectedMd5}; actual ${result.actualMd5})\n${result.verificationMode === 'thorough' ? `Independent physical SHA-256 readback: VERIFIED (${result.bytesRead} bytes); actual ${result.actualSha256}` : 'Independent physical SHA-256 readback: NOT RUN (Fast mode)'}\nTarget range: [0x${result.targetRange.start.toString(16)}, 0x${result.targetRange.end.toString(16)})\nErase range: [0x${result.eraseRange.start.toString(16)}, 0x${result.eraseRange.end.toString(16)})\nOTA metadata unchanged: YES\nActive ota_1 unchanged: YES\nAutomatic activation: NO\n`);
       } catch (error) {
         progress.finish('failed');
         const message = error instanceof Error ? error.message : String(error);
@@ -620,13 +607,14 @@ async function main() {
             : 'STAGING BLOCKED — PREFLIGHT FAILED';
           const report = { outcome, error: message, writeInitiated: error.writeInitiated,
             ...(noWrite ? { noFlashModifications: true } : {}), normalBootResetSucceeded: error.normalBootResetSucceeded,
-            serialPortReleased: error.serialPortReleased };
+            serialPortReleased: error.serialPortReleased, targetVerification: error.targetVerification ?? null, integrityAudit: error.integrityAudit ?? null,
+            otaMetadataModified: false, activation: 'BLOCKED' };
           const resetReport = error.normalBootResetSucceeded === true ? 'Returning gateway to normal boot... DONE'
             : error.normalBootResetSucceeded === false ? 'WARNING: normal boot reset failed; power-cycle the gateway before further use.'
             : 'No ROM connection was opened; reset was not required.';
           const portReport = error.serialPortReleased === true ? 'Serial port released.'
             : error.serialPortReleased === false ? 'WARNING: serial port release failed.' : 'Serial port was not opened.';
-          if (!args.json) process.stderr.write(`${cancelled ? 'Stage-only operation cancelled.' : error.kind === 'operator_declined' ? 'Stage-only operation declined.' : 'Stage-only preflight failed.'}\n${noWrite ? 'No flash erase or write initiated.' : 'A flash erase/write may have started; target contents require read-only verification.'}\n${resetReport}\n${portReport}\n\n${outcome}\n`);
+          if (!args.json) process.stderr.write(`${cancelled ? 'Stage-only operation cancelled.' : error.kind === 'operator_declined' ? 'Stage-only operation declined.' : 'Stage-only operation failed.'}\n${noWrite ? 'No flash erase or write initiated.' : 'A flash erase/write may have started; OTA activation was not attempted.'}\n${resetReport}\n${portReport}\n${error.targetVerification ? `\nTarget MD5: expected ${error.targetVerification.expectedMd5}; actual ${error.targetVerification.actualMd5 ?? 'UNAVAILABLE'}; ${error.targetVerification.result}\n` : ''}${error.integrityAudit ? `\nINTEGRITY AUDIT\n${error.integrityAudit.map((x) => `  ${x.name}: ${x.status}${x.actualDigest ? ` (${x.algorithm})` : ''} @ 0x${x.offset.toString(16)} length ${x.length}`).join('\n')}\nActivation: BLOCKED\n` : ''}\n${outcome}\n`);
           else process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
           process.exitCode = 1;
           return;

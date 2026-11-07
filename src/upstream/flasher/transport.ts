@@ -362,6 +362,11 @@ export interface StageOnlyRegionDigestSnapshot {
   readonly digest: string;
 }
 
+export interface RegionDigestAudit {
+  name: string; offset: number; size: number; algorithm: 'MD5' | 'SHA-256'; expectedDigest: string;
+  actualDigest: string | null; status: 'UNCHANGED' | 'CHANGED' | 'UNVERIFIED';
+}
+
 export function stageOnlyProtectedRanges(preservedOtaSlot: 'ota_0' | 'ota_1'): Array<{ name: string; offset: number; size: number }> {
   const ota = preservedOtaSlot === 'ota_0' ? WG1200_CONSTANTS.APP_OTA_0 : WG1200_CONSTANTS.APP_OTA_1;
   return [
@@ -467,6 +472,27 @@ export class Wg1200Transport {
       romBaudrate: WG1200_CONSTANTS.BAUDRATE_ROM,
       terminal: terminalWrapper,
     });
+
+    // ESPLoader's main() repeats modem-line transitions internally. Report
+    // the logical ROM/sync and stub operations once; transition details remain
+    // available from NodeSerialPort only when verbose diagnostics are enabled.
+    const loaderWithProgress = this.loader as any;
+    const wrapStage = (method: 'detectChip' | 'runStub', stage: string) => {
+      const original = loaderWithProgress[method].bind(loaderWithProgress);
+      loaderWithProgress[method] = async (...args: unknown[]) => {
+        this.logger.progress?.(stage, 'start');
+        try {
+          const result = await original(...args);
+          this.logger.progress?.(stage, 'complete');
+          return result;
+        } catch (error) {
+          this.logger.progress?.(stage, 'failed', error instanceof Error ? error.message : String(error));
+          throw error;
+        }
+      };
+    };
+    wrapStage('detectChip', 'Entering ESP32-S3 ROM download mode and synchronizing');
+    if (inspectHardware !== 'rom-read-only') wrapStage('runStub', 'Starting ESP32-S3 flash stub');
 
     try {
       this.logger.log('Connecting to ESP32 ROM bootloader…');
@@ -924,18 +950,30 @@ export class Wg1200Transport {
 
   /** Rechecks every exact stage-only protected range against its immutable device-side MD5 snapshot. */
   public async verifyProtectedRegionsMd5(snapshots: readonly StageOnlyRegionDigestSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1', onRegion?: (snapshot: StageOnlyRegionDigestSnapshot, elapsedMs: number) => void, signal?: AbortSignal): Promise<{ valid: boolean; mismatches: string[] }> {
+    const checks = await this.auditProtectedRegionsMd5(snapshots, preservedOtaSlot, onRegion, signal);
+    const mismatches = checks.filter((entry) => entry.status !== 'UNCHANGED').map((entry) => `Protected region '${entry.name}' MD5 ${entry.status.toLowerCase()}`);
+    return { valid: mismatches.length === 0, mismatches };
+  }
+
+  public async auditProtectedRegionsMd5(snapshots: readonly StageOnlyRegionDigestSnapshot[], preservedOtaSlot: 'ota_0' | 'ota_1', onRegion?: (snapshot: StageOnlyRegionDigestSnapshot, elapsedMs: number) => void, signal?: AbortSignal): Promise<RegionDigestAudit[]> {
     assertCompleteStageOnlyMd5Snapshots(snapshots, preservedOtaSlot);
-    const mismatches: string[] = [];
+    const checks: RegionDigestAudit[] = [];
     for (const snapshot of snapshots) {
       if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
       const started = performance.now();
-      const digest = await this.md5FlashRegion(snapshot.offset, snapshot.size);
+      let actualDigest: string;
+      try { actualDigest = await this.md5FlashRegion(snapshot.offset, snapshot.size); }
+      catch {
+        checks.push({ name: snapshot.name, offset: snapshot.offset, size: snapshot.size, algorithm: 'MD5', expectedDigest: snapshot.digest, actualDigest: null, status: 'UNVERIFIED' });
+        continue;
+      }
       if (signal?.aborted) throw signal.reason ?? new Error('Operation cancelled');
       const elapsedMs = Math.max(0, performance.now() - started);
-      if (digest !== snapshot.digest) mismatches.push(`Protected region '${snapshot.name}' MD5 changed`);
+      checks.push({ name: snapshot.name, offset: snapshot.offset, size: snapshot.size, algorithm: 'MD5', expectedDigest: snapshot.digest,
+        actualDigest, status: actualDigest === snapshot.digest ? 'UNCHANGED' : 'CHANGED' });
       onRegion?.(snapshot, elapsedMs);
     }
-    return { valid: mismatches.length === 0, mismatches };
+    return checks;
   }
 
   /**
@@ -950,7 +988,8 @@ export class Wg1200Transport {
 
     for (const snap of beforeSnapshots) {
       const currentHash = await this.hashRegionSha256(snap.offset, snap.size, (completed, total) => onProgress?.(snap.name, completed, total), signal);
-      if (!compareHexHashes(snap.sha256, currentHash)) {
+      const status = compareHexHashes(snap.sha256, currentHash) ? 'UNCHANGED' as const : 'CHANGED' as const;
+      if (status === 'CHANGED') {
         mismatches.push(`Protected partition '${snap.name}' was modified`);
       }
     }

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createInactiveBackup, createPartitionBackup, runStageOnlyTransaction, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
+import { createInactiveBackup, createPartitionBackup, runStageOnlyTransaction, StageOnlyVerificationFailure, validateInactiveBackup, type StageOnlyOperations } from '../src/stageOnly.js';
 import { retryExactConfirmation } from '../src/verification.js';
 
 const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -23,9 +23,10 @@ function ops(overrides: Partial<StageOnlyOperations> = {}) {
   const defaults: StageOnlyOperations = {
     revalidate: vi.fn(async () => { events.push('revalidate'); return true; }),
     writeApplication: vi.fn(async () => { events.push('write'); }),
-    verifyHardwareMd5: vi.fn(async () => { events.push('md5'); return true; }),
+    readHardwareMd5: vi.fn(async () => { events.push('md5'); return md5(bytes); }),
     readbackSha256: vi.fn(async () => { events.push('sha256'); return sha(bytes); }),
-    verifyProtected: vi.fn(async () => { events.push('protected'); return { valid: true, mismatches: [] }; }),
+    auditUnchanged: vi.fn(async () => { events.push('audit'); return [{ name: 'otadata', offset: 0x13000, length: 8192, algorithm: 'MD5' as const,
+      expectedDigest: md5(new Uint8Array(8192).fill(0xaa)), actualDigest: md5(new Uint8Array(8192).fill(0xaa)), status: 'UNCHANGED' as const }]; }),
     readOtadata: vi.fn(async () => { events.push('otadata'); return new Uint8Array(8192).fill(0xaa); }),
     resetNormal: vi.fn(async () => { events.push('reset'); }),
   };
@@ -37,13 +38,21 @@ function ops(overrides: Partial<StageOnlyOperations> = {}) {
 }
 
 describe('stage-only transaction', () => {
-  it('writes only ota_0, verifies bytes and protected state, preserves otadata, and never calls activation', async () => {
+  it('defaults to Fast, verifies on-chip MD5 and protected state, preserves otadata, and never calls activation', async () => {
     const { events, mock, input } = ops();
     const result = await runStageOnlyTransaction(mock, input);
-    expect(result).toMatchObject({ outcome: 'STAGED AND VERIFIED — NOT ACTIVATED', expectedSha256: sha(bytes), actualSha256: sha(bytes), bytesRead: bytes.length, range: { start: 0x420000, end: 0x420008 } });
-    expect(events).toEqual(['revalidate', 'write', 'md5', 'sha256', 'protected', 'otadata', 'reset']);
+    expect(result).toMatchObject({ outcome: 'FIRMWARE STAGED AND VERIFIED — NOT ACTIVATED', expectedSha256: sha(bytes), actualSha256: null, bytesRead: 0, range: { start: 0x420000, end: 0x420008 } });
+    expect(events).toEqual(['revalidate', 'write', 'md5', 'audit', 'otadata', 'reset']);
     expect(mock.writeApplication).toHaveBeenCalledWith(0x420000, bytes);
     expect('writeOtaSelectSector' in mock).toBe(false);
+  });
+
+  it('runs complete physical target SHA-256 only when Thorough is explicitly selected', async () => {
+    const { events, mock, input } = ops();
+    const result = await runStageOnlyTransaction(mock, { ...input, verificationMode: 'thorough' });
+    expect(result.actualSha256).toBe(sha(bytes));
+    expect(result.bytesRead).toBe(bytes.length);
+    expect(events).toEqual(['revalidate', 'write', 'md5', 'sha256', 'audit', 'otadata', 'reset']);
   });
 
   it('blocks an active ota_0, wrong target, oversized write, hash mismatch, and operator cancellation before writing', async () => {
@@ -66,7 +75,7 @@ describe('stage-only transaction', () => {
     expect(preflight.mock.writeApplication).not.toHaveBeenCalled();
     const interrupted = ops({ writeApplication: vi.fn(async () => { throw new Error('timeout'); }) });
     await expect(runStageOnlyTransaction(interrupted.mock, interrupted.input)).rejects.toThrow(/TARGET MAY BE PARTIALLY WRITTEN/);
-    expect(interrupted.mock.verifyHardwareMd5).not.toHaveBeenCalled();
+    expect(interrupted.mock.readHardwareMd5).not.toHaveBeenCalled();
     expect(interrupted.mock.readOtadata).not.toHaveBeenCalled();
   });
 
@@ -75,8 +84,8 @@ describe('stage-only transaction', () => {
     const phrase = `STAGE ota_0 WeatherXM 0.8.34 ${sha(bytes)}`;
     const entries = ['partial sha', phrase];
     input.confirm = vi.fn(() => retryExactConfirmation({ phrase, askPhrase: async () => entries.shift()!, askRetry: async () => 'retry' }));
-    await runStageOnlyTransaction(mock, input);
-    expect(events).toEqual(['revalidate', 'write', 'md5', 'sha256', 'protected', 'otadata', 'reset']);
+    await runStageOnlyTransaction(mock, { ...input, verificationMode: 'thorough' });
+    expect(events).toEqual(['revalidate', 'write', 'md5', 'sha256', 'audit', 'otadata', 'reset']);
     expect(mock.writeApplication).toHaveBeenCalledTimes(1);
   });
 
@@ -89,30 +98,36 @@ describe('stage-only transaction', () => {
     expect(mock.writeApplication).not.toHaveBeenCalled();
   });
 
-  it('does not accept hardware MD5 or SHA-256 mismatch', async () => {
-    const md5Fail = ops({ verifyHardwareMd5: vi.fn(async () => false) });
-    await expect(runStageOnlyTransaction(md5Fail.mock, md5Fail.input)).rejects.toThrow(/hardware MD5 mismatch/);
-    expect(md5Fail.mock.verifyProtected).not.toHaveBeenCalled();
+  it('does not accept hardware MD5 or SHA-256 mismatch and audits unchanged regions after target MD5 failure', async () => {
+    const md5Fail = ops({ readHardwareMd5: vi.fn(async () => 'f'.repeat(32)) });
+    const md5Error = await runStageOnlyTransaction(md5Fail.mock, md5Fail.input).catch((error) => error);
+    expect(md5Error).toBeInstanceOf(StageOnlyVerificationFailure);
+    expect(md5Error.integrityAudit).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'otadata', status: 'UNCHANGED' })]));
+    expect(md5Fail.mock.auditUnchanged).toHaveBeenCalledOnce();
+    expect(md5Fail.mock.readbackSha256).not.toHaveBeenCalled();
     const shaFail = ops({ readbackSha256: vi.fn(async () => 'f'.repeat(64)) });
-    await expect(runStageOnlyTransaction(shaFail.mock, shaFail.input)).rejects.toThrow(/SHA-256 expected/);
+    await expect(runStageOnlyTransaction(shaFail.mock, { ...shaFail.input, verificationMode: 'thorough' })).rejects.toThrow(/SHA-256 expected/);
     expect(shaFail.mock.readOtadata).not.toHaveBeenCalled();
   });
 
   it('classifies verification I/O failures and does not proceed to later checks', async () => {
-    const md5ReadFail = ops({ verifyHardwareMd5: vi.fn(async () => { throw new Error('serial timeout'); }) });
+    const md5ReadFail = ops({ readHardwareMd5: vi.fn(async () => { throw new Error('serial timeout'); }) });
     await expect(runStageOnlyTransaction(md5ReadFail.mock, md5ReadFail.input)).rejects.toThrow(/VERIFICATION MISMATCH: hardware MD5 read failed/);
     expect(md5ReadFail.mock.readbackSha256).not.toHaveBeenCalled();
 
     const shaReadFail = ops({ readbackSha256: vi.fn(async () => { throw new Error('serial disconnected'); }) });
-    await expect(runStageOnlyTransaction(shaReadFail.mock, shaReadFail.input)).rejects.toThrow(/VERIFICATION MISMATCH: SHA-256 readback failed/);
-    expect(shaReadFail.mock.verifyProtected).not.toHaveBeenCalled();
+    await expect(runStageOnlyTransaction(shaReadFail.mock, { ...shaReadFail.input, verificationMode: 'thorough' })).rejects.toThrow(/VERIFICATION MISMATCH: SHA-256 readback failed/);
+    expect(shaReadFail.mock.auditUnchanged).toHaveBeenCalledOnce();
 
-    const protectedReadFail = ops({ verifyProtected: vi.fn(async () => { throw new Error('read failed'); }) });
-    await expect(runStageOnlyTransaction(protectedReadFail.mock, protectedReadFail.input)).rejects.toThrow(/PROTECTED REGION CHANGED: protected-region readback failed/);
-    expect(protectedReadFail.mock.readOtadata).not.toHaveBeenCalled();
+    const protectedReadFail = ops({ auditUnchanged: vi.fn(async () => [{ name: 'otadata', offset: 0x13000, length: 8192, algorithm: 'MD5' as const,
+      expectedDigest: md5(new Uint8Array(8192)), actualDigest: null, status: 'UNVERIFIED' as const }]) });
+    await expect(runStageOnlyTransaction(protectedReadFail.mock, protectedReadFail.input)).rejects.toThrow(/PROTECTED REGION UNVERIFIED/);
 
     const metadataReadFail = ops({ readOtadata: vi.fn(async () => { throw new Error('read failed'); }) });
-    await expect(runStageOnlyTransaction(metadataReadFail.mock, metadataReadFail.input)).rejects.toThrow(/VERIFICATION MISMATCH: OTA metadata readback failed/);
+    const metadataError = await runStageOnlyTransaction(metadataReadFail.mock, metadataReadFail.input).catch((error) => error);
+    expect(metadataError).toBeInstanceOf(StageOnlyVerificationFailure);
+    expect(metadataError.message).toMatch(/VERIFICATION MISMATCH: OTA metadata readback failed/);
+    expect(metadataError.integrityAudit).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'otadata', status: 'UNVERIFIED' })]));
     expect(metadataReadFail.mock.resetNormal).not.toHaveBeenCalled();
 
     const resetFail = ops({ resetNormal: vi.fn(async () => { throw new Error('reset unavailable'); }) });
@@ -120,7 +135,8 @@ describe('stage-only transaction', () => {
   });
 
   it('reports active-image/protected change and unexpected OTA metadata without activation', async () => {
-    const protectedFail = ops({ verifyProtected: vi.fn(async () => ({ valid: false, mismatches: ['preserved_ota'] })) });
+    const protectedFail = ops({ auditUnchanged: vi.fn(async () => [{ name: 'preserved_ota', offset: 0x820000, length: 0x400000,
+      algorithm: 'MD5' as const, expectedDigest: 'a'.repeat(32), actualDigest: 'b'.repeat(32), status: 'CHANGED' as const }]) });
     await expect(runStageOnlyTransaction(protectedFail.mock, protectedFail.input)).rejects.toThrow(/PROTECTED REGION CHANGED/);
     expect(protectedFail.mock.readOtadata).not.toHaveBeenCalled();
     const otaChanged = ops({ readOtadata: vi.fn(async () => new Uint8Array(8192).fill(0xbb)) });

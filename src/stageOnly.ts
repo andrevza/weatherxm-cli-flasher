@@ -6,6 +6,7 @@ import type { AppDescriptor } from './upstream/flasher/appDescriptor.js';
 import { parseEsp32S3ImageBoundary, type SecureBootImageEvidence } from './upstream/flasher/secureBoot.js';
 import { getEmbeddedBuildInfo } from './buildInfo.js';
 import type { ProgressReporter } from './progress.js';
+import type { VerificationMode } from './verification.js';
 
 export interface InactiveBackupManifest {
   backupFormatVersion: 1;
@@ -254,20 +255,31 @@ export interface StageOnlySummary {
   metadataWillChange: false; autoActivation: false;
 }
 
+export interface IntegrityAuditEntry {
+  name: string; offset: number; length: number; algorithm: 'MD5' | 'SHA-256';
+  expectedDigest: string | null; actualDigest: string | null;
+  status: 'UNCHANGED' | 'CHANGED' | 'UNVERIFIED';
+}
+
+export class StageOnlyVerificationFailure extends Error {
+  constructor(message: string, readonly targetVerification: { expectedMd5: string; actualMd5: string | null; result: 'MISMATCH' | 'UNVERIFIED' },
+    readonly integrityAudit: IntegrityAuditEntry[]) { super(message); this.name = 'StageOnlyVerificationFailure'; }
+}
+
 export interface StageOnlyOperations {
   revalidate(): Promise<boolean>;
   writeApplication(offset: number, bytes: Uint8Array): Promise<void>;
-  verifyHardwareMd5(offset: number, expectedMd5: string, length: number): Promise<boolean>;
+  readHardwareMd5(offset: number, length: number): Promise<string>;
   readbackSha256(offset: number, length: number): Promise<string>;
-  verifyProtected(): Promise<{ valid: boolean; mismatches: string[] }>;
+  auditUnchanged(): Promise<IntegrityAuditEntry[]>;
   readOtadata(): Promise<Uint8Array>;
   resetNormal(): Promise<void>;
 }
 
 export async function runStageOnlyTransaction(operations: StageOnlyOperations, input: {
   activeSlot: 'ota_0' | 'ota_1'; targetOffset: number; targetLength: number; firmwareBytes: Uint8Array; expectedSha256: string;
-  expectedMd5: string; otadataBefore: Uint8Array; confirm: () => Promise<boolean>;
-}): Promise<{ outcome: 'STAGED AND VERIFIED — NOT ACTIVATED'; hardwareMd5Verified: true; expectedMd5: string; expectedSha256: string; actualSha256: string; bytesRead: number; range: { start: number; end: number } }> {
+  expectedMd5: string; otadataBefore: Uint8Array; confirm: () => Promise<boolean>; verificationMode?: VerificationMode;
+}): Promise<{ outcome: 'FIRMWARE STAGED AND VERIFIED — NOT ACTIVATED'; hardwareMd5Verified: true; expectedMd5: string; actualMd5: string; expectedSha256: string; actualSha256: string | null; bytesRead: number; range: { start: number; end: number }; integrityAudit: IntegrityAuditEntry[] }> {
   if (input.activeSlot !== 'ota_1' || input.targetOffset !== 0x420000 || input.targetLength !== 0x400000 ||
       input.firmwareBytes.length === 0 || input.firmwareBytes.length > input.targetLength) {
     throw new Error('STAGING BLOCKED — PREFLIGHT FAILED: only the validated 4 MiB ota_0 partition is supported');
@@ -289,29 +301,74 @@ export async function runStageOnlyTransaction(operations: StageOnlyOperations, i
   try {
     await operations.writeApplication(input.targetOffset, input.firmwareBytes);
   } catch (error) {
-    throw new Error(`STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN: ${error instanceof Error ? error.message : String(error)}`);
+    const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.byteLength, input.expectedMd5, null);
+    throw new StageOnlyVerificationFailure(`STAGING FAILED — TARGET MAY BE PARTIALLY WRITTEN: ${error instanceof Error ? error.message : String(error)}`,
+      { expectedMd5: input.expectedMd5, actualMd5: null, result: 'UNVERIFIED' }, audit);
   }
-  let md5Valid = false;
-  try { md5Valid = await operations.verifyHardwareMd5(input.targetOffset, input.expectedMd5, input.firmwareBytes.length); }
-  catch { throw new Error('STAGING FAILED — VERIFICATION MISMATCH: hardware MD5 read failed'); }
-  if (!md5Valid) throw new Error('STAGING FAILED — VERIFICATION MISMATCH: hardware MD5 mismatch');
-  let actualSha256: string;
-  try { actualSha256 = await operations.readbackSha256(input.targetOffset, input.firmwareBytes.length); }
-  catch { throw new Error('STAGING FAILED — VERIFICATION MISMATCH: SHA-256 readback failed'); }
-  if (actualSha256.toLowerCase() !== input.expectedSha256.toLowerCase()) {
-    throw new Error(`STAGING FAILED — VERIFICATION MISMATCH: target SHA-256 expected ${input.expectedSha256}, readback ${actualSha256}`);
+  let actualMd5: string | null = null;
+  try { actualMd5 = (await operations.readHardwareMd5(input.targetOffset, input.firmwareBytes.length)).toLowerCase(); }
+  catch {
+    const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, null);
+    throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: hardware MD5 read failed',
+      { expectedMd5: input.expectedMd5, actualMd5: null, result: 'UNVERIFIED' }, audit);
   }
-  let protectedResult: { valid: boolean; mismatches: string[] };
-  try { protectedResult = await operations.verifyProtected(); }
-  catch { throw new Error('STAGING FAILED — PROTECTED REGION CHANGED: protected-region readback failed'); }
-  if (!protectedResult.valid) throw new Error(`STAGING FAILED — PROTECTED REGION CHANGED: ${protectedResult.mismatches.join('; ')}`);
+  if (actualMd5 !== input.expectedMd5.toLowerCase()) {
+    const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, actualMd5);
+    throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: hardware MD5 mismatch; OTA activation was not attempted',
+      { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, audit);
+  }
+  let actualSha256: string | null = null;
+  if ((input.verificationMode ?? 'fast') === 'thorough') {
+    try { actualSha256 = await operations.readbackSha256(input.targetOffset, input.firmwareBytes.length); }
+    catch {
+      const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, actualMd5);
+      throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: SHA-256 readback failed',
+        { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, audit);
+    }
+    if (actualSha256.toLowerCase() !== input.expectedSha256.toLowerCase()) {
+      const audit = await auditAfterFailure(operations, input.targetOffset, input.firmwareBytes.length, input.expectedMd5, actualMd5);
+      throw new StageOnlyVerificationFailure(`STAGING FAILED — VERIFICATION MISMATCH: target SHA-256 expected ${input.expectedSha256}, readback ${actualSha256}`,
+        { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, audit);
+    }
+  }
+  let integrityAudit: IntegrityAuditEntry[];
+  try { integrityAudit = await operations.auditUnchanged(); }
+  catch {
+    integrityAudit = [{ name: 'unchanged regions', offset: 0, length: 0, algorithm: (input.verificationMode ?? 'fast') === 'fast' ? 'MD5' : 'SHA-256',
+      expectedDigest: null, actualDigest: null, status: 'UNVERIFIED' }];
+  }
+  const changed = integrityAudit.filter((entry) => entry.status === 'CHANGED');
+  const unverified = integrityAudit.filter((entry) => entry.status === 'UNVERIFIED');
+  if (changed.length || unverified.length) throw new StageOnlyVerificationFailure(
+    changed.length ? `STAGING FAILED — PROTECTED REGION CHANGED: ${changed.map((x) => x.name).join(', ')}` : 'STAGING FAILED — PROTECTED REGION UNVERIFIED',
+    { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, integrityAudit);
   let otadataAfter: Uint8Array;
   try { otadataAfter = await operations.readOtadata(); }
-  catch { throw new Error('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata readback failed'); }
-  if (!Buffer.from(otadataAfter).equals(Buffer.from(input.otadataBefore))) throw new Error('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata changed during stage-only operation');
+  catch {
+    integrityAudit = integrityAudit.map((entry) => entry.name === 'otadata' ? { ...entry, status: 'UNVERIFIED' as const, actualDigest: null } : entry);
+    throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata readback failed',
+      { expectedMd5: input.expectedMd5, actualMd5, result: 'UNVERIFIED' }, integrityAudit);
+  }
+  if (!Buffer.from(otadataAfter).equals(Buffer.from(input.otadataBefore))) {
+    integrityAudit = integrityAudit.map((entry) => entry.name === 'otadata' ? { ...entry, status: 'CHANGED' as const } : entry);
+    throw new StageOnlyVerificationFailure('STAGING FAILED — VERIFICATION MISMATCH: OTA metadata changed during stage-only operation',
+      { expectedMd5: input.expectedMd5, actualMd5, result: 'MISMATCH' }, integrityAudit);
+  }
   try { await operations.resetNormal(); }
   catch { throw new Error('STAGING FAILED — VERIFICATION MISMATCH: normal-boot reset could not be confirmed'); }
-  return { outcome: 'STAGED AND VERIFIED — NOT ACTIVATED', hardwareMd5Verified: true, expectedMd5: input.expectedMd5, expectedSha256: input.expectedSha256,
-    actualSha256, bytesRead: input.firmwareBytes.length,
-    range: { start: input.targetOffset, end: input.targetOffset + input.firmwareBytes.length } };
+  return { outcome: 'FIRMWARE STAGED AND VERIFIED — NOT ACTIVATED', hardwareMd5Verified: true, expectedMd5: input.expectedMd5, actualMd5,
+    expectedSha256: input.expectedSha256, actualSha256, bytesRead: (input.verificationMode ?? 'fast') === 'thorough' ? input.firmwareBytes.length : 0,
+    range: { start: input.targetOffset, end: input.targetOffset + input.firmwareBytes.length }, integrityAudit };
+}
+
+async function auditAfterFailure(operations: StageOnlyOperations, offset: number, length: number, expectedMd5: string, actualMd5: string | null): Promise<IntegrityAuditEntry[]> {
+  try {
+    const audit = await operations.auditUnchanged();
+    return [{ name: 'failed_target', offset, length, algorithm: 'MD5', expectedDigest: expectedMd5, actualDigest: actualMd5,
+      status: actualMd5 === null ? 'UNVERIFIED' : actualMd5 === expectedMd5 ? 'UNCHANGED' : 'CHANGED' }, ...audit];
+  } catch {
+    return [{ name: 'failed_target', offset, length, algorithm: 'MD5', expectedDigest: expectedMd5, actualDigest: actualMd5,
+      status: actualMd5 === null ? 'UNVERIFIED' : actualMd5 === expectedMd5 ? 'UNCHANGED' : 'CHANGED' },
+      { name: 'unchanged regions', offset: 0, length: 0, algorithm: 'MD5', expectedDigest: null, actualDigest: null, status: 'UNVERIFIED' }];
+  }
 }

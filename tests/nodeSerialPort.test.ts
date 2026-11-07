@@ -6,6 +6,7 @@ import { NodeSerialPort, type SerialPortFactory } from '../src/nodeSerialPort.js
 class FakePort extends EventEmitter {
   isOpen = true;
   written: Buffer[] = [];
+  signalHistory: Array<{ dtr: boolean; rts: boolean }> = [];
   drainCallback?: (error: Error | null) => void;
   pauseCount = 0;
   resumeCount = 0;
@@ -14,7 +15,7 @@ class FakePort extends EventEmitter {
   write(chunk: Buffer, callback: (error: Error | null) => void) { this.written.push(Buffer.from(chunk)); callback(null); }
   drain(callback: (error: Error | null) => void) { this.drainCallback = callback; }
   update(_options: { baudRate: number }, callback: (error: Error | null) => void) { callback(null); }
-  set(_options: { dtr: boolean; rts: boolean }, callback: (error: Error | null) => void) { callback(null); }
+  set(options: { dtr: boolean; rts: boolean }, callback: (error: Error | null) => void) { this.signalHistory.push(options); callback(null); }
   pause() { this.pauseCount++; return this; }
   resume() { this.resumeCount++; return this; }
   close(callback: () => void) { this.isOpen = false; this.emit('close'); callback(); }
@@ -50,6 +51,33 @@ describe('NodeSerialPort transport contract', () => {
     await adapter.open({ baudRate: 115200 });
     expect(lifecycle).toEqual(['Opening serial port /dev/fake:start', 'Opening serial port /dev/fake:complete']);
     await adapter.close();
+  });
+
+  it('keeps modem-line transitions quiet in ordinary mode and exposes each transition in detailed mode', async () => {
+    const ordinaryPort = new FakePort(); const ordinaryEvents: string[] = [];
+    const ordinary = new NodeSerialPort('/dev/fake', undefined, (() => ordinaryPort) as unknown as SerialPortFactory, false,
+      (stage, state) => ordinaryEvents.push(`${stage}:${state}`));
+    await ordinary.open({ baudRate: 115200 });
+    await ordinary.setSignals({ dataTerminalReady: false, requestToSend: false });
+    await ordinary.setSignals({ dataTerminalReady: false, requestToSend: false });
+    await ordinary.setSignals({ dataTerminalReady: false, requestToSend: true });
+    await ordinary.setSignals({ dataTerminalReady: false, requestToSend: false });
+    expect(ordinaryEvents.filter((event) => event.startsWith('Applying RTS/DTR'))).toEqual([]);
+    expect(ordinaryPort.signalHistory).toEqual([{ dtr: false, rts: false }, { dtr: false, rts: true }, { dtr: false, rts: false }]);
+    await ordinary.close();
+
+    const detailedPort = new FakePort(); const detailedEvents: string[] = [];
+    const detailed = new NodeSerialPort('/dev/fake', undefined, (() => detailedPort) as unknown as SerialPortFactory, false,
+      (stage, state) => detailedEvents.push(`${stage}:${state}`), true);
+    await detailed.open({ baudRate: 115200 });
+    await detailed.setSignals({ dataTerminalReady: false, requestToSend: false });
+    await detailed.setSignals({ dataTerminalReady: false, requestToSend: true });
+    await detailed.setSignals({ dataTerminalReady: false, requestToSend: false });
+    expect(detailedEvents.filter((event) => event.startsWith('Applying RTS/DTR'))).toEqual([
+      'Applying RTS/DTR reset signals:start', 'Applying RTS/DTR reset signals:complete',
+      'Applying RTS/DTR reset signals:start', 'Applying RTS/DTR reset signals:complete',
+    ]);
+    await detailed.close();
   });
 
   it('reassembles a SLIP packet fragmented across serial data events', async () => {
