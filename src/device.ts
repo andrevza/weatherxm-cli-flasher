@@ -315,6 +315,13 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
     let md5ProtectedSnapshots: readonly StageOnlyRegionDigestSnapshot[] | undefined;
     let protectedSnapshots: Awaited<ReturnType<Wg1200Transport['snapshotProtectedRegions']>> | undefined;
     let bootloaderHash: string | undefined;
+    if (verificationMode === 'thorough') {
+      options.progress?.stage('Capturing Thorough-mode device-side MD5 baselines for all unchanged regions');
+      md5ProtectedSnapshots = await transport.snapshotProtectedRegionsMd5('ota_1', (snapshot, elapsedMs) => {
+        options.progress?.log(`Protected ${snapshot.name}: MD5 SNAPSHOT @ 0x${snapshot.offset.toString(16)} length ${snapshot.size} (${(elapsedMs / 1000).toFixed(1)}s)`);
+      }, options.signal);
+      options.progress?.finish('complete', `${md5ProtectedSnapshots.length} unchanged-region MD5 baselines captured`);
+    }
     options.progress?.stage(verificationMode === 'fast' ? 'Capturing protected-region device-side MD5 snapshots' : 'Hashing protected regions with physical SHA-256');
     const protectedCapture = await establishProtectedRegionSnapshot({ mode: verificationMode,
       fastSnapshot: () => transport.snapshotProtectedRegionsMd5('ota_1', (snapshot, elapsedMs) => {
@@ -412,7 +419,11 @@ export async function stageOnlyFirmware(options: DeviceOptions & {
           return checks.map((x) => ({ name: x.name, offset: x.offset, length: x.size, algorithm: x.algorithm,
             expectedDigest: x.expectedDigest, actualDigest: x.actualDigest, status: x.status }));
         }
-        const checks: IntegrityAuditEntry[] = [];
+        const md5Checks = md5ProtectedSnapshots ? await transport.auditProtectedRegionsMd5(md5ProtectedSnapshots, 'ota_1', (snapshot, elapsedMs) => {
+          options.progress?.log(`MD5 ${snapshot.name} @ 0x${snapshot.offset.toString(16)} length ${snapshot.size}: ${elapsedMs.toFixed(0)} ms`);
+        }, options.signal) : [];
+        const checks: IntegrityAuditEntry[] = md5Checks.map((x) => ({ name: x.name, offset: x.offset, length: x.size, algorithm: x.algorithm,
+          expectedDigest: x.expectedDigest, actualDigest: x.actualDigest, status: x.status }));
         for (const snap of protectedSnapshots!) {
           let actualDigest: string | null = null; let status: IntegrityAuditEntry['status'] = 'UNVERIFIED';
           try {
