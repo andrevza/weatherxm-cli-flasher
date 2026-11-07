@@ -296,6 +296,23 @@ async function main() {
     process.stdout.write(`serial binding loaded; native API verified (${requiredApi.join(', ')})\n`);
     return;
   }
+  if (process.argv[2] === '--boot-health-smoke') {
+    // Redacted excerpt supplied from the successful physical ota_1 boot. Kept
+    // behind an internal validation flag so the actual SEA bundle exercises
+    // the same parser without opening a serial port.
+    const lines = [
+      'I (1954) MAIN: LittleFS mounted successfully.',
+      'W (2181) Utils: NVS diagnostics: initial=ESP_OK final=ESP_OK',
+      'I (2696) Settings: All configuration keys loaded from NVS.',
+      'I (11035) WiFi: Got IP: [REDACTED IP]',
+      'Wi-Fi CONNECTED SUCCESSFULLY!',
+      'Starting web server on port 80...',
+      'I (11054) WebServer: Starting web server on port 80...',
+      'I (11116) WiFi: Connected to internet!',
+    ];
+    process.stdout.write(`${JSON.stringify(analyzeBootLogs(lines), null, 2)}\n`);
+    return;
+  }
   const args = parseArgs(process.argv.slice(2));
   if (args.command === 'help') return help(args.helpTarget, args.json || args.noColor);
   if (args.command === 'monitor') { await runMonitor(args); return; }

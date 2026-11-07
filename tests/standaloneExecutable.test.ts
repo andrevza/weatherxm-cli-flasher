@@ -31,6 +31,21 @@ describe('standalone executable packaging', () => {
     expect(output).toMatch(/^serial binding loaded; native API verified \(open, close, set, get, getBaudRate, update, flush, drain\)$/m);
   });
 
+  it.skipIf(!builtExecutable)('parses the supplied redacted boot-health evidence in the embedded executable', () => {
+    const executable = resolve(builtExecutable!);
+    const report = JSON.parse(execFileSync(executable, ['--boot-health-smoke'], {
+      cwd: tmpdir(), encoding: 'utf8', env: { PATH: '', TMPDIR: tmpdir(), TMP: tmpdir(), TEMP: tmpdir() }, timeout: 15_000,
+    }));
+    expect(report.health).toMatchObject({ littlefsMounted: true, nvsInitialized: true, wifiConnected: true,
+      dhcpAddress: true, httpServerStarted: true, internetConnected: true, mqttConnected: false,
+      weatherPacketReceived: false, stationReceptionComplete: false, stationActive: false });
+    expect(report.healthDetails.nvs).toMatchObject({ status: 'VERIFIED', uptimeMs: 2181 });
+    expect(report.healthDetails.httpServer).toMatchObject({ status: 'VERIFIED', startup: 'STARTING', reachable: { status: 'NOT_OBSERVED' } });
+    expect(report.healthDetails.internet).toMatchObject({ status: 'VERIFIED', uptimeMs: 11116 });
+    expect(report.healthDetails.mqtt.status).toBe('NOT_OBSERVED');
+    expect(report.healthDetails.weatherStationPacket.status).toBe('NOT_OBSERVED');
+  });
+
   it.skipIf(!builtExecutable)('prints structured, non-colored help and keeps input errors off JSON stdout', () => {
     const executable = resolve(builtExecutable!);
     const cleanDir = mkdtempSync(join(tmpdir(), 'wxm-clean-help-'));
