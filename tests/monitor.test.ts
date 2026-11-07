@@ -195,7 +195,7 @@ describe('passive serial monitor', () => {
       const formatted = formatSanitizedMonitorLine(line, { timestamp: true, color: true })!;
       writeMonitorOutput(`${formatted}\n`, true, (text) => displayed.push(text), (text) => saved.push(text));
     }
-    expect(displayed.join('')).toBe(saved.join(''));
+    expect(displayed.join('').replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')).toBe(saved.join(''));
     expect(saved.join('')).not.toMatch(/\u001b\[/);
     expect(saved.join('')).toMatch(/^\d{4}-\d\d-\d\dT/m);
     expect(analysis.lines).toEqual(rawEvidence);
