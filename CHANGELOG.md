@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.1 — 2026-11-18
+## v0.1.1 (pre-release candidate) — 2026-11-18
 
 Adds a separately named Linux ARM64 executable for Alpine Linux and other
 musl-based environments. The existing glibc executable and v0.1.0 release

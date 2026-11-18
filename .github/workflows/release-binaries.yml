@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    if: github.ref_name != 'v0.1.1-rc.1'
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +81,7 @@ jobs:
 
   read-only-hardware-gate:
     needs: build
+    if: github.ref_name != 'v0.1.1-rc.1'
     # Configure a self-hosted Linux ARM64 runner with a WG1200 attached and
     # WG1200_PORT set in the runner environment (for example /dev/ttyUSB0).
     runs-on: [self-hosted, linux, ARM64, wg1200]
@@ -99,6 +101,7 @@ jobs:
 
   publish:
     needs: [build, read-only-hardware-gate]
+    if: github.ref_name != 'v0.1.1-rc.1'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -122,4 +125,52 @@ jobs:
             This job creates a draft. Review the documentation and provenance before publishing it.
           files: |
             release/weatherxm-flash-*
+            release/SHA256SUMS
+
+  alpine-arm64-musl-prerelease:
+    if: github.ref_name == 'v0.1.1-rc.1'
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in Alpine ARM64
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          docker buildx build --platform linux/arm64 --load \
+            --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
+            --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
+            --build-arg WG1200_GIT_DIRTY=false \
+            --target clean-runtime-test \
+            --tag weatherxm-wg1200:alpine-arm64-musl .
+          mkdir -p release/weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl
+          container_id=$(docker create weatherxm-wg1200:alpine-arm64-musl)
+          docker cp "$container_id:/usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1" \
+            "release/weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl/"
+          docker rm "$container_id"
+          package="release/weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl"
+          cp LICENSE "$package/LICENSE"
+          cp docs/alpine-home-assistant-install.md "$package/INSTALL.md"
+          cp docs/release-v0.1.1.md "$package/RELEASE-NOTES.md"
+          (cd "$package" && sha256sum weatherxm-flash-linux-arm64-musl-v0.1.1 > SHA256SUMS)
+          tar -C release -czf "release/weatherxm-flash-linux-arm64-musl-${RELEASE_TAG}.tar.gz" \
+            "weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl"
+          (cd release && sha256sum "weatherxm-flash-linux-arm64-musl-${RELEASE_TAG}.tar.gz" > SHA256SUMS)
+          tar -tzf "release/weatherxm-flash-linux-arm64-musl-${RELEASE_TAG}.tar.gz"
+          (cd release && sha256sum -c SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: true
+          name: WeatherXM WG1200 CLI v0.1.1-rc.1 (Alpine ARM64 musl)
+          body: |
+            Pre-release candidate for remote testing on Alpine Linux ARM64, including the Home Assistant Terminal & SSH add-on. This is not the final v0.1.1 release and is not an official WeatherXM product or endorsement.
+
+            The archive contains only the Alpine ARM64 musl executable, its executable checksum, installation instructions, release notes, and license. The executable was built and tested in a clean Alpine 3.24.3 ARM64 container; no Raspberry Pi or physical WG1200 validation is claimed. PTY checks cover serial data flow but do not verify DTR/RTS reset behavior.
+
+            Download the `.tar.gz` and `SHA256SUMS`, verify the archive checksum, extract it, then verify the executable checksum using the included `SHA256SUMS`. See `INSTALL.md` for Home Assistant instructions. Review the safety documentation before connecting hardware.
+          files: |
+            release/weatherxm-flash-linux-arm64-musl-v0.1.1-rc.1.tar.gz
             release/SHA256SUMS

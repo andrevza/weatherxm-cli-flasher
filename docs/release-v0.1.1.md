@@ -1,8 +1,9 @@
 # v0.1.1 Alpine ARM64 build record
 
-This local v0.1.1 candidate adds the Linux ARM64 musl executable
+This v0.1.1 release candidate adds the Linux ARM64 musl executable
 `weatherxm-flash-linux-arm64-musl-v0.1.1`. It does not replace or modify the
-existing glibc artifact. No public release or Git tag is part of this record.
+existing glibc artifact. The Alpine build is published under the pre-release
+tag `v0.1.1-rc.1`; v0.1.1 has not been published as a final release.
 
 ## Build and validation
 
