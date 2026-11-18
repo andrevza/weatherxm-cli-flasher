@@ -134,6 +134,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Docker Buildx on the ARM64 runner
+        uses: docker/setup-buildx-action@v3
       - name: Build and test in Alpine ARM64
         env:
           RELEASE_TAG: ${{ github.ref_name }}
