@@ -15,7 +15,7 @@ tag `v0.1.1-rc.1`; v0.1.1 has not been published as a final release.
   statically. ELF inspection showed only Alpine musl as a dynamic dependency
   for the Node runtime and addon.
 - The build runs the SerialPort binding smoke check, enumerates and uses a PTY
-  for open/read/write/close, the complete unit/safety/standalone test suite,
+  in an Alpine container for open/read/write/close, the complete unit/safety/standalone test suite,
   typecheck, and the regular bundle build.
 - The final-stage check copies only the standalone executable into a clean
   Alpine runtime image with no added packages, inspects its dynamic libraries,

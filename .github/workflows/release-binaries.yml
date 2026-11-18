@@ -148,17 +148,23 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           set -o pipefail
-          build_log=$(mktemp)
-          docker buildx build --file Dockerfile.alpine-arm64 --progress=plain --platform linux/arm64 --load \
-            --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
-            --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
-            --build-arg WG1200_GIT_DIRTY=false \
-            --target clean-runtime-test \
-            --tag weatherxm-wg1200:alpine-arm64-musl . 2>&1 | tee "$build_log" || {
-              detail=$(tail -n 8 "$build_log" | tr '\n' ' ' | cut -c1-1200)
-              echo "::error file=.github/workflows/release-binaries.yml,line=150,title=Alpine Docker build failed::$detail"
-              exit 1
-            }
+          build_image() {
+            target="$1"
+            image_tag="$2"
+            build_log=$(mktemp)
+            if ! docker buildx build --file Dockerfile.alpine-arm64 --progress=plain --platform linux/arm64 --load \
+              --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
+              --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
+              --build-arg WG1200_GIT_DIRTY=false \
+              --target "$target" --tag "$image_tag" . 2>&1 | tee "$build_log"; then
+                detail=$(grep -Ei 'error|failed|not found|denied' "$build_log" | tail -n 8 | tr '\n' ' ' | cut -c1-1200)
+                echo "::error file=.github/workflows/release-binaries.yml,line=150,title=Alpine Docker build failed::$detail"
+                return 1
+            fi
+          }
+          build_image app-build weatherxm-wg1200:alpine-arm64-app-build
+          docker run --rm --entrypoint node weatherxm-wg1200:alpine-arm64-app-build scripts/serialport-pty-smoke.mjs
+          build_image clean-runtime-test weatherxm-wg1200:alpine-arm64-musl
           mkdir -p release/weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl
           container_id=$(docker create weatherxm-wg1200:alpine-arm64-musl)
           docker cp "$container_id:/usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1" \

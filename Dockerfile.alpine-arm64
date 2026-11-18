@@ -28,8 +28,7 @@ RUN cd node_modules/@serialport/bindings-cpp \
  && cp build/Release/bindings.node prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node \
  && readelf -d prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node | grep NEEDED \
  && ! readelf -d prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node | grep -E 'lib(atomic|stdc\+\+|gcc_s)\.so'
-RUN node scripts/patch-musl-serialport-list.mjs \
- && node scripts/serialport-pty-smoke.mjs
+RUN node scripts/patch-musl-serialport-list.mjs
 ENV WG1200_STANDALONE_OUTPUT_FILE=/app/dist/weatherxm-flash-linux-arm64-musl-v0.1.1
 RUN npm run build:standalone
 ENV WG1200_STANDALONE_BINARY=/app/dist/weatherxm-flash-linux-arm64-musl-v0.1.1
