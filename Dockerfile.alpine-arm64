@@ -9,7 +9,7 @@ RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.
  && tar -xzf "node-v${NODE_VERSION}.tar.gz" \
  && cd "node-v${NODE_VERSION}" \
  && LDFLAGS='-Wl,-Bstatic -latomic -Wl,-Bdynamic' ./configure --partly-static \
- && make -j2 \
+ && make -j4 \
  && make install
 
 FROM alpine:3.24.3 AS app-build
