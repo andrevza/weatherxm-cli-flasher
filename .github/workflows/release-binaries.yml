@@ -149,7 +149,7 @@ jobs:
         run: |
           set -o pipefail
           build_log=$(mktemp)
-          docker buildx build --progress=plain --platform linux/arm64 --load \
+          docker buildx build --file Dockerfile.alpine-arm64 --progress=plain --platform linux/arm64 --load \
             --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
             --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
             --build-arg WG1200_GIT_DIRTY=false \
