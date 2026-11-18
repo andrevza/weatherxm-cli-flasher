@@ -136,17 +136,29 @@ jobs:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx on the ARM64 runner
         uses: docker/setup-buildx-action@v3
+      - name: Verify Docker ARM64 build environment
+        run: |
+          docker version
+          docker info
+          docker buildx version
+          docker buildx inspect --bootstrap
       - name: Build and test in Alpine ARM64
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
-          docker buildx build --platform linux/arm64 --load \
+          set -o pipefail
+          build_log=$(mktemp)
+          docker buildx build --progress=plain --platform linux/arm64 --load \
             --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
             --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
             --build-arg WG1200_GIT_DIRTY=false \
             --target clean-runtime-test \
-            --tag weatherxm-wg1200:alpine-arm64-musl .
+            --tag weatherxm-wg1200:alpine-arm64-musl . 2>&1 | tee "$build_log" || {
+              detail=$(tail -n 8 "$build_log" | tr '\n' ' ' | cut -c1-1200)
+              echo "::error file=.github/workflows/release-binaries.yml,line=150,title=Alpine Docker build failed::$detail"
+              exit 1
+            }
           mkdir -p release/weatherxm-wg1200-${RELEASE_TAG}-alpine-arm64-musl
           container_id=$(docker create weatherxm-wg1200:alpine-arm64-musl)
           docker cp "$container_id:/usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1" \
