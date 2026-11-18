@@ -1,0 +1,45 @@
+# Reproducible ARM64 Alpine builder for the self-contained musl executable.
+# The Node source archive checksum is published in nodejs.org's SHASUMS256.txt.
+FROM alpine:3.24.3 AS node-runtime
+ARG NODE_VERSION=26.8.2
+RUN apk add --no-cache build-base linux-headers python3 curl tar xz
+WORKDIR /tmp
+RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.gz" \
+ && echo '67d1e64b1c80faa8be9ee80e78b89c9aa47ddd29a62200a6b053e80b9c8d4245  node-v26.8.2.tar.gz' | sha256sum -c - \
+ && tar -xzf "node-v${NODE_VERSION}.tar.gz" \
+ && cd "node-v${NODE_VERSION}" \
+ && LDFLAGS='-Wl,-Bstatic -latomic -Wl,-Bdynamic' ./configure --partly-static \
+ && make -j2 \
+ && make install
+
+FROM alpine:3.24.3 AS app-build
+RUN apk add --no-cache build-base linux-headers python3 util-linux bash
+COPY --from=node-runtime /usr/local/ /usr/local/
+WORKDIR /app
+ARG WG1200_GIT_COMMIT
+ARG WG1200_GIT_TAG=
+ARG WG1200_GIT_DIRTY=true
+ENV WG1200_GIT_COMMIT=${WG1200_GIT_COMMIT} WG1200_GIT_TAG=${WG1200_GIT_TAG} WG1200_GIT_DIRTY=${WG1200_GIT_DIRTY}
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN cd node_modules/@serialport/bindings-cpp \
+ && LDFLAGS='-static-libstdc++ -static-libgcc' npm exec --yes --package=node-gyp@11.0.0 -- node-gyp rebuild \
+ && cp build/Release/bindings.node prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node \
+ && readelf -d prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node | grep NEEDED \
+ && ! readelf -d prebuilds/linux-arm64/@serialport+bindings-cpp.armv8.musl.node | grep -E 'lib(atomic|stdc\+\+|gcc_s)\.so'
+RUN node scripts/patch-musl-serialport-list.mjs \
+ && node scripts/serialport-pty-smoke.mjs
+ENV WG1200_STANDALONE_OUTPUT_FILE=/app/dist/weatherxm-flash-linux-arm64-musl-v0.1.1
+RUN npm run build:standalone
+ENV WG1200_STANDALONE_BINARY=/app/dist/weatherxm-flash-linux-arm64-musl-v0.1.1
+RUN npm run typecheck && npm run build
+RUN npm test
+
+FROM alpine:3.24.3 AS clean-runtime-test
+COPY --from=app-build /app/dist/weatherxm-flash-linux-arm64-musl-v0.1.1 /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1
+RUN ldd /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1 \
+ && ! ldd /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1 2>&1 | grep -E 'not found|lib(atomic|stdc\+\+|gcc_s)' \
+ && env -i PATH='' /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1 --version --verbose \
+ && env -i PATH='' /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1 --help \
+ && env -i PATH='' /usr/local/bin/weatherxm-flash-linux-arm64-musl-v0.1.1 --serial-binding-smoke

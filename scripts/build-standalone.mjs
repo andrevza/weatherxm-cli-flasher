@@ -21,10 +21,17 @@ const gitDirty = dirtyOverride === 'true' ? true : dirtyOverride === 'false' ? f
 if (process.env.GITHUB_REF_TYPE === 'tag' && (!gitCommit || gitDirty)) {
   throw new Error('Refusing to build an official tagged release from an uncommitted or non-Git source tree.');
 }
+const linuxLibc = process.platform === 'linux'
+  ? process.report.getReport().header.glibcVersionRuntime ? 'glibc' : 'musl'
+  : undefined;
 const targets = {
   'linux-arm64': {
     name: 'weatherxm-flash-linux-arm64',
     addon: 'linux-arm64/@serialport+bindings-cpp.armv8.glibc.node',
+  },
+  'linux-arm64-musl': {
+    name: 'weatherxm-flash-linux-arm64-musl',
+    addon: 'linux-arm64/@serialport+bindings-cpp.armv8.musl.node',
   },
   'linux-x64': {
     name: 'weatherxm-flash-linux-x64',
@@ -36,7 +43,7 @@ const targets = {
   },
 };
 
-const target = `${process.platform}-${process.arch}`;
+const target = `${process.platform}-${process.arch}${linuxLibc === 'musl' ? '-musl' : ''}`;
 const output = targets[target];
 if (!output) throw new Error(`Unsupported target ${target}. Choose: ${Object.keys(targets).join(', ')}`);
 if (Number(process.versions.node.split('.')[0]) < 26) {
@@ -139,7 +146,7 @@ try {
   if (result.status !== 0) process.exit(result.status ?? 1);
   chmodSync(stagedExecutable, 0o755);
 
-  if (target === 'linux-arm64') {
+  if (target === 'linux-arm64' || target === 'linux-arm64-musl') {
     const elfCheck = spawnSync(process.execPath, [resolve(root, 'scripts/validate-linux-elf.mjs'), stagedExecutable, addonPath, process.execPath], { cwd: root, encoding: 'utf8' });
     if (elfCheck.error) throw elfCheck.error;
     if (elfCheck.status !== 0) throw new Error(`Generated Linux ARM64 executable or embedded SerialPort addon is not compatible with 16 KB pages:\n${elfCheck.stderr || elfCheck.stdout}`);

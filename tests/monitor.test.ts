@@ -217,6 +217,34 @@ describe('passive serial monitor', () => {
     expect(output).toContain('[REDACTED_SENSITIVE_BLOCK_END]');
     expect(output).toContain('boot continues');
   });
+
+  it('keeps public-key redaction active across interleaved UART lines and fragmented byte rows', () => {
+    // Model a UART reader splitting the stream at arbitrary byte boundaries;
+    // line framing reassembles each line before LogSanitizer sees it.
+    const stream = 'WS PubKey:\r\n=========================\r\n12 34\r\nI (42) UART: diagnostic\r\n56\r\n78 9a bc\r\n=========================\r\nI (43) MAIN: boot continues\r\n';
+    const sanitizer = new LogSanitizer({ suppressRadioPayloads: true });
+    const safe: string[] = [];
+    let pending = '';
+    for (let offset = 0; offset < stream.length;) {
+      const width = (offset % 7) + 1;
+      pending += stream.slice(offset, offset + width);
+      offset += width;
+      // Simulate the serial line framer used by monitorSerial.
+      const lines = pending.split('\n');
+      pending = lines.pop() ?? '';
+      for (const line of lines) {
+        const sanitized = sanitizer.sanitizeLine(line.replace(/[\r\n]+$/, ''));
+        if (sanitized !== null) safe.push(sanitized);
+      }
+    }
+    const output = safe.join('\n');
+    expect(output).toContain('I (42) UART: diagnostic');
+    expect(output).toContain('I (43) MAIN: boot continues');
+    expect(output).not.toMatch(/(?:12 34|56|78 9a bc)/);
+    expect(output).toContain('[REDACTED PUBLIC KEY; 2 bytes]');
+    expect(output).toContain('[REDACTED PUBLIC KEY; 1 bytes]');
+    expect(output).toContain('[REDACTED PUBLIC KEY; 3 bytes]');
+  });
 });
 
 describe('boot log evidence', () => {

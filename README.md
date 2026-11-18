@@ -2,7 +2,7 @@
 
 Independent command-line utility for inspecting, verifying and installing compatible firmware on WeatherXM WG1200 gateways without a browser. It is not an official WeatherXM utility.
 
-Stable package version: **v0.1.0**. Local release details and evidence are in [the v0.1.0 release notes](docs/release-v0.1.0.md). The Linux ARM64 artifact bundle is assembled from a fixed allowlist; no public release is published by the current local release-finalization work.
+Package version: **v0.1.1**. The stable glibc release remains **v0.1.0**; v0.1.1 adds a separately named Alpine ARM64 musl executable. No final Git tag or public release is created by this work.
 
 ## Status
 
@@ -29,10 +29,11 @@ The release workflow builds a self-contained executable with the Node.js runtime
 | Release artifact | OS and architecture | Minimum validated OS baseline | Status in this project |
 | --- | --- | --- | --- |
 | `weatherxm-flash-macos-arm64` | macOS ARM64 (Apple Silicon) | macOS 14 build runner | Build target; physical hardware validation is not claimed in this validation record. |
-| `weatherxm-flash-linux-arm64` | Linux ARM64 | Ubuntu 22.04 build runner | Read-only physical validation reported on Raspberry Pi 5; see [hardware validation](docs/hardware-validation.md). |
+| `weatherxm-flash-linux-arm64` | Linux ARM64 with glibc (Debian/Ubuntu) | Ubuntu 22.04 build runner | Requires the host C/C++ runtime and `libatomic1`; existing artifact is unchanged. |
+| `weatherxm-flash-linux-arm64-musl-v0.1.1` | Linux ARM64 with musl (Alpine/Home Assistant SSH add-on) | Alpine 3.24.3, musl 1.2.6 | Separate self-contained executable; see [Alpine/Home Assistant installation](docs/alpine-home-assistant-install.md). |
 | `weatherxm-flash-linux-x64` | Linux x64 | Ubuntu 22.04 build runner | Build and release-workflow smoke-test target; no physical-device validation is recorded here. |
 
-Build runner baselines are macOS 14 and Ubuntu 22.04. Linux ARM64 runtime environments need `libatomic1`. Older OS releases have not been established as compatible. The maintainer-reported Linux ARM64 build has completed read-only tests on a Raspberry Pi 5; the current audited source has not. Other platform targets are not claimed as physically validated.
+The Linux ARM64 glibc executable is for Debian/Ubuntu systems. The musl executable is for Alpine and does not use glibc or require separately installed `libatomic` or `libstdc++`. Choose the right file with `uname -m`, `cat /etc/os-release`, and `ldd --version`; Alpine reports musl. The musl build was tested in an ARM64 Alpine 3.24.3 Docker Desktop VM on Apple Silicon. This is container runtime testing, not physical Raspberry Pi or gateway validation. The SSH add-on is containerized, so it must expose the serial device and grant the add-on process permission to open it.
 
 Linux executables need a compatible system C/C++ runtime and `libatomic.so.1` (usually provided by the `libatomic1` package on Debian/Ubuntu). Linux users need permission to open the serial device, often through the `dialout` group; log out and back in after changing group membership. Containers must expose the serial device, commonly `/dev/ttyUSB0` or `/dev/serial/by-id/...`.
 

@@ -251,15 +251,18 @@ export class LogSanitizer {
         this.pendingIdentityBlock = undefined;
         return line;
       }
-      if (this.identityHexBlock && /^(?:[0-9a-f]{2}(?:\s+|$)){2,}$/i.test(trimmed)) {
+      // UART diagnostics can be interleaved between rows of the identity dump.
+      // Keep the block armed across those lines: only the explicit separator
+      // ends it. Accept single-byte rows as well, since chunking/formatting can
+      // split a hex dump at any byte boundary.
+      if (this.identityHexBlock && /^(?:[0-9a-f]{2}(?:\s+|$))+$/i.test(trimmed)) {
         const bytes = trimmed.split(/\s+/).filter(Boolean).length;
         return `[REDACTED ${this.identityHexBlock}; ${bytes} bytes]`;
       }
-      if (this.pendingIdentityBlock && /^(?:[0-9a-f]{2}(?:\s+|$)){2,}$/i.test(trimmed)) {
+      if (this.pendingIdentityBlock && /^(?:[0-9a-f]{2}(?:\s+|$))+$/i.test(trimmed)) {
         const bytes = trimmed.split(/\s+/).filter(Boolean).length;
         return `[REDACTED ${this.pendingIdentityBlock}; ${bytes} bytes]`;
       }
-      if (this.pendingIdentityBlock) this.pendingIdentityBlock = undefined;
 
       if (/---.*\bPacket\s+(?:Received|Response)\b.*---/i.test(trimmed)) {
         this.inRadioPacket = true;

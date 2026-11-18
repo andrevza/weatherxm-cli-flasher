@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.1.1 — 2026-11-18
+
+Adds a separately named Linux ARM64 executable for Alpine Linux and other
+musl-based environments. The existing glibc executable and v0.1.0 release
+remain unchanged.
+
+- Builds Node.js 26.8.2 from checksum-verified source on Alpine ARM64 and embeds
+  the SerialPort native addon with its C++ runtime statically linked.
+- Tests the standalone executable in a clean Alpine 3.24.3 runtime with no
+  additional packages, and exercises serial open/read/write/close using a PTY.
+- Includes a narrowly scoped musl SerialPort enumeration fallback for systems
+  without `udevadm`.
+- Fixes monitor redaction across chunked public-key output interleaved with
+  diagnostics.
+- No physical gateway or Raspberry Pi validation is claimed. The container
+  checks ran in an ARM64 Docker Desktop VM on Apple Silicon.
+
+See [`docs/alpine-home-assistant-install.md`](docs/alpine-home-assistant-install.md)
+for Alpine/Home Assistant installation instructions and [`docs/release-v0.1.1.md`](docs/release-v0.1.1.md)
+for build evidence and limitations.
+
 ## v0.1.0 — 2026-11-07
 
 First stable version of this independent WeatherXM WG1200 CLI. This is not an
