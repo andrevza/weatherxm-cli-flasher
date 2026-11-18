@@ -168,13 +168,19 @@ describe('passive serial monitor', () => {
   });
 
   it('uses the same timestamped, severity-coloured presentation for monitor and OTA boot lines', () => {
-    const raw = 'W (123) WiFi: credentials unavailable';
-    const monitor = formatMonitorLine(raw, { timestamp: true, color: true });
-    const ota = formatSanitizedMonitorLine(raw, { timestamp: true, color: true });
-    expect(ota).toBe(monitor);
-    expect(ota).toMatch(/^\u001b\[33m\d{4}-\d\d-\d\dT.* W \(123\) WiFi: credentials unavailable\u001b\[0m$/);
-    const banner = formatSanitizedMonitorLine('WeatherXM WG1200 starting', { color: true });
-    expect(banner).toBe('\u001b[36mWeatherXM WG1200 starting\u001b[0m');
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-18T12:34:56.789Z'));
+    try {
+      const raw = 'W (123) WiFi: credentials unavailable';
+      const monitor = formatMonitorLine(raw, { timestamp: true, color: true });
+      const ota = formatSanitizedMonitorLine(raw, { timestamp: true, color: true });
+      expect(ota).toBe(monitor);
+      expect(ota).toMatch(/^\u001b\[33m\d{4}-\d\d-\d\dT.* W \(123\) WiFi: credentials unavailable\u001b\[0m$/);
+      const banner = formatSanitizedMonitorLine('WeatherXM WG1200 starting', { color: true });
+      expect(banner).toBe('\u001b[36mWeatherXM WG1200 starting\u001b[0m');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps OTA and monitor logs plain when color is disabled, redirected, or NO_COLOR is set', () => {
