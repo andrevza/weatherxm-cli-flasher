@@ -153,6 +153,8 @@ jobs:
             image_tag="$2"
             build_log=$(mktemp)
             if ! docker buildx build --file Dockerfile.alpine-arm64 --progress=plain --platform linux/arm64 --load \
+              --cache-from type=gha,scope=weatherxm-alpine-arm64-musl \
+              --cache-to type=gha,scope=weatherxm-alpine-arm64-musl,mode=max \
               --build-arg "WG1200_GIT_COMMIT=$RELEASE_COMMIT" \
               --build-arg "WG1200_GIT_TAG=$RELEASE_TAG" \
               --build-arg WG1200_GIT_DIRTY=false \
@@ -162,6 +164,7 @@ jobs:
                 return 1
             fi
           }
+          build_image node-runtime weatherxm-wg1200:alpine-node-runtime
           build_image app-build weatherxm-wg1200:alpine-arm64-app-build
           docker run --rm --entrypoint node weatherxm-wg1200:alpine-arm64-app-build scripts/serialport-pty-smoke.mjs
           build_image clean-runtime-test weatherxm-wg1200:alpine-arm64-musl
